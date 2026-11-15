@@ -46,6 +46,16 @@ pub fn run(repo: &Repo) -> Result<()> {
             st,
             info.wt.path.display()
         );
+        if let Ok(Some(fork)) = sg_git::fork(&info.wt.path) {
+            let parent = fork
+                .parent
+                .map(|p| format!(", forked from {} at {}", p.name, &p.merge_base[..8]))
+                .unwrap_or_default();
+            println!(
+                "      ↑{} ↓{} vs {}{parent}",
+                fork.commits, fork.behind, fork.base
+            );
+        }
         for s in info.sessions.iter().take(5) {
             let age = s
                 .modified

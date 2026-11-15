@@ -107,7 +107,7 @@ fn worktree_lifecycle() {
         "-qm",
         "work\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
     ]);
-    let log = sg_git::log(&wt_path, "HEAD", 10).unwrap();
+    let log = sg_git::log(&wt_path, &["HEAD"], 10).unwrap();
     assert_eq!(log.len(), 2);
     assert_eq!(log[0].subject, "work");
     assert!(log[0].by_agent);
@@ -147,7 +147,7 @@ fn existing_branch_checkout_and_unborn_repo() {
     std::fs::write(empty.join("f.txt"), "hi\n").unwrap();
     let st = sg_git::status(&empty).unwrap();
     assert!(st.is_unborn());
-    assert_eq!(sg_git::log(&empty, "HEAD", 10).unwrap().len(), 0);
+    assert_eq!(sg_git::log(&empty, &["HEAD"], 10).unwrap().len(), 0);
     let patch = sg_git::worktree_patch(&empty, &st).unwrap();
     assert!(patch.contains("+hi"));
     assert_eq!(FileState::Untracked, st.files[0].state());
@@ -314,6 +314,7 @@ fn fork_counts_commits_since_branching_from_the_base() {
         assert!(ok);
     };
     assert_eq!(sg_git::fork(&wt).unwrap().unwrap().commits, 0);
+    let forked_at = rev_parse(&wt, "HEAD");
     commit(&wt, "one");
     commit(&wt, "two");
     // New work on main does not count against the branch.
@@ -322,7 +323,12 @@ fn fork_counts_commits_since_branching_from_the_base() {
         sg_git::fork(&wt).unwrap(),
         Some(sg_git::Fork {
             base: "main".into(),
-            commits: 2
+            commits: 2,
+            behind: 1,
+            parent: Some(sg_git::ForkParent {
+                name: "main".into(),
+                merge_base: forked_at.clone(),
+            }),
         })
     );
 
@@ -340,6 +346,139 @@ fn fork_counts_commits_since_branching_from_the_base() {
     assert_eq!(sg_git::fork(&t.root()).unwrap(), None);
 }
 
+fn rev_parse(dir: &Path, rev: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+#[test]
+fn fork_parent_is_the_nearest_branch_not_the_branch_itself() {
+    let t = TempRepo::new("fork_parent");
+    let a = t.dir.join("a");
+    sg_git::add_worktree(&t.root(), &a, Some("feat-a"), None).unwrap();
+    run_git(&a, &["commit", "-q", "--allow-empty", "-m", "a1"]);
+    let a1 = rev_parse(&a, "HEAD");
+    // feat-b starts from feat-a, not from main.
+    let b = t.dir.join("b");
+    run_git(
+        &a,
+        &["worktree", "add", "-q", "-b", "feat-b", b.to_str().unwrap()],
+    );
+    run_git(&b, &["commit", "-q", "--allow-empty", "-m", "b1"]);
+    run_git(&a, &["commit", "-q", "--allow-empty", "-m", "a2"]);
+    // Its own (stale) remote copy is never its parent.
+    run_git(&b, &["update-ref", "refs/remotes/origin/feat-b", "HEAD~1"]);
+    run_git(
+        &t.root(),
+        &["commit", "-q", "--allow-empty", "-m", "main moves on"],
+    );
+
+    let fork = sg_git::fork(&b).unwrap().unwrap();
+    assert_eq!((fork.commits, fork.behind), (2, 1));
+    assert_eq!(
+        fork.parent,
+        Some(sg_git::ForkParent {
+            name: "feat-a".into(),
+            merge_base: a1,
+        })
+    );
+    // feat-b shares a1 with feat-a, but it forked off a commit made on
+    // feat-a: it is feat-a's child, so feat-a's parent is still main.
+    let fork = sg_git::fork(&a).unwrap().unwrap();
+    assert_eq!(fork.parent.unwrap().name, "main");
+}
+
+#[test]
+fn a_branch_merged_into_main_still_forks_from_main() {
+    let t = TempRepo::new("fork_merged");
+    let wt = t.dir.join("feature");
+    sg_git::add_worktree(&t.root(), &wt, Some("feature"), None).unwrap();
+    run_git(&wt, &["commit", "-q", "--allow-empty", "-m", "f1"]);
+    let f1 = rev_parse(&wt, "HEAD");
+    // The PR merges f1 into main; the branch keeps going.
+    t.git(&["merge", "-q", "--no-ff", "-m", "Merge PR", "feature"]);
+    run_git(&wt, &["commit", "-q", "--allow-empty", "-m", "f2"]);
+    let fork = sg_git::fork(&wt).unwrap().unwrap();
+    assert_eq!((fork.commits, fork.behind), (1, 1));
+    assert_eq!(
+        fork.parent,
+        Some(sg_git::ForkParent {
+            name: "main".into(),
+            merge_base: f1,
+        })
+    );
+
+    // A branch with no work of its own sits on the base.
+    let idle = t.dir.join("idle");
+    sg_git::add_worktree(&t.root(), &idle, Some("idle"), None).unwrap();
+    let fork = sg_git::fork(&idle).unwrap().unwrap();
+    assert_eq!((fork.commits, fork.behind), (0, 0));
+    assert_eq!(
+        fork.parent.map(|p| (p.name, p.merge_base)),
+        Some(("main".into(), rev_parse(&t.root(), "HEAD")))
+    );
+}
+
+#[test]
+fn history_shows_every_branch_remote_and_tag() {
+    let t = TempRepo::new("history_all");
+    let wt = t.dir.join("feature");
+    sg_git::add_worktree(&t.root(), &wt, Some("feature"), None).unwrap();
+    run_git(
+        &wt,
+        &["commit", "-q", "--allow-empty", "-m", "feature work"],
+    );
+    run_git(
+        &t.root(),
+        &["commit", "-q", "--allow-empty", "-m", "main work"],
+    );
+    t.git(&["tag", "v1.0"]);
+    t.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+    let history = sg_git::history(&wt, 50).unwrap();
+    let subjects: Vec<_> = history.iter().map(|c| c.subject.as_str()).collect();
+    assert!(subjects.contains(&"main work"), "{subjects:?}");
+    assert!(subjects.contains(&"feature work"));
+    let main = history.iter().find(|c| c.subject == "main work").unwrap();
+    let kinds: Vec<_> = main
+        .refs
+        .iter()
+        .map(|r| (r.kind, r.name.as_str(), r.current))
+        .collect();
+    assert!(
+        kinds.contains(&(sg_git::RefKind::Branch, "main", false)),
+        "{kinds:?}"
+    );
+    assert!(kinds.contains(&(sg_git::RefKind::Tag, "v1.0", false)));
+    assert!(kinds.contains(&(sg_git::RefKind::Remote, "origin/main", false)));
+    let head = history
+        .iter()
+        .find(|c| c.subject == "feature work")
+        .unwrap();
+    assert_eq!(
+        head.refs
+            .iter()
+            .find(|r| r.current)
+            .map(|r| r.name.as_str()),
+        Some("feature")
+    );
+}
+
 #[test]
 fn commit_details_carry_the_full_message() {
     let t = TempRepo::new("details");
@@ -355,7 +494,7 @@ fn commit_details_carry_the_full_message() {
         "-m",
         "Co-Authored-By: Claude <noreply@anthropic.com>",
     ]);
-    let head = sg_git::log(&t.root(), "HEAD", 1).unwrap().remove(0);
+    let head = sg_git::log(&t.root(), &["HEAD"], 1).unwrap().remove(0);
     let details = sg_git::commit_details(&t.root(), &head.sha).unwrap();
     assert_eq!(details.commit, head);
     assert_eq!(details.commit.subject, "Add b");
