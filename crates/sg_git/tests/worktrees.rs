@@ -294,3 +294,78 @@ fn untracked_symlinks_show_targets_without_reading_them() {
         );
     }
 }
+
+#[test]
+fn fork_counts_commits_since_branching_from_the_base() {
+    let t = TempRepo::new("fork");
+    // The main checkout is the base itself: nothing to count.
+    assert_eq!(sg_git::base_branch(&t.root()).as_deref(), Some("main"));
+    assert_eq!(sg_git::fork(&t.root()).unwrap(), None);
+
+    let wt = t.dir.join("feature");
+    sg_git::add_worktree(&t.root(), &wt, Some("feature"), None).unwrap();
+    let commit = |dir: &Path, msg: &str| {
+        let ok = Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", msg])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    };
+    assert_eq!(sg_git::fork(&wt).unwrap().unwrap().commits, 0);
+    commit(&wt, "one");
+    commit(&wt, "two");
+    // New work on main does not count against the branch.
+    commit(&t.root(), "main moves on");
+    assert_eq!(
+        sg_git::fork(&wt).unwrap(),
+        Some(sg_git::Fork {
+            base: "main".into(),
+            commits: 2
+        })
+    );
+
+    // A remote's default branch wins over the local one.
+    t.git(&["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+    t.git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    assert_eq!(sg_git::base_branch(&wt).as_deref(), Some("origin/main"));
+    assert_eq!(sg_git::fork(&wt).unwrap().unwrap().commits, 2);
+    // Local `main` is ahead of `origin/main` by one commit: unpushed, but
+    // still the base checkout, so no count.
+    assert_eq!(sg_git::fork(&t.root()).unwrap(), None);
+}
+
+#[test]
+fn commit_details_carry_the_full_message() {
+    let t = TempRepo::new("details");
+    std::fs::write(t.root().join("b.txt"), "two\n").unwrap();
+    t.git(&["add", "."]);
+    t.git(&[
+        "commit",
+        "-q",
+        "-m",
+        "Add b",
+        "-m",
+        "Why: the second file.\nSecond line.",
+        "-m",
+        "Co-Authored-By: Claude <noreply@anthropic.com>",
+    ]);
+    let head = sg_git::log(&t.root(), "HEAD", 1).unwrap().remove(0);
+    let details = sg_git::commit_details(&t.root(), &head.sha).unwrap();
+    assert_eq!(details.commit, head);
+    assert_eq!(details.commit.subject, "Add b");
+    assert!(details.commit.by_agent);
+    assert_eq!(
+        details.body,
+        "Why: the second file.\nSecond line.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"
+    );
+    assert_eq!(details.committer, "Tester");
+    // `YYYY-MM-DD HH:MM`
+    assert_eq!(details.date.len(), 16, "{}", details.date);
+    assert!(sg_git::commit_details(&t.root(), "0000000000000000000000000000000000000000").is_err());
+}
