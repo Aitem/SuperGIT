@@ -65,6 +65,13 @@ CI (`.github/workflows/ci.yml`, on PRs and pushes to `main`, `macos-latest`):
 All builds use `--locked`: commit `Cargo.lock` changes. The `CI ok` job
 aggregates the rest — the one check to require for merges.
 
+`main` is protected by a repository ruleset ("main: PR + green CI"): no
+direct pushes, force-pushes or deletion, no bypass even for admins. Every
+change lands through a pull request whose `CI ok` is green (no approval
+needed). Work on a branch, push it, `gh pr create --fill`, then
+`gh pr merge --auto --merge` — GitHub merges once CI passes and deletes the
+remote branch.
+
 App-launch specifics (`main.rs`, `shell_env.rs`, `recent.rs`): a Dock launch
 has cwd `/` and launchd's minimal PATH, so `shell_env` imports the login
 shell's environment (only when `TERM` is unset) before any thread starts, and
