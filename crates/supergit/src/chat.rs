@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::attention::{Attention, Kind};
 use futures::StreamExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
@@ -30,6 +31,8 @@ const OUTPUT_LINES: usize = 40;
 const DEFAULT_MODE: PermissionMode = PermissionMode::Auto;
 
 pub struct ChatSession {
+    attention: Attention,
+    permission_focus: FocusHandle,
     /// Where `claude` runs (a resumed session must run where it started).
     cwd: PathBuf,
     local_id: String,
@@ -106,6 +109,7 @@ impl ChatSession {
             chat.local_id = saved.local_id.clone();
         }
         chat.transcript = saved.transcript.clone().filter(|p| p.is_file());
+        chat.attention = saved.attention.clone().restored();
         chat.input.update(cx, |input, cx| {
             input.set_value(saved.draft.clone(), window, cx)
         });
@@ -114,6 +118,7 @@ impl ChatSession {
 
     pub fn snapshot(&self, cx: &App) -> crate::workspace::SavedConversation {
         crate::workspace::SavedConversation {
+            attention: self.attention.clone(),
             local_id: self.local_id.clone(),
             provider: "claude".into(),
             session_id: self.convo.session_id.clone(),
@@ -158,6 +163,8 @@ impl ChatSession {
             .unwrap_or(DEFAULT_MODE);
         let _ = worktree;
         Self {
+            attention: Attention::default(),
+            permission_focus: cx.focus_handle(),
             cwd,
             local_id: format!(
                 "draft-{}",
@@ -189,6 +196,36 @@ impl ChatSession {
         &self.local_id
     }
 
+    pub fn attention(&self) -> &Attention {
+        &self.attention
+    }
+
+    pub fn mark_seen(&mut self, cx: &mut Context<Self>) {
+        if self.attention.unread {
+            self.attention.unread = false;
+            cx.notify();
+        }
+    }
+
+    pub fn focus_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mark_seen(cx);
+        if let Some(ix) = self
+            .convo
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::Permission(p) if p.decision.is_none()))
+        {
+            self.scroller.update(cx, |scroller, cx| {
+                scroller.scroll_to_item(ix, cx);
+            });
+            self.permission_focus.focus(window, cx);
+        } else {
+            self.scroller
+                .update(cx, |scroller, cx| scroller.scroll_to_end(cx));
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.convo.session_id.as_deref()
     }
@@ -206,6 +243,14 @@ impl ChatSession {
 
     pub fn is_empty(&self) -> bool {
         self.convo.items.is_empty()
+    }
+
+    pub fn follows_tail(&self, cx: &App) -> bool {
+        self.scroller.read(cx).is_following_tail()
+    }
+
+    pub fn has_draft(&self, cx: &App) -> bool {
+        !self.input.read(cx).value().is_empty()
     }
 
     // ---- process ---------------------------------------------------------
@@ -241,6 +286,7 @@ impl ChatSession {
 
     fn on_event(&mut self, event: ProcessEvent, cx: &mut Context<Self>) {
         let before = self.convo.items.len();
+        let was_busy = self.convo.status.is_busy();
         match event {
             ProcessEvent::Message(v) => {
                 let reported = self.convo.permission_mode.clone();
@@ -260,6 +306,24 @@ impl ChatSession {
                         self.on_control_response(&request_id, error)
                     }
                     None => {}
+                }
+                if v.get("type").and_then(|value| value.as_str()) == Some("result") {
+                    self.attention.set(
+                        if v.get("is_error")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            Kind::Failed
+                        } else {
+                            Kind::Completed
+                        },
+                        None,
+                    );
+                } else if let Some(request) = self.convo.pending_permission() {
+                    self.attention
+                        .set(Kind::Approval, Some(request.request_id.clone()));
+                } else if self.convo.status.is_busy() {
+                    self.attention.set(Kind::Running, None);
                 }
                 // The CLI changed modes (our request, a settings default at
                 // start, an approved plan): follow it.
@@ -281,6 +345,9 @@ impl ChatSession {
                 return;
             }
             ProcessEvent::Exited => {
+                if was_busy {
+                    self.attention.set(Kind::Failed, None);
+                }
                 self.convo.on_exit(self.stderr_tail.last().cloned());
                 self.process = None;
             }
@@ -337,6 +404,7 @@ impl ChatSession {
 
     /// Send a turn (also used by automation in screenshot builds).
     pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.attention.set(Kind::Running, None);
         let text = text.to_string();
         let before = self.convo.items.len();
         self.convo.push_user(&text);
@@ -346,6 +414,7 @@ impl ChatSession {
                 is_error: true,
             });
             self.convo.status = Status::Idle;
+            self.attention.set(Kind::Failed, None);
         }
         self.items_changed(before, cx);
     }
@@ -399,6 +468,9 @@ impl ChatSession {
         };
         if sent.is_ok() {
             self.convo.resolve_permission(&request_id, decision);
+            if self.convo.pending_permission().is_none() {
+                self.attention.set(Kind::Running, None);
+            }
         }
         let len = self.convo.items.len();
         self.items_changed(len, cx);
@@ -699,6 +771,12 @@ impl ChatSession {
                             .label("Deny")
                             .small()
                             .ghost()
+                            .when(
+                                self.convo
+                                    .pending_permission()
+                                    .is_some_and(|pending| pending.request_id == p.request_id),
+                                |button| button.track_focus(&self.permission_focus),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.decide(rid3.clone(), Decision::Denied, cx)
                             })),
