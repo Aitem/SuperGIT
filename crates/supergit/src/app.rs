@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::*;
@@ -69,6 +70,10 @@ pub struct SuperGitApp {
     tab: MainTab,
     details: Details,
     changes_diff: Entity<DiffState>,
+    sidebar_layout: Entity<ResizableState>,
+    chat_layout: Entity<ResizableState>,
+    changes_layout: Entity<ResizableState>,
+    history_layout: Entity<ResizableState>,
     selected_commit: Option<String>,
     commit_diff: Entity<DiffState>,
 
@@ -129,6 +134,10 @@ impl SuperGitApp {
             tab: initial_tab(),
             details: Details::default(),
             changes_diff,
+            sidebar_layout: cx.new(|_| ResizableState::default()),
+            chat_layout: cx.new(|_| ResizableState::default()),
+            changes_layout: cx.new(|_| ResizableState::default()),
+            history_layout: cx.new(|_| ResizableState::default()),
             selected_commit: None,
             commit_diff,
             branch_input,
@@ -862,7 +871,8 @@ impl SuperGitApp {
             .collect::<Vec<_>>();
 
         v_flex()
-            .w(px(320.))
+            .w_full()
+            .min_w_0()
             .h_full()
             .flex_none()
             .bg(theme.sidebar)
@@ -1252,25 +1262,32 @@ impl SuperGitApp {
                     el.child(div().text_xs().text_color(theme.success).child("staged"))
                 })
         });
-        h_flex()
-            .size_full()
+        h_resizable("changes-layout")
+            .with_state(&self.changes_layout)
             .child(
-                v_flex()
-                    .id("change-list")
-                    .w(px(300.))
-                    .flex_none()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .border_r_1()
-                    .border_color(theme.border)
-                    .children(rows),
+                resizable_panel()
+                    .size(px(300.))
+                    .size_range(px(140.)..px(600.))
+                    .child(
+                        v_flex()
+                            .id("change-list")
+                            .w_full()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .border_r_1()
+                            .border_color(theme.border)
+                            .children(rows),
+                    ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(Diff::new(&self.changes_diff).line_number(true)),
+                resizable_panel().size_range(px(180.)..Pixels::MAX).child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(Diff::new(&self.changes_diff).line_number(true)),
+                ),
             )
             .into_any_element()
     }
@@ -1286,34 +1303,41 @@ impl SuperGitApp {
             commit_row(ix, c, selected, theme)
                 .on_click(cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)))
         });
-        h_flex()
-            .size_full()
+        h_resizable("history-layout")
+            .with_state(&self.history_layout)
             .child(
-                v_flex()
-                    .id("commit-list")
-                    .w(relative(0.45))
-                    .flex_none()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .border_r_1()
-                    .border_color(theme.border)
-                    .children(rows),
+                resizable_panel()
+                    .size(px(300.))
+                    .size_range(px(160.)..px(800.))
+                    .child(
+                        v_flex()
+                            .id("commit-list")
+                            .w_full()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .border_r_1()
+                            .border_color(theme.border)
+                            .children(rows),
+                    ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .when(self.selected_commit.is_none(), |el| {
-                        el.flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme.muted_foreground)
-                            .child("Select a commit")
-                    })
-                    .when(self.selected_commit.is_some(), |el| {
-                        el.child(Diff::new(&self.commit_diff).line_number(true))
-                    }),
+                resizable_panel().size_range(px(180.)..Pixels::MAX).child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .when(self.selected_commit.is_none(), |el| {
+                            el.flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(theme.muted_foreground)
+                                .child("Select a commit")
+                        })
+                        .when(self.selected_commit.is_some(), |el| {
+                            el.child(Diff::new(&self.commit_diff).line_number(true))
+                        }),
+                ),
             )
     }
 
@@ -1513,7 +1537,8 @@ impl SuperGitApp {
         });
 
         v_flex()
-            .w(px(480.))
+            .w_full()
+            .min_w_0()
             .flex_none()
             .h_full()
             .border_l_1()
@@ -1679,14 +1704,47 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::new_chat_action))
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
-                let panel = (self.chat_open && self.selected.is_some())
-                    .then(|| self.render_claude_panel(window, cx));
-                h_flex()
+                let show_chat = self.chat_open && self.selected.is_some();
+                let main = self.render_main(window, cx);
+                let workspace = if show_chat {
+                    let chat = self.render_claude_panel(window, cx);
+                    h_resizable("chat-layout")
+                        .with_state(&self.chat_layout)
+                        .child(
+                            resizable_panel()
+                                .size_range(px(360.)..Pixels::MAX)
+                                .child(main),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(px(480.))
+                                .size_range(px(320.)..px(960.))
+                                .child(chat),
+                        )
+                        .into_any_element()
+                } else {
+                    main
+                };
+                div()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_main(window, cx))
-                    .children(panel)
+                    .child(
+                        h_resizable("sidebar-layout")
+                            .with_state(&self.sidebar_layout)
+                            .child(
+                                resizable_panel()
+                                    .size(px(320.))
+                                    .size_range(px(220.)..px(520.))
+                                    .child(self.render_sidebar(cx)),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(
+                                        px(if show_chat { 680. } else { 360. })..Pixels::MAX,
+                                    )
+                                    .child(workspace),
+                            ),
+                    )
                     .into_any_element()
             } else {
                 self.render_welcome(cx).into_any_element()
