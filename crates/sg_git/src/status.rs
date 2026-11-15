@@ -17,7 +17,7 @@ pub enum FileState {
 }
 
 impl FileState {
-    fn from_code(c: u8) -> Option<Self> {
+    pub(crate) fn from_code(c: u8) -> Option<Self> {
         Some(match c {
             b'A' => Self::Added,
             b'M' => Self::Modified,

@@ -153,6 +153,116 @@ fn existing_branch_checkout_and_unborn_repo() {
     assert_eq!(FileState::Untracked, st.files[0].state());
 }
 
+#[test]
+fn branch_comparison_keeps_committed_and_new_work_against_merge_base() {
+    let t = TempRepo::new("comparison");
+    std::fs::write(t.root().join("a.txt"), "one\n".repeat(20)).unwrap();
+    t.git(&["add", "."]);
+    t.git(&["commit", "-qm", "base content"]);
+    t.git(&["branch", "release/trunk"]);
+    t.git(&["checkout", "-qb", "agent/task"]);
+    t.git(&["mv", "a.txt", "renamed.txt"]);
+    std::fs::write(t.root().join("committed.txt"), "committed work\n").unwrap();
+    t.git(&["add", "."]);
+    t.git(&["commit", "-qm", "agent checkpoint"]);
+    std::fs::write(
+        t.root().join("renamed.txt"),
+        format!("{}next edit\n", "one\n".repeat(20)),
+    )
+    .unwrap();
+    std::fs::write(t.root().join("fresh.txt"), "new untracked work\n").unwrap();
+    std::fs::write(t.root().join("binary.bin"), [0, 1, 2]).unwrap();
+    let status = sg_git::status(&t.root()).unwrap();
+    let changes = sg_git::branch_changes(&t.root(), &status, "release/trunk").unwrap();
+    assert!(
+        changes.patch.contains("+committed work"),
+        "{}",
+        changes.patch
+    );
+    assert!(changes.patch.contains("+next edit"));
+    assert!(changes.patch.contains("+new untracked work"));
+    assert!(changes.patch.contains("Binary files"));
+    assert_eq!(changes.files.len(), 4);
+    assert!(changes.files.iter().any(|file| file.path == "renamed.txt"));
+    assert!(
+        !sg_git::worktree_patch(&t.root(), &status)
+            .unwrap()
+            .contains("committed work")
+    );
+    t.git(&["checkout", "--detach", "-q"]);
+    assert!(sg_git::branch_changes(&t.root(), &status, "release/trunk").is_ok());
+    assert!(sg_git::branch_changes(&t.root(), &status, "missing").is_err());
+    assert!(sg_git::resolve_branch(&t.root(), "HEAD~1").is_err());
+    assert!(sg_git::resolve_branch(&t.root(), "--help").is_err());
+}
+
+#[test]
+fn unborn_branch_comparison_is_an_error() {
+    let t = TempRepo::new("comparison_unborn");
+    let empty = t.dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "trunk"])
+            .current_dir(&empty)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = sg_git::status(&empty).unwrap();
+    assert!(
+        sg_git::branch_changes(&empty, &status, "trunk")
+            .unwrap_err()
+            .to_string()
+            .contains("first commit")
+    );
+}
+
+#[test]
+fn recreated_untracked_path_is_compared_to_base_without_changing_staging() {
+    let t = TempRepo::new("comparison_recreated");
+    t.git(&["branch", "trunk"]);
+    t.git(&["rm", "-q", "a.txt"]);
+    t.git(&["commit", "-qm", "remove file"]);
+    std::fs::write(t.root().join("a.txt"), "one\nrestored locally\n").unwrap();
+    let index = t.root().join(".git/index");
+    let before = std::fs::read(&index).unwrap();
+    let status = sg_git::status(&t.root()).unwrap();
+    let changes = sg_git::branch_changes(&t.root(), &status, "trunk").unwrap();
+    assert_eq!(changes.files.len(), 1);
+    assert_eq!(changes.files[0].state(), FileState::Modified);
+    assert!(changes.patch.contains("+restored locally"));
+    assert!(!changes.patch.contains("new file mode"));
+    assert_eq!(std::fs::read(index).unwrap(), before);
+    assert_eq!(sg_git::status(&t.root()).unwrap(), status);
+}
+
+#[test]
+fn branch_comparison_keeps_conflict_markers_and_conflicted_badge() {
+    let t = TempRepo::new("comparison_conflict");
+    t.git(&["checkout", "-qb", "topic"]);
+    std::fs::write(t.root().join("a.txt"), "topic\n").unwrap();
+    t.git(&["commit", "-qam", "topic edit"]);
+    t.git(&["checkout", "-q", "main"]);
+    std::fs::write(t.root().join("a.txt"), "main\n").unwrap();
+    t.git(&["commit", "-qam", "main edit"]);
+    let merge = Command::new("git")
+        .args(["merge", "topic"])
+        .current_dir(t.root())
+        .output()
+        .unwrap();
+    assert!(!merge.status.success());
+    let status = sg_git::status(&t.root()).unwrap();
+    let changes = sg_git::branch_changes(&t.root(), &status, "topic").unwrap();
+    assert!(changes.patch.contains("<<<<<<<"));
+    assert!(
+        changes
+            .files
+            .iter()
+            .any(|file| file.path == "a.txt" && file.state() == FileState::Conflicted)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn untracked_symlinks_show_targets_without_reading_them() {

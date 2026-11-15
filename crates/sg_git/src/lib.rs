@@ -6,11 +6,13 @@
 //! agents that run git in the same worktrees. Hot paths can move to `gix`
 //! later without changing this API.
 
+mod comparison;
 mod log;
 mod runner;
 mod status;
 mod worktree;
 
+pub use comparison::{BranchChanges, branch_changes, resolve_branch, suggested_base};
 pub use log::{Commit, commit_patch, log};
 pub use runner::{GitError, git, git_bytes};
 pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};

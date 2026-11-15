@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -103,6 +104,7 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    base_inputs: HashMap<PathBuf, Entity<InputState>>,
     switcher_input: Entity<InputState>,
     switcher: Option<Switcher>,
     /// `None` shows the welcome screen (e.g. first launch from the Dock).
@@ -213,6 +215,7 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            base_inputs: HashMap::new(),
             switcher_input,
             switcher: None,
             repo,
@@ -1042,12 +1045,13 @@ impl SuperGitApp {
         };
         let path = info.wt.path.clone();
         let status = info.status.clone();
+        let base = self.comparison_base();
         self.details_generation += 1;
         let generation = self.details_generation;
         self.details_task = Some(cx.spawn(async move |this, cx| {
             let details = cx
                 .background_executor()
-                .spawn(async move { model::load_details(&path, status) })
+                .spawn(async move { model::load_details(&path, status, base) })
                 .await;
             this.update(cx, |this, cx| {
                 if generation == this.details_generation {
@@ -1060,7 +1064,7 @@ impl SuperGitApp {
     }
 
     fn apply_details(&mut self, mut details: Details, cx: &mut Context<Self>) {
-        if self.selected.as_ref() != Some(&details.path) {
+        if self.selected.as_ref() != Some(&details.path) || self.comparison_base() != details.base {
             return;
         }
         if let LoadState::Ready(patch) = &details.patch
@@ -1848,7 +1852,7 @@ impl SuperGitApp {
             )
     }
 
-    fn render_main(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let Some(info) = self.selected_info().cloned() else {
             if let Some(error) = &self.load_error {
@@ -1869,11 +1873,18 @@ impl SuperGitApp {
         };
 
         let tab_ix = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
-        let changes = info
-            .status
-            .as_ref()
-            .map(|status| status.files.len().to_string())
-            .unwrap_or_else(|_| "—".into());
+        let changes = if self.comparison_base().is_some() {
+            self.details
+                .files
+                .value()
+                .map(|files| files.len().to_string())
+                .unwrap_or_else(|| "—".into())
+        } else {
+            info.status
+                .as_ref()
+                .map(|status| status.files.len().to_string())
+                .unwrap_or_else(|_| "—".into())
+        };
         let sessions = info.sessions.len();
         let open_prs = self
             .prs
@@ -1883,9 +1894,19 @@ impl SuperGitApp {
 
         let (_, _, main_width) = self.pane_widths(window, cx);
         let content = match self.tab {
-            MainTab::Changes => self
-                .render_changes(&info, main_width, &theme, cx)
-                .into_any_element(),
+            MainTab::Changes => {
+                let comparison = self.render_comparison(window, cx);
+                v_flex()
+                    .size_full()
+                    .child(comparison)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(self.render_changes(&info, main_width, &theme, cx)),
+                    )
+                    .into_any_element()
+            }
             MainTab::History => self
                 .render_history(main_width, &theme, cx)
                 .into_any_element(),
@@ -2123,6 +2144,133 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    fn comparison_base(&self) -> Option<String> {
+        let view = self
+            .selected
+            .as_ref()
+            .and_then(|path| self.repository_view().worktrees.get(path))?;
+        view.branch_changes.then(|| view.base.clone())
+    }
+
+    fn change_comparison(&mut self, branch: bool, base: Option<String>, cx: &mut Context<Self>) {
+        let (Some(root), Some(path)) = (
+            self.repo.as_ref().map(|repo| repo.root.clone()),
+            self.selected.clone(),
+        ) else {
+            return;
+        };
+        self.capture_saved_review(cx);
+        let suggestion = self
+            .selected_info()
+            .and_then(|info| self.pr_for_branch(info.wt.branch.as_deref()))
+            .map(|pr| pr.base_branch.clone())
+            .or_else(|| self.details.suggested_base.clone());
+        let view = self
+            .persisted
+            .repositories
+            .entry(root)
+            .or_default()
+            .worktrees
+            .entry(path)
+            .or_default();
+        view.branch_changes = branch;
+        if let Some(base) = base {
+            view.base = base;
+        } else if view.base.is_empty() {
+            view.base = suggestion.unwrap_or_default();
+        }
+        self.details_generation += 1;
+        self.details_task = None;
+        self.details.base = self.comparison_base();
+        self.details.patch = LoadState::Loading;
+        self.details.files = LoadState::Loading;
+        self.details.merge_base = None;
+        self.changes_diff
+            .update(cx, |diff, cx| diff.set_files(Vec::new(), cx));
+        self.reload_details(cx);
+        self.queue_persist(cx);
+        cx.notify();
+    }
+
+    fn render_comparison(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(path) = self.selected.clone() else {
+            return div().into_any_element();
+        };
+        let base = self.comparison_base();
+        let theme = cx.theme().clone();
+        let mut bar = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                Button::new("compare-uncommitted")
+                    .label("Uncommitted")
+                    .xsmall()
+                    .ghost()
+                    .selected(base.is_none())
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.change_comparison(false, None, cx)),
+                    ),
+            )
+            .child(
+                Button::new("compare-branch")
+                    .label("Branch changes")
+                    .xsmall()
+                    .ghost()
+                    .selected(base.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| this.change_comparison(true, None, cx))),
+            );
+        if let Some(base) = base {
+            if !self.base_inputs.contains_key(&path) {
+                let input = cx.new(|cx| {
+                    let mut input = InputState::new(window, cx).placeholder("Base branch");
+                    input.set_value(base, window, cx);
+                    input
+                });
+                cx.subscribe(&input, |this, input, event, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        let base = input.read(cx).value().trim().to_string();
+                        this.change_comparison(true, Some(base), cx);
+                    }
+                })
+                .detach();
+                self.base_inputs.insert(path.clone(), input);
+            }
+            let input = self.base_inputs[&path].clone();
+            bar = bar
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Base"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(80.))
+                        .child(Input::new(&input).small()),
+                )
+                .child(
+                    Button::new("apply-base")
+                        .label("Compare")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let base = input.read(cx).value().trim().to_string();
+                            this.change_comparison(true, Some(base), cx);
+                        })),
+                );
+        }
+        v_flex().w_full().border_b_1().border_color(theme.border).child(bar)
+            .child(div().px_3().pb_1().text_xs().text_color(theme.muted_foreground)
+                .child(if let Some(base) = &self.details.base {
+                    format!("Working tree vs merge base of {base}{} · includes committed and uncommitted work",
+                        self.details.merge_base.as_ref().map(|oid| format!(" ({})", &oid[..oid.len().min(8)])).unwrap_or_default())
+                } else { "Working tree vs HEAD · staged, unstaged and untracked changes".into() }))
+            .into_any_element()
+    }
+
     fn render_changes(
         &self,
         info: &WorktreeInfo,
@@ -2135,8 +2283,9 @@ impl SuperGitApp {
             .as_deref()
             .or_else(|| info.status.as_ref().err().map(String::as_str))
             .or_else(|| self.details.status.error())
+            .or_else(|| self.details.files.error())
             .or_else(|| self.details.patch.error());
-        let Some(status) = self.details.status.value() else {
+        let Some(files) = self.details.files.value() else {
             return if let Some(error) = error {
                 self.render_data_notice("Changes unavailable", Some(error), false, cx)
             } else {
@@ -2151,7 +2300,7 @@ impl SuperGitApp {
                 cx,
             )
         });
-        let files = status.files.clone();
+        let files = files.clone();
         if files.is_empty() {
             return v_flex()
                 .size_full()
@@ -2166,7 +2315,11 @@ impl SuperGitApp {
                         .child(if error.is_some() {
                             "Last successful status: no changes"
                         } else {
-                            "Working tree clean"
+                            if self.comparison_base().is_some() {
+                                "No branch changes against this merge base"
+                            } else {
+                                "Working tree clean"
+                            }
                         }),
                 )
                 .into_any_element();

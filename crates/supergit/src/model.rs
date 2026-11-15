@@ -148,6 +148,10 @@ impl<T: Clone> LoadState<T> {
 #[derive(Clone, Debug, Default)]
 pub struct Details {
     pub path: PathBuf,
+    pub base: Option<String>,
+    pub suggested_base: Option<String>,
+    pub merge_base: Option<String>,
+    pub files: LoadState<Vec<sg_git::FileChange>>,
     pub status: LoadState<WorktreeStatus>,
     pub patch: LoadState<String>,
     pub commits: LoadState<Vec<Commit>>,
@@ -155,18 +159,46 @@ pub struct Details {
 
 impl Details {
     pub fn update(&mut self, next: Self) {
-        if self.path != next.path {
+        if self.path != next.path || self.base != next.base {
             *self = next;
             return;
         }
         self.status.update(next.status);
+        self.files.update(next.files);
+        self.merge_base = next.merge_base;
+        self.suggested_base = next.suggested_base;
         self.patch.update(next.patch);
         self.commits.update(next.commits);
     }
 }
 
-pub fn load_details(path: &Path, status: Result<WorktreeStatus, String>) -> Details {
+pub fn load_details(
+    path: &Path,
+    status: Result<WorktreeStatus, String>,
+    base: Option<String>,
+) -> Details {
+    let suggested_base = sg_git::suggested_base(path);
+    let mut files = status
+        .as_ref()
+        .map(|status| status.files.clone())
+        .map_err(Clone::clone);
+    let mut merge_base = None;
     let patch = match &status {
+        Ok(st) if base.is_some() => {
+            match sg_git::branch_changes(path, st, base.as_deref().unwrap_or_default())
+                .map_err(git_error_message)
+            {
+                Ok(changes) => {
+                    files = Ok(changes.files);
+                    merge_base = Some(changes.merge_base);
+                    Ok(changes.patch)
+                }
+                Err(error) => {
+                    files = Err(error.clone());
+                    Err(error)
+                }
+            }
+        }
         Ok(st) if !st.is_clean() => sg_git::worktree_patch(path, st).map_err(git_error_message),
         Ok(_) => Ok(String::new()),
         Err(error) => Err(error.clone()),
@@ -174,6 +206,10 @@ pub fn load_details(path: &Path, status: Result<WorktreeStatus, String>) -> Deta
     let commits = sg_git::log(path, "HEAD", 400).map_err(git_error_message);
     Details {
         path: path.to_path_buf(),
+        base,
+        suggested_base,
+        merge_base,
+        files: LoadState::from_result(files),
         status: LoadState::from_result(status),
         patch: LoadState::from_result(patch),
         commits: LoadState::from_result(commits),
@@ -289,7 +325,7 @@ mod tests {
         let temp = TempDir::new();
         let status = sg_git::status(&temp.0).map_err(|e| e.to_string());
         assert!(status.is_err());
-        let details = load_details(&temp.0, status);
+        let details = load_details(&temp.0, status, None);
         assert!(details.status.error().is_some());
         assert!(details.patch.error().is_some());
         assert!(details.commits.error().is_some());
@@ -303,7 +339,11 @@ mod tests {
         let temp = TempDir::new();
         temp.git(&["init", "-q", "-b", "main"]);
         assert!(sg_git::log(&temp.0, "missing-branch", 10).is_err());
-        let details = load_details(&temp.0, sg_git::status(&temp.0).map_err(|e| e.to_string()));
+        let details = load_details(
+            &temp.0,
+            sg_git::status(&temp.0).map_err(|e| e.to_string()),
+            None,
+        );
         assert!(details.status.value().unwrap().is_clean());
         assert_eq!(details.patch.value().map(String::as_str), Some(""));
         assert!(matches!(details.commits, LoadState::Ready(commits) if commits.is_empty()));
@@ -325,7 +365,11 @@ mod tests {
             "supergit-nonexistent-test-textconv",
         ]);
         std::fs::write(temp.0.join("tracked.txt"), "after\n").unwrap();
-        let mut details = load_details(&temp.0, sg_git::status(&temp.0).map_err(|e| e.to_string()));
+        let mut details = load_details(
+            &temp.0,
+            sg_git::status(&temp.0).map_err(|e| e.to_string()),
+            None,
+        );
         assert!(details.status.error().is_none());
         assert!(details.patch.error().is_some());
         assert_eq!(details.commits.value().unwrap().len(), 1);
@@ -334,6 +378,7 @@ mod tests {
         details.update(load_details(
             &temp.0,
             sg_git::status(&temp.0).map_err(|e| e.to_string()),
+            None,
         ));
         assert!(details.patch.error().is_none());
         assert!(details.patch.value().unwrap().contains("+after"));
