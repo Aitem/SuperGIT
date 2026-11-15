@@ -1131,11 +1131,32 @@ impl SuperGitApp {
                     .min_w_0()
                     .gap_1()
                     .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .truncate()
-                            .child(info.wt.display_name()),
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD)
+                                    .truncate()
+                                    .child(info.wt.display_name()),
+                            )
+                            .when_some(info.wt.branch.clone(), |row, branch| {
+                                row.child(
+                                    Button::new("copy-branch-name")
+                                        .label("Copy")
+                                        .small()
+                                        .ghost()
+                                        .tooltip(format!("Copy branch name: {branch}"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                branch.clone(),
+                                            ));
+                                            this.flash("Copied branch name", false, cx);
+                                        })),
+                                )
+                            }),
                     )
                     .child(
                         div()
