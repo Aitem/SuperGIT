@@ -19,6 +19,30 @@ plan-mode "accept plan" card, per-hunk accept/revert of edits, macOS
 notification when a conversation needs approval or finishes, queued messages
 while Claude works, copy buttons.
 
+## 1a. Codex alongside Claude
+
+Make the native coding-agent panel support both Claude Code and Codex, with
+an agent picker for each new conversation and independent sessions per
+worktree. Keep existing Claude conversations working throughout the change.
+
+1. Extract a UI-independent agent interface for session start/resume, sending
+   turns, streaming text/tool events, approval requests, interruption and exit.
+   Keep provider-specific transports and transcript formats in their adapters;
+   identify sessions by `(provider, session_id)` to avoid collisions.
+2. Add an `sg_codex` adapter using the installed Codex CLI's structured
+   `app-server` protocol over stdio. Verify the supported CLI/protocol version
+   and handshake before starting a conversation; report missing or incompatible
+   installations in the panel. Use the user's existing Codex login.
+3. Add the Claude/Codex picker, provider labels on tabs and sidebar activity,
+   and Codex session discovery/history/resume. Retain the original working
+   directory for resume and preserve existing Claude history.
+4. Render each provider's approval and sandbox capabilities explicitly: do
+   not assume that Claude permission modes map to Codex policies. Support
+   stop, process failure and reconnect without losing the visible transcript.
+5. Test both adapters with recorded protocol events and fake processes:
+   approvals, denied actions, interruption, crashes, resume and simultaneous
+   sessions in different worktrees. Keep real-agent tests opt-in.
+
 ## 1b. Embedded terminal
 
 For people who prefer the TUI and for plain shells: terminal tabs per
@@ -37,6 +61,15 @@ Installing hooks touches `~/.claude/settings.json`: always ask first.
 
 Lane graph across all branches and worktrees (GitKraken-style), gix-based
 traversal for big repos, filters (branch, author, "by Claude"), search.
+
+Git backend: evaluate a hybrid before a full migration. Benchmark `gix` and
+`git2`/libgit2 for history, refs and status behind the existing `sg_git` API;
+keep worktree mutations, fetch/push and signing/hook-sensitive operations on
+the Git CLI initially. Compare results with the CLI for staged + unstaged
+changes, renames, conflicts, untracked files, symlinks, detached/unborn HEAD,
+linked worktrees and concurrent external Git operations. Measure both latency
+and idle CPU on large repos and many worktrees; first avoid recomputing
+unchanged history/diffs on every poll and evaluate filesystem notifications.
 
 ## 4. Pull request details
 
