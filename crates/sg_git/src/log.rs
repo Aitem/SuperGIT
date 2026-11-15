@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::git;
+use crate::{GitError, git};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
@@ -41,11 +41,16 @@ pub fn log(path: &Path, rev: &str, limit: usize) -> Result<Vec<Commit>> {
         Ok(out) => out,
         Err(e) => {
             // Unborn branch (no commits yet): an empty history, not an error.
-            let rev_exists = git(path, ["rev-parse", "--verify", "--quiet", rev]).is_ok();
-            if rev_exists {
-                return Err(e);
+            if rev == "HEAD"
+                && let Ok(branch) = git(path, ["symbolic-ref", "--quiet", "HEAD"])
+                && let Err(missing) = git(path, ["show-ref", "--verify", "--quiet", branch.trim()])
+                && missing
+                    .downcast_ref::<GitError>()
+                    .is_some_and(|e| e.code == Some(1))
+            {
+                return Ok(Vec::new());
             }
-            return Ok(Vec::new());
+            return Err(e);
         }
     };
     Ok(parse_log(&out))

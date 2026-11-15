@@ -19,7 +19,7 @@ use sg_github::{PrState, PullRequest};
 
 use crate::chat::ChatSession;
 use crate::launch::{self, TerminalApp};
-use crate::model::{self, Details, SharedSessionIndex, WorktreeInfo};
+use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::settings::Appearance;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -76,6 +76,9 @@ pub struct SuperGitApp {
     history_layout: Entity<ResizableState>,
     selected_commit: Option<String>,
     commit_diff: Entity<DiffState>,
+    commit_patch: LoadState<String>,
+    details_generation: u64,
+    commit_generation: u64,
 
     branch_input: Entity<InputState>,
     confirm_remove: Option<PathBuf>,
@@ -141,6 +144,9 @@ impl SuperGitApp {
             history_layout: cx.new(|_| ResizableState::default()),
             selected_commit: None,
             commit_diff,
+            commit_patch: LoadState::Loading,
+            details_generation: 0,
+            commit_generation: 0,
             branch_input,
             confirm_remove: None,
             chats: HashMap::new(),
@@ -222,8 +228,13 @@ impl SuperGitApp {
                 self.load_error = None;
                 self.worktrees = list;
             }
-            Err(e) => self.load_error = Some(e.to_string()),
+            Err(e) => {
+                self.load_error = Some(model::git_error_message(e));
+                cx.notify();
+                return;
+            }
         }
+        let previous = self.selected.clone();
         let valid = self
             .selected
             .as_ref()
@@ -237,6 +248,9 @@ impl SuperGitApp {
                 .max_by_key(|w| w.wt.path.as_os_str().len())
                 .or(self.worktrees.first())
                 .map(|w| w.wt.path.clone());
+        }
+        if self.selected != previous {
+            self.reset_details(cx);
         }
         self.reload_details(cx);
         #[cfg(feature = "screenshot")]
@@ -305,46 +319,87 @@ impl SuperGitApp {
     }
 
     fn reload_details(&mut self, cx: &mut Context<Self>) {
+        // Let a slow read finish instead of canceling it on every poll.
+        if self.details_task.is_some() {
+            return;
+        }
         let Some(info) = self.selected_info() else {
             return;
         };
         let path = info.wt.path.clone();
-        let status = info.status.clone().ok();
+        let status = info.status.clone();
+        self.details_generation += 1;
+        let generation = self.details_generation;
         self.details_task = Some(cx.spawn(async move |this, cx| {
             let details = cx
                 .background_executor()
-                .spawn(async move { model::load_details(&path, status.as_ref()) })
+                .spawn(async move { model::load_details(&path, status) })
                 .await;
-            this.update(cx, |this, cx| this.apply_details(details, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                if generation == this.details_generation {
+                    this.details_task = None;
+                    this.apply_details(details, cx);
+                }
+            })
+            .ok();
         }));
     }
 
-    fn apply_details(&mut self, details: Details, cx: &mut Context<Self>) {
+    fn apply_details(&mut self, mut details: Details, cx: &mut Context<Self>) {
         if self.selected.as_ref() != Some(&details.path) {
             return;
         }
-        if details.patch != self.details.patch || details.path != self.details.path {
-            let files = DiffFile::parse(&details.patch).unwrap_or_default();
-            self.changes_diff
-                .update(cx, |state, cx| state.set_files(files, cx));
+        if let LoadState::Ready(patch) = &details.patch
+            && (self.details.patch.value() != Some(patch) || details.path != self.details.path)
+        {
+            match DiffFile::parse(patch) {
+                Ok(files) => self
+                    .changes_diff
+                    .update(cx, |state, cx| state.set_files(files, cx)),
+                Err(error) => {
+                    details.patch =
+                        LoadState::from_result(Err(format!("Cannot display diff: {error}")));
+                }
+            }
         }
-        if let Some(sha) = &self.selected_commit
-            && !details.commits.iter().any(|c| &c.sha == sha)
+        // A failed history refresh must not clear the current review selection.
+        if let LoadState::Ready(commits) = &details.commits
+            && let Some(sha) = &self.selected_commit
+            && !commits.iter().any(|c| &c.sha == sha)
         {
             self.selected_commit = None;
+            self.commit_task = None;
+            self.commit_generation += 1;
+            self.commit_patch = LoadState::Loading;
             self.commit_diff
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
         }
-        let first_commit = details.commits.first().map(|c| c.sha.clone());
-        self.details = details;
-        // Show the latest commit right away instead of an empty pane.
+        self.details.update(details);
         if self.selected_commit.is_none()
-            && let Some(sha) = first_commit
+            && let Some(sha) = self
+                .details
+                .commits
+                .value()
+                .and_then(|commits| commits.first())
+                .map(|c| c.sha.clone())
         {
             self.select_commit(sha, cx);
         }
         cx.notify();
+    }
+
+    fn reset_details(&mut self, cx: &mut Context<Self>) {
+        self.details_generation += 1;
+        self.commit_generation += 1;
+        self.details_task = None;
+        self.commit_task = None;
+        self.details = Details::default();
+        self.selected_commit = None;
+        self.commit_patch = LoadState::Loading;
+        self.changes_diff
+            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        self.commit_diff
+            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -353,12 +408,7 @@ impl SuperGitApp {
         }
         self.selected = Some(path);
         self.confirm_remove = None;
-        self.selected_commit = None;
-        self.details = Details::default();
-        self.changes_diff
-            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
-        self.commit_diff
-            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        self.reset_details(cx);
         self.reload_details(cx);
         cx.notify();
     }
@@ -367,22 +417,39 @@ impl SuperGitApp {
         let Some(path) = self.selected.clone() else {
             return;
         };
+        if self.selected_commit.as_ref() != Some(&sha) {
+            self.commit_patch = LoadState::Loading;
+            self.commit_diff
+                .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        }
         self.selected_commit = Some(sha.clone());
+        self.commit_generation += 1;
+        let generation = self.commit_generation;
         self.commit_task = Some(cx.spawn(async move |this, cx| {
+            let request_path = path.clone();
+            let request_sha = sha.clone();
             let patch = cx
                 .background_executor()
-                .spawn(async move { sg_git::commit_patch(&path, &sha) })
+                .spawn(async move {
+                    sg_git::commit_patch(&request_path, &request_sha)
+                        .map_err(model::git_error_message)
+                })
                 .await;
             this.update(cx, |this, cx| {
-                let files = match patch {
-                    Ok(p) => DiffFile::parse(&p).unwrap_or_default(),
-                    Err(e) => {
-                        this.flash(format!("{e}"), true, cx);
-                        Vec::new()
-                    }
-                };
-                this.commit_diff
-                    .update(cx, |state, cx| state.set_files(files, cx));
+                if generation != this.commit_generation
+                    || this.selected.as_ref() != Some(&path)
+                    || this.selected_commit.as_ref() != Some(&sha)
+                {
+                    return;
+                }
+                let patch = patch.and_then(|patch| {
+                    let files = DiffFile::parse(&patch)
+                        .map_err(|e| format!("Cannot display commit diff: {e}"))?;
+                    this.commit_diff
+                        .update(cx, |state, cx| state.set_files(files, cx));
+                    Ok(patch)
+                });
+                this.commit_patch.update(LoadState::from_result(patch));
                 cx.notify();
             })
             .ok();
@@ -434,15 +501,8 @@ impl SuperGitApp {
         self.prs_error = None;
         self.prs_loaded = false;
         self.selected = None;
-        self.details = Details::default();
-        self.selected_commit = None;
         self.confirm_remove = None;
-        self.details_task = None;
-        self.commit_task = None;
-        self.changes_diff
-            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
-        self.commit_diff
-            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        self.reset_details(cx);
     }
 
     pub fn open_repository(&mut self, _: &OpenRepository, _: &mut Window, cx: &mut Context<Self>) {
@@ -958,10 +1018,10 @@ impl SuperGitApp {
                     meta.push(div().child(format!("↓{}", st.behind)).into_any_element());
                 }
             }
-            Err(e) => meta.push(
+            Err(_) => meta.push(
                 div()
                     .text_color(theme.danger)
-                    .child(e.clone())
+                    .child("Status unavailable")
                     .into_any_element(),
             ),
         }
@@ -1031,6 +1091,9 @@ impl SuperGitApp {
     fn render_main(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let Some(info) = self.selected_info().cloned() else {
+            if let Some(error) = &self.load_error {
+                return self.render_data_notice("Worktrees unavailable", Some(error), false, cx);
+            }
             return div()
                 .flex_1()
                 .flex()
@@ -1046,7 +1109,11 @@ impl SuperGitApp {
         };
 
         let tab_ix = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
-        let changes = info.changed_files();
+        let changes = info
+            .status
+            .as_ref()
+            .map(|status| status.files.len().to_string())
+            .unwrap_or_else(|_| "—".into());
         let sessions = info.sessions.len();
         let open_prs = self
             .prs
@@ -1243,25 +1310,98 @@ impl SuperGitApp {
             )
     }
 
+    /// Inline feedback keeps errors actionable without a modal or a focus change.
+    fn render_data_notice(
+        &self,
+        title: &str,
+        detail: Option<&str>,
+        retry_commit: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .p_3()
+            .gap_2()
+            .text_sm()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title.to_string()),
+            )
+            .when_some(detail.map(str::to_string), |el, detail| {
+                el.child(div().text_color(theme.muted_foreground).child(detail))
+                    .child(
+                        Button::new(if retry_commit {
+                            "retry-commit"
+                        } else {
+                            "retry-git-data"
+                        })
+                        .label("Retry")
+                        .small()
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if retry_commit {
+                                if let Some(sha) = this.selected_commit.clone() {
+                                    this.select_commit(sha, cx);
+                                }
+                            } else {
+                                this.start_polling(cx);
+                            }
+                        })),
+                    )
+            })
+            .into_any_element()
+    }
+
     fn render_changes(
         &self,
         info: &WorktreeInfo,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let files = info
-            .status
-            .as_ref()
-            .map(|s| s.files.clone())
-            .unwrap_or_default();
+        let error = self
+            .load_error
+            .as_deref()
+            .or_else(|| info.status.as_ref().err().map(String::as_str))
+            .or_else(|| self.details.status.error())
+            .or_else(|| self.details.patch.error());
+        let Some(status) = self.details.status.value() else {
+            return if let Some(error) = error {
+                self.render_data_notice("Changes unavailable", Some(error), false, cx)
+            } else {
+                self.render_data_notice("Loading changes…", None, false, cx)
+            };
+        };
+        let notice = error.map(|error| {
+            self.render_data_notice(
+                "Changes may be out of date — showing the last successful data",
+                Some(error),
+                false,
+                cx,
+            )
+        });
+        let files = status.files.clone();
         if files.is_empty() {
-            return div()
+            return v_flex()
                 .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.muted_foreground)
-                .child("Working tree clean")
+                .children(notice)
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.muted_foreground)
+                        .child(if error.is_some() {
+                            "Last successful status: no changes"
+                        } else {
+                            "Working tree clean"
+                        }),
+                )
                 .into_any_element();
         }
         let rows = files.into_iter().enumerate().map(|(ix, f)| {
@@ -1292,7 +1432,7 @@ impl SuperGitApp {
                     el.child(div().text_xs().text_color(theme.success).child("staged"))
                 })
         });
-        h_resizable("changes-layout")
+        let content = h_resizable("changes-layout")
             .with_state(&self.changes_layout)
             .child(
                 resizable_panel()
@@ -1319,6 +1459,11 @@ impl SuperGitApp {
                         .child(Diff::new(&self.changes_diff).line_number(true)),
                 ),
             )
+            .into_any_element();
+        v_flex()
+            .size_full()
+            .children(notice)
+            .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
 
@@ -1327,13 +1472,51 @@ impl SuperGitApp {
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let rows = self.details.commits.iter().enumerate().map(|(ix, c)| {
+        let error = self
+            .load_error
+            .as_deref()
+            .or_else(|| self.details.commits.error());
+        let Some(commits) = self.details.commits.value() else {
+            return if let Some(error) = error {
+                self.render_data_notice("History unavailable", Some(error), false, cx)
+            } else {
+                self.render_data_notice("Loading history…", None, false, cx)
+            };
+        };
+        let notice = error.map(|error| {
+            self.render_data_notice(
+                "History may be out of date — showing the last successful data",
+                Some(error),
+                false,
+                cx,
+            )
+        });
+        if commits.is_empty() {
+            return v_flex()
+                .size_full()
+                .children(notice)
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.muted_foreground)
+                        .child(if error.is_some() {
+                            "Last successful history: no commits"
+                        } else {
+                            "No commits yet"
+                        }),
+                )
+                .into_any_element();
+        }
+        let rows = commits.iter().enumerate().map(|(ix, c)| {
             let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
             let sha = c.sha.clone();
             commit_row(ix, c, selected, theme)
                 .on_click(cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)))
         });
-        h_resizable("history-layout")
+        let content = h_resizable("history-layout")
             .with_state(&self.history_layout)
             .child(
                 resizable_panel()
@@ -1352,23 +1535,50 @@ impl SuperGitApp {
                     ),
             )
             .child(
-                resizable_panel().size_range(px(180.)..Pixels::MAX).child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .when(self.selected_commit.is_none(), |el| {
-                            el.flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(theme.muted_foreground)
-                                .child("Select a commit")
-                        })
-                        .when(self.selected_commit.is_some(), |el| {
-                            el.child(Diff::new(&self.commit_diff).line_number(true))
-                        }),
-                ),
+                resizable_panel()
+                    .size_range(px(180.)..Pixels::MAX)
+                    .child(self.render_commit_patch(cx)),
+            );
+        v_flex()
+            .size_full()
+            .children(notice)
+            .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
+
+    fn render_commit_patch(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.selected_commit.is_none() {
+            return self.render_data_notice("Select a commit", None, false, cx);
+        }
+        if self.commit_patch.is_loading() {
+            return self.render_data_notice("Loading commit diff…", None, false, cx);
+        }
+        let notice = self.commit_patch.error().map(|error| {
+            self.render_data_notice(
+                if self.commit_patch.value().is_some() {
+                    "Commit diff may be out of date — showing the last successful data"
+                } else {
+                    "Commit diff unavailable"
+                },
+                Some(error),
+                true,
+                cx,
             )
+        });
+        v_flex()
+            .size_full()
+            .children(notice)
+            .when_some(self.commit_patch.value(), |el, patch| {
+                el.child(div().flex_1().min_h_0().child(if patch.is_empty() {
+                    self.render_data_notice("No changes in this commit", None, false, cx)
+                } else {
+                    div()
+                        .size_full()
+                        .child(Diff::new(&self.commit_diff).line_number(true))
+                        .into_any_element()
+                }))
+            })
+            .into_any_element()
     }
 
     fn render_sessions(
