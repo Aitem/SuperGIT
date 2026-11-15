@@ -32,3 +32,6 @@ gpui_platform_test_support = { package = "gpui-pre-platform", version = "=0.3.12
 # `SUPERGIT_SCREENSHOT=out.png supergit` renders the window to a PNG and quits.
 # Used to check the UI without screen-recording permission (agents, CI).
 screenshot = ["dep:gpui_platform_test_support"]
+
+[lints]
+workspace = true

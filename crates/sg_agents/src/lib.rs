@@ -434,6 +434,7 @@ mod tests {
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &home) };
         let worktrees = vec![PathBuf::from("/w/repo"), PathBuf::from("/w/repo-box")];
         let by = SessionIndex::new().sessions_by_worktree(&worktrees);
+        // SAFETY: as above.
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
         std::fs::remove_dir_all(&home).ok();
         assert_eq!(

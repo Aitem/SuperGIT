@@ -1,5 +1,9 @@
 //! End-to-end checks against a real temporary repository: the operations the
 //! UI buttons run (create/list/status/log/remove worktrees).
+#![expect(
+    clippy::unwrap_used,
+    reason = "test helpers fail the test by panicking"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

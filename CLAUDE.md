@@ -62,7 +62,7 @@ no GPUI types in `sg_*` crates.
 ```sh
 cargo build                         # debug app (deps built with opt-level 2)
 cargo test --workspace              # unit + integration tests (temp git repos)
-cargo clippy --workspace --all-targets && cargo fmt --all
+cargo lint && cargo fmt --all        # lint = CI's clippy (.cargo/config.toml)
 cargo run -- --dump $SUPERGIT_TEST_REPO  # data layer as text, no window
 cargo run -- $SUPERGIT_TEST_REPO         # the app
 scripts/bundle-macos.sh --install   # SuperGIT.app → /Applications (ad-hoc signed)
@@ -75,6 +75,37 @@ CI (`.github/workflows/ci.yml`, on PRs and pushes to `main`, `macos-latest`):
 --workspace`, and `scripts/bundle-macos.sh` (release `.app`, no upload yet).
 All builds use `--locked`: commit `Cargo.lock` changes. The `CI ok` job
 aggregates the rest — the one check to require for merges.
+
+### Rust workflow for agents
+
+- **Iterate per crate.** `cargo check -p sg_git` / `cargo test -p sg_git` take
+  seconds: core crates don't build GPUI. Check the app crate (`-p supergit`)
+  only when you touched it.
+- **Hooks** (`.claude/settings.json`, scripts in `.claude/hooks/`): every
+  edited `.rs` file is rustfmt-ed; while Rust files differ from HEAD, finishing
+  a turn or running `git commit` first needs `cargo clippy --workspace
+  --all-targets -- -D warnings` to pass (exit 2 returns the errors to you).
+  `SUPERGIT_NO_RUST_GATE=1` turns the gate off. CI additionally checks
+  `--all-features` (`cargo lint`).
+- **Lints** (`[workspace.lints]` + `clippy.toml`) fail CI. Fix the code; when a
+  lint is truly wrong, use `#[expect(clippy::…, reason = "…")]` on the
+  narrowest item — `#[allow]` itself is a lint error. No `unwrap()` outside
+  tests (`?`, or `expect("why this holds")`), every `unsafe` block gets a
+  `// SAFETY:` comment, no `println!` outside `--dump`, `foo.rs` + `foo/`
+  instead of `foo/mod.rs`. `sg_claude` and `sg_github` forbid `unsafe`.
+- **LSP**: the `LSP` tool talks to rust-analyzer — `findReferences` before
+  changing a signature, `goToImplementation` for trait impls, `hover` for
+  inferred types. Right after a session starts it answers empty while it
+  indexes (about a minute). It does not push diagnostics after edits: the
+  compiler (`cargo check`) is the source of truth.
+- **GPUI API**: `gpui-pre 0.3.12` differs from the Zed GPUI you may remember.
+  Read the real source (`goToDefinition`, or
+  `~/.cargo/registry/src/*/gpui-pre-0.3.12`, `gpui-kit-0.9.1`) and existing
+  views in `app.rs` before guessing a method.
+- **Text is UTF-8** (Cyrillic branch names, commit subjects): never cut
+  user-visible strings by byte index (`&s[..n]` panics mid-character); use
+  `chars()` / `char_indices()`. Byte slicing is fine for SHAs and ASCII
+  porcelain fields.
 
 `main` is protected by a repository ruleset ("main: PR + green CI"): no
 direct pushes, force-pushes or deletion, no bypass even for admins. Every

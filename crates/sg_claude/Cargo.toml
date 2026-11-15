@@ -11,3 +11,6 @@ publish.workspace = true
 anyhow.workspace = true
 futures = { workspace = true, features = ["executor"] }
 serde_json.workspace = true
+
+[lints]
+workspace = true

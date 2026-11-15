@@ -38,9 +38,8 @@ define_class!(
             completion: &block2::DynBlock<dyn Fn()>,
         ) {
             // SAFETY: UserNotifications exports this immutable NSString constant.
-            if response.actionIdentifier().to_string()
-                != unsafe { UNNotificationDefaultActionIdentifier }.to_string()
-            {
+            let default_action = unsafe { UNNotificationDefaultActionIdentifier };
+            if response.actionIdentifier().to_string() != default_action.to_string() {
                 completion.call(());
                 return;
             }

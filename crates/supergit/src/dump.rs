@@ -1,5 +1,6 @@
 //! `supergit --dump [path]`: print what the UI would show, as text. Handy for
 //! debugging the data layer and for agents working on SuperGIT itself.
+#![expect(clippy::print_stdout, reason = "the dump is written to stdout")]
 
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;

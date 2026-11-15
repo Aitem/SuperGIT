@@ -1,6 +1,7 @@
 //! GitHub access through the `gh` CLI: the user's existing auth, no tokens to
 //! manage. Every call runs in a repository directory so `gh` resolves the
 //! remote itself.
+#![forbid(unsafe_code)]
 
 use std::path::Path;
 use std::process::{Command, Stdio};
