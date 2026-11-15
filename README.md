@@ -77,3 +77,7 @@ supergit --dump [PATH]    # print worktrees, sessions and PRs as text
 
 See [CLAUDE.md](CLAUDE.md) for the layout, commands and conventions, and
 [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next.
+
+## License
+
+[MIT](LICENSE)
