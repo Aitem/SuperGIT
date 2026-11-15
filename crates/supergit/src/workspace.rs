@@ -62,6 +62,7 @@ pub struct SavedConversation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepositoryView {
+    pub recent_targets: Vec<String>,
     pub selected: Option<PathBuf>,
     pub worktrees: BTreeMap<PathBuf, WorktreeView>,
     pub conversations: BTreeMap<PathBuf, Vec<SavedConversation>>,
@@ -76,6 +77,7 @@ pub struct RepositoryView {
 impl Default for RepositoryView {
     fn default() -> Self {
         Self {
+            recent_targets: Vec::new(),
             selected: None,
             worktrees: BTreeMap::new(),
             conversations: BTreeMap::new(),

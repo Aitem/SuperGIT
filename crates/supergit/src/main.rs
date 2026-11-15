@@ -9,6 +9,7 @@ mod recent;
 mod screenshot;
 mod settings;
 mod shell_env;
+mod switcher;
 mod workspace;
 
 use std::path::PathBuf;
@@ -99,6 +100,10 @@ fn main() -> Result<()> {
             KeyBinding::new("cmd-shift-o", app::CloseRepository, None),
             KeyBinding::new("cmd-l", app::ToggleClaude, None),
             KeyBinding::new("cmd-n", app::NewClaudeChat, None),
+            KeyBinding::new("cmd-p", app::OpenSwitcher, None),
+            KeyBinding::new("up", app::SwitcherPrevious, Some("Switcher")),
+            KeyBinding::new("down", app::SwitcherNext, Some("Switcher")),
+            KeyBinding::new("escape", app::CloseSwitcher, Some("Switcher")),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         set_app_menus(cx);
@@ -179,6 +184,8 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::action("Refresh", app::Refresh),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Switch Worktree or Conversation…", app::OpenSwitcher),
+            MenuItem::separator(),
             MenuItem::action("Toggle Claude Panel", app::ToggleClaude),
             MenuItem::action("New Claude Conversation", app::NewClaudeChat),
             MenuItem::separator(),
