@@ -54,6 +54,8 @@ impl Appearance {
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
+    pub notify_approvals: bool,
+    pub notify_completions: bool,
 }
 
 fn file() -> Option<PathBuf> {
@@ -121,6 +123,7 @@ mod tests {
         assert_eq!(s.appearance, Appearance::Dark);
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.appearance, Appearance::System);
+        assert!(!s.notify_approvals && !s.notify_completions);
         assert_eq!(Appearance::System.next().next().next(), Appearance::System);
     }
 

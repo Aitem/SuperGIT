@@ -1,6 +1,8 @@
 //! The main window: worktrees on the left, the selected worktree's changes,
 //! history, Claude sessions and pull requests on the right.
 
+mod worktrees;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -12,6 +14,7 @@ use gpui_kit::component::diff::{
     Diff, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffSide, DiffState,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex, v_flex};
@@ -21,10 +24,13 @@ use sg_agents::{AgentState, Session};
 use sg_git::{Commit, CommitDetails, FileChange, FileState, Repo, relative_time};
 use sg_github::{PrState, PullRequest};
 
+use crate::agent_context::{self, Attachment};
+use crate::attention::Kind;
 use crate::chat::ChatSession;
 use crate::file_tree::{self, TreeRow};
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
+use crate::notifications;
 use crate::settings::Appearance;
 use crate::switcher::{self, Destination, Entry};
 use crate::workspace::{self, RepositoryView, ReviewPosition, WindowRect};
@@ -44,7 +50,12 @@ actions!(
         OpenSwitcher,
         CloseSwitcher,
         SwitcherNext,
-        SwitcherPrevious
+        SwitcherPrevious,
+        OpenSettings,
+        AskAgent,
+        AskAgentNewConversation,
+        ToggleKeepWorktree,
+        PreviewCleanup
     ]
 );
 
@@ -94,6 +105,13 @@ enum FileList {
     Commit,
 }
 
+#[derive(Clone, Copy)]
+enum ContextScope {
+    Auto,
+    Hunk,
+    File,
+}
+
 struct ReviewView {
     tab: MainTab,
     details: Details,
@@ -118,7 +136,16 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    cleanup_preview: Option<worktrees::CleanupPreview>,
+    cleanup_handle: FocusHandle,
+    prs_fetched_at: Option<std::time::Instant>,
     focus_handle: FocusHandle,
+    settings_open: bool,
+    settings_focus: Option<FocusHandle>,
+    settings_handle: FocusHandle,
+    notified: HashMap<String, u64>,
+    pending_notification: Option<notifications::Target>,
+    attention_cursor: HashMap<Kind, usize>,
     base_inputs: HashMap<PathBuf, Entity<InputState>>,
     switcher_input: Entity<InputState>,
     switcher: Option<Switcher>,
@@ -249,7 +276,17 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            cleanup_preview: None,
+            cleanup_handle: cx.focus_handle(),
+            prs_fetched_at: None,
             focus_handle: cx.focus_handle(),
+            settings_open: cfg!(feature = "screenshot")
+                && std::env::var_os("SUPERGIT_DEBUG_SETTINGS").is_some(),
+            settings_focus: None,
+            settings_handle: cx.focus_handle(),
+            notified: HashMap::new(),
+            pending_notification: None,
+            attention_cursor: HashMap::new(),
             base_inputs: HashMap::new(),
             switcher_input,
             switcher: None,
@@ -594,6 +631,18 @@ impl SuperGitApp {
         }))
     }
 
+    /// Right-click on a file row: ask an agent about that file.
+    fn file_menu(row: Stateful<Div>, path: String, cx: &mut Context<Self>) -> AnyElement {
+        let owner = cx.entity().downgrade();
+        row.context_menu(move |menu, _, cx| {
+            let Some(owner) = owner.upgrade() else {
+                return menu;
+            };
+            owner.update(cx, |this, cx| this.context_menu(menu, Some(&path), cx))
+        })
+        .into_any_element()
+    }
+
     fn toggle_dir(&mut self, list: FileList, path: String, cx: &mut Context<Self>) {
         let collapsed = match list {
             FileList::Changes => &mut self.changes_collapsed,
@@ -641,7 +690,7 @@ impl SuperGitApp {
         for info in self
             .worktrees
             .iter()
-            .filter(|info| info.path().is_dir() && !info.wt.is_bare && info.wt.prunable.is_none())
+            .filter(|info| info.status.is_ok() && !info.wt.is_bare && info.wt.prunable.is_none())
         {
             let path = info.wt.path.clone();
             let branch = info.wt.branch.as_deref().unwrap_or("Detached HEAD");
@@ -732,6 +781,12 @@ impl SuperGitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.cleanup_preview.is_some() {
+            self.close_cleanup_preview(window, cx);
+        }
+        if self.settings_open {
+            self.close_settings(window, cx);
+        }
         if self.switcher.is_some() {
             return;
         }
@@ -804,6 +859,13 @@ impl SuperGitApp {
             return;
         };
         self.close_switcher(&CloseSwitcher, window, cx);
+        self.open_destination(entry, window, cx);
+    }
+
+    fn open_destination(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_preview.is_some() {
+            self.close_cleanup_preview(window, cx);
+        }
         // A worktree can disappear between the search and Return.
         if !entry.path.is_dir() || !self.worktrees.iter().any(|info| info.path() == entry.path) {
             self.flash(
@@ -826,10 +888,10 @@ impl SuperGitApp {
                     self.active_chat.insert(entry.path, ix);
                     self.chat_open = true;
                     if let Some(chat) = self.active_chat_entity() {
-                        chat.read(cx)
-                            .input()
-                            .update(cx, |input, cx| input.focus(window, cx));
+                        chat.update(cx, |chat, cx| chat.focus_attention(window, cx));
                     }
+                } else {
+                    self.flash("This conversation is no longer available", true, cx);
                 }
             }
             Destination::Transcript(session) => self.open_session_chat(session, window, cx),
@@ -936,6 +998,68 @@ impl SuperGitApp {
                             .child("↑ ↓ Navigate    Return Open    Esc Cancel"),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_preview.is_some() {
+            self.close_cleanup_preview(window, cx);
+        }
+        self.settings_focus = window.focused(cx);
+        self.settings_open = true;
+        self.settings_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        if let Some(focus) = self.settings_focus.take() {
+            focus.focus(window, cx);
+        } else {
+            window.blur(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_notification(&mut self, approvals: bool, cx: &mut Context<Self>) {
+        let mut settings = crate::settings::load();
+        let enabled = if approvals {
+            &mut settings.notify_approvals
+        } else {
+            &mut settings.notify_completions
+        };
+        if !*enabled && let Err(error) = notifications::request_permission(cx) {
+            self.flash(error.to_string(), true, cx);
+            return;
+        }
+        *enabled = !*enabled;
+        crate::settings::save(&settings);
+        cx.notify();
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let settings = crate::settings::load();
+        let theme = cx.theme().clone();
+        div().absolute().inset_0().flex().justify_center().items_start().pt(px(80.))
+            .bg(gpui_kit::black().opacity(0.35))
+            .on_mouse_down(MouseButton::Left,cx.listener(|this,_,window,cx| this.close_settings(window,cx)))
+            .child(v_flex().w(px(480.)).track_focus(&self.settings_handle).max_w_full().p_4().gap_3().rounded_lg().shadow_lg()
+                .border_1().border_color(theme.border).bg(theme.background)
+                .on_mouse_down(MouseButton::Left,|_,_,cx| cx.stop_propagation())
+                .capture_key_down(cx.listener(|this,event: &KeyDownEvent,window,cx| {
+                    if event.keystroke.key == "escape" { this.close_settings(window,cx); cx.stop_propagation(); }
+                }))
+                .child(h_flex().justify_between().child(div().text_lg().font_weight(FontWeight::BOLD).child("Settings"))
+                    .child(Button::new("close-settings").label("Done").small().ghost()
+                        .on_click(cx.listener(|this,_,window,cx| this.close_settings(window,cx)))))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Background notifications"))
+                .children([(true,"Approval requests",settings.notify_approvals),(false,"Completion and failures",settings.notify_completions)]
+                    .into_iter().map(|(approval,label,enabled)| h_flex().justify_between().child(label)
+                        .child(Button::new(if approval {"notify-approval"} else {"notify-completion"})
+                            .label(if enabled {"On"} else {"Off"}).small().ghost()
+                            .on_click(cx.listener(move |this,_,_,cx| this.toggle_notification(approval,cx))))))
+                .child(div().text_sm().text_color(theme.muted_foreground).child(
+                    "Only exact events from native conversations are notified. The visible conversation stays quiet. If macOS blocks alerts, enable SuperGIT in System Settings → Notifications.")))
             .into_any_element()
     }
 
@@ -1047,6 +1171,16 @@ impl SuperGitApp {
             self.queue_persist(cx);
         }
         self.reload_details(cx);
+        if let Some(target) = self.pending_notification.take() {
+            let this = cx.entity();
+            if let Some(window) = cx.windows().first().copied() {
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        this.update(cx, |this, cx| this.open_notification(target, window, cx));
+                    });
+                });
+            }
+        }
         #[cfg(feature = "screenshot")]
         self.debug_chat_once(cx);
         cx.notify();
@@ -1109,13 +1243,47 @@ impl SuperGitApp {
     }
 
     fn apply_prs(&mut self, result: Result<Vec<PullRequest>, String>, cx: &mut Context<Self>) {
+        let was_loaded = self.prs_loaded;
         self.prs_loaded = true;
         match result {
             Ok(prs) => {
+                self.prs_fetched_at = Some(std::time::Instant::now());
                 self.prs = prs;
                 self.prs_error = None;
             }
             Err(e) => self.prs_error = Some(e),
+        }
+        if !was_loaded
+            && self
+                .selected_info()
+                .is_some_and(|info| self.is_completed(info, cx))
+        {
+            self.set_completed_collapsed(false, cx);
+        }
+        #[cfg(feature = "screenshot")]
+        if std::env::var_os("SUPERGIT_DEBUG_CLEANUP").is_some()
+            && std::env::var_os("SUPERGIT_DEBUG_CLEANUP_DONE").is_none()
+        {
+            let paths: Vec<_> = self
+                .worktrees
+                .iter()
+                .filter(|info| self.is_completed(info, cx))
+                .map(|info| info.wt.path.clone())
+                .collect();
+            if !paths.is_empty() {
+                // SAFETY: isolated screenshot builds only, on the main thread.
+                unsafe { std::env::set_var("SUPERGIT_DEBUG_CLEANUP_DONE", "1") };
+                let owner = cx.entity();
+                if let Some(window) = cx.windows().first().copied() {
+                    cx.defer(move |cx| {
+                        let _ = window.update(cx, |_, window, cx| {
+                            owner.update(cx, |this, cx| {
+                                this.open_cleanup_preview(paths, window, cx)
+                            });
+                        });
+                    });
+                }
+            }
         }
         cx.notify();
     }
@@ -1191,6 +1359,22 @@ impl SuperGitApp {
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
         }
         self.details.update(details);
+        #[cfg(feature = "screenshot")]
+        if std::env::var_os("SUPERGIT_DEBUG_CONTEXT").is_some()
+            && std::env::var_os("SUPERGIT_DEBUG_CONTEXT_DONE").is_none()
+            && self.details.patch.value().is_some()
+        {
+            // SAFETY: isolated screenshot builds only, on the main thread.
+            unsafe { std::env::set_var("SUPERGIT_DEBUG_CONTEXT_DONE", "1") };
+            if let Some(window) = cx.windows().first().copied() {
+                let owner = cx.entity();
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        owner.update(cx, |this, cx| this.ask_agent(&AskAgent, window, cx));
+                    });
+                });
+            }
+        }
         if self.commit_task.is_none()
             && self.commit_patch.is_loading()
             && let Some(sha) = self.selected_commit.clone().or_else(|| {
@@ -1219,6 +1403,14 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self
+            .worktrees
+            .iter()
+            .find(|info| info.path() == path)
+            .is_some_and(|info| self.is_completed(info, cx))
+        {
+            self.set_completed_collapsed(false, cx);
+        }
         self.remember_target(format!("worktree:{}", path.display()), cx);
         if self.selected.as_ref() == Some(&path) {
             return;
@@ -1341,6 +1533,8 @@ impl SuperGitApp {
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.cleanup_preview = None;
+        self.prs_fetched_at = None;
         self.worktrees.clear();
         self.load_error = None;
         self.prs.clear();
@@ -1387,6 +1581,186 @@ impl SuperGitApp {
 
     // ---- Claude panel ------------------------------------------------------
 
+    fn watch_chat(&mut self, path: PathBuf, chat: &Entity<ChatSession>, cx: &mut Context<Self>) {
+        let Some(repository) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
+            return;
+        };
+        let key = format!(
+            "{}:{}:{}",
+            repository.display(),
+            path.display(),
+            chat.read(cx).local_id()
+        );
+        self.notified
+            .insert(key.clone(), chat.read(cx).attention().revision);
+        cx.observe(chat, move |this, chat, cx| {
+            let state = chat.read(cx).attention().clone();
+            let local_id = chat.read(cx).local_id().to_string();
+            let revision_changed =
+                this.notified.insert(key.clone(), state.revision) != Some(state.revision);
+            let focused = this
+                .repo
+                .as_ref()
+                .is_some_and(|repo| repo.root == repository)
+                && this.selected.as_ref() == Some(&path)
+                && this.chat_open
+                && !this.settings_open
+                && this.switcher.is_none()
+                && this.cleanup_preview.is_none()
+                && this
+                    .active_chat_entity()
+                    .is_some_and(|active| active == chat)
+                && cx.windows().first().is_some_and(|window| {
+                    window
+                        .update(cx, |_, window, _| window.is_window_active())
+                        .unwrap_or(false)
+                });
+            if focused && chat.read(cx).follows_tail(cx) {
+                chat.update(cx, |chat, cx| chat.mark_seen(cx));
+            }
+            if revision_changed {
+                let settings = crate::settings::load();
+                if state.should_notify(
+                    focused,
+                    settings.notify_approvals,
+                    settings.notify_completions,
+                ) {
+                    notifications::deliver(
+                        &notifications::Target {
+                            repository: repository.clone(),
+                            worktree: path.clone(),
+                            provider: "claude".into(),
+                            conversation: local_id,
+                        },
+                        state.revision,
+                        match state.kind {
+                            Kind::Approval => "Claude needs your approval",
+                            Kind::Failed => "Claude task failed",
+                            _ => "Claude task completed",
+                        },
+                        &chat.read(cx).title(),
+                        cx,
+                    );
+                }
+            }
+            this.queue_persist(cx);
+            cx.notify();
+        })
+        .detach();
+    }
+
+    fn attention_entries(&self, kind: Kind, cx: &App) -> Vec<Entry> {
+        self.navigation_entries(cx)
+            .into_iter()
+            .filter(|entry| {
+                let Destination::Conversation(id) = &entry.destination else {
+                    return false;
+                };
+                let state = self
+                    .chats
+                    .get(&entry.path)
+                    .and_then(|chats| chats.iter().find(|chat| chat.read(cx).local_id() == id))
+                    .map(|chat| chat.read(cx).attention())
+                    .or_else(|| {
+                        self.repository_view()
+                            .conversations
+                            .get(&entry.path)
+                            .and_then(|chats| chats.iter().find(|chat| chat.local_id == *id))
+                            .map(|chat| &chat.attention)
+                    });
+                state.is_some_and(|state| {
+                    state.kind == kind
+                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+                })
+            })
+            .collect()
+    }
+
+    fn attention_count(&self, kind: Kind, cx: &App) -> usize {
+        self.worktrees
+            .iter()
+            .map(|info| {
+                if let Some(chats) = self.chats.get(info.path()) {
+                    chats
+                        .iter()
+                        .filter(|chat| {
+                            let state = chat.read(cx).attention();
+                            state.kind == kind
+                                && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+                        })
+                        .count()
+                } else {
+                    self.repository_view()
+                        .conversations
+                        .get(info.path())
+                        .into_iter()
+                        .flatten()
+                        .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
+                        .filter(|chat| {
+                            chat.attention.kind == kind
+                                && (matches!(kind, Kind::Running | Kind::Approval)
+                                    || chat.attention.unread)
+                        })
+                        .count()
+                }
+            })
+            .sum()
+    }
+
+    fn open_attention(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.attention_entries(kind, cx);
+        if entries.is_empty() {
+            return;
+        }
+        let cursor = self.attention_cursor.entry(kind).or_default();
+        let entry = entries[*cursor % entries.len()].clone();
+        *cursor += 1;
+        self.open_destination(entry, window, cx);
+    }
+
+    pub fn open_notification(
+        &mut self,
+        target: notifications::Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target.provider != "claude" {
+            self.flash(
+                "This provider does not support notification navigation yet",
+                true,
+                cx,
+            );
+            return;
+        }
+        if self
+            .repo
+            .as_ref()
+            .is_none_or(|repo| repo.root != target.repository)
+        {
+            self.open_path(target.repository.clone(), cx);
+            self.pending_notification = Some(target);
+            return;
+        }
+        if self.worktrees.is_empty() {
+            self.pending_notification = Some(target);
+            return;
+        }
+        self.open_destination(
+            Entry {
+                key: format!("chat:{}:{}", target.worktree.display(), target.conversation),
+                path: target.worktree,
+                title: String::new(),
+                detail: String::new(),
+                search: String::new(),
+                destination: Destination::Conversation(target.conversation),
+            },
+            window,
+            cx,
+        );
+        window.activate_window();
+        cx.activate(true);
+    }
+
     fn add_chat(
         &mut self,
         path: PathBuf,
@@ -1395,11 +1769,7 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) {
         // Re-render (sidebar dots, title counts) whenever a conversation changes.
-        cx.observe(&chat, |this, _, cx| {
-            this.queue_persist(cx);
-            cx.notify();
-        })
-        .detach();
+        self.watch_chat(path.clone(), &chat, cx);
         let list = self.chats.entry(path.clone()).or_default();
         list.push(chat.clone());
         self.active_chat.insert(path, list.len() - 1);
@@ -1419,7 +1789,7 @@ impl SuperGitApp {
         if let Some(ix) = self.chats.get(&path).and_then(|list| {
             list.iter().position(|c| {
                 let c = c.read(cx);
-                c.is_empty() && c.session_id().is_none()
+                c.is_empty() && c.session_id().is_none() && !c.has_draft(cx)
             })
         }) {
             self.active_chat.insert(path.clone(), ix);
@@ -1512,12 +1882,64 @@ impl SuperGitApp {
             .min()
     }
 
-    /// Transcript-based and live state combined (most urgent wins).
-    fn agent_state_for(&self, info: &WorktreeInfo, cx: &App) -> Option<AgentState> {
-        [info.agent_state(), self.live_agent_state(info.path(), cx)]
+    /// Estimates apply only to transcripts not owned by the native UI.
+    fn external_agent_state(&self, info: &WorktreeInfo, cx: &App) -> Option<AgentState> {
+        let ids: std::collections::HashSet<_> = self
+            .chats
+            .get(info.path())
             .into_iter()
             .flatten()
+            .filter_map(|chat| chat.read(cx).session_id().map(str::to_string))
+            .chain(
+                self.repository_view()
+                    .conversations
+                    .get(info.path())
+                    .into_iter()
+                    .flatten()
+                    .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
+                    .filter_map(|chat| chat.session_id.clone()),
+            )
+            .collect();
+        info.sessions
+            .iter()
+            .filter(|session| !ids.contains(&session.id))
+            .map(|session| session.state)
+            .filter(|state| state.is_active())
             .min()
+    }
+
+    fn native_attention_for(&self, path: &Path, cx: &App) -> Option<Kind> {
+        let states: Vec<_> = if let Some(chats) = self.chats.get(path) {
+            chats.iter().map(|chat| chat.read(cx).attention()).collect()
+        } else {
+            self.repository_view()
+                .conversations
+                .get(path)
+                .into_iter()
+                .flatten()
+                .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
+                .map(|chat| &chat.attention)
+                .collect()
+        };
+        [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
+            .into_iter()
+            .find(|kind| {
+                states.iter().any(|state| {
+                    state.kind == *kind
+                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+                })
+            })
+    }
+
+    /// Exact native activity and explicitly labeled external estimates.
+    fn agent_state_for(&self, info: &WorktreeInfo, cx: &App) -> Option<AgentState> {
+        [
+            self.external_agent_state(info, cx),
+            self.live_agent_state(info.path(), cx),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
@@ -1676,21 +2098,35 @@ impl SuperGitApp {
     // ---- rendering -------------------------------------------------------
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let working = self
-            .worktrees
-            .iter()
-            .filter(|w| self.agent_state_for(w, cx) == Some(AgentState::Working))
-            .count();
-        let waiting = self
-            .worktrees
-            .iter()
-            .filter(|w| {
-                matches!(
-                    self.agent_state_for(w, cx),
-                    Some(AgentState::NeedsAttention | AgentState::Finished)
-                )
-            })
-            .count();
+        let indicators =
+            [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
+                .into_iter()
+                .filter_map(|kind| {
+                    let count = self.attention_count(kind, cx);
+                    (count > 0).then(|| {
+                        Button::new(match kind {
+                            Kind::Approval => "attention-approval",
+                            Kind::Failed => "attention-failed",
+                            Kind::Completed => "attention-completed",
+                            _ => "attention-running",
+                        })
+                        .label(format!("{count} {}", kind.label()))
+                        .text_color(attention_color(kind, cx.theme()))
+                        .xsmall()
+                        .ghost()
+                        .tooltip(format!(
+                            "{} · Open the exact conversation; repeat to cycle",
+                            if kind == Kind::Completed {
+                                "Completed and unread"
+                            } else {
+                                kind.label()
+                            }
+                        ))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.open_attention(kind, window, cx),
+                        ))
+                    })
+                });
         let theme = cx.theme();
         TitleBar::new().child(
             h_flex()
@@ -1723,20 +2159,7 @@ impl SuperGitApp {
                                     this.open_switcher(&OpenSwitcher, window, cx)
                                 })),
                         )
-                        .when(working > 0, |el| {
-                            el.child(
-                                div()
-                                    .text_color(theme.blue)
-                                    .child(format!("● {working} working")),
-                            )
-                        })
-                        .when(waiting > 0, |el| {
-                            el.child(
-                                div()
-                                    .text_color(theme.warning)
-                                    .child(format!("● {waiting} waiting for you")),
-                            )
-                        })
+                        .children(indicators)
                         .child(
                             Button::new("open-repo")
                                 .label("Open…")
@@ -1797,12 +2220,22 @@ impl SuperGitApp {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let rows = self
-            .worktrees
-            .iter()
-            .enumerate()
-            .map(|(ix, info)| self.render_worktree_row(ix, info, &theme, cx))
-            .collect::<Vec<_>>();
+        let mut active = Vec::new();
+        let mut completed = Vec::new();
+        let mut completed_paths = Vec::new();
+        for (ix, info) in self.worktrees.iter().enumerate() {
+            if self.is_completed(info, cx) {
+                completed_paths.push(info.wt.path.clone());
+                if !self.repository_view().completed_collapsed {
+                    completed.push(self.render_worktree_row(ix, info, &theme, cx));
+                }
+            } else {
+                active.push(self.render_worktree_row(ix, info, &theme, cx));
+            }
+        }
+        let completed_count = completed_paths.len();
+        let active_count = active.len();
+        let collapsed = self.repository_view().completed_collapsed;
 
         v_flex()
             .w_full()
@@ -1829,7 +2262,52 @@ impl SuperGitApp {
                     .id("worktrees")
                     .flex_1()
                     .overflow_y_scroll()
-                    .children(rows),
+                    .when(completed_count > 0, |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("ACTIVE · {active_count}")),
+                        )
+                    })
+                    .children(active)
+                    .when(completed_count > 0, |list| {
+                        list.child(
+                            h_flex()
+                                .px_2()
+                                .py_1()
+                                .justify_between()
+                                .child(
+                                    Button::new("completed-group")
+                                        .label(format!(
+                                            "{} COMPLETED · {completed_count}",
+                                            if collapsed { "▸" } else { "▾" }
+                                        ))
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.set_completed_collapsed(!collapsed, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("preview-completed-cleanup")
+                                        .label("Preview…")
+                                        .tooltip("Preview cleanup of completed worktrees")
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_cleanup_preview(
+                                                completed_paths.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                ),
+                        )
+                        .children(completed)
+                    }),
             )
             .child(
                 v_flex()
@@ -1856,12 +2334,17 @@ impl SuperGitApp {
         info: &WorktreeInfo,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> AnyElement {
         let selected = self.selected.as_deref() == Some(info.path());
         let path = info.wt.path.clone();
         let branch = info.wt.branch.clone();
         let pr = self.pr_for_branch(branch.as_deref());
         let agent = self.agent_state_for(info, cx);
+        let native = self.native_attention_for(info.path(), cx);
+        let external = self.external_agent_state(info, cx);
+        let owner = cx.entity().downgrade();
+        let context_path = path.clone();
+        let kept = self.kept_active(info.path());
 
         let mut meta: Vec<AnyElement> = Vec::new();
         match &info.status {
@@ -1926,6 +2409,14 @@ impl SuperGitApp {
                                 .child("main"),
                         )
                     })
+                    .when(kept, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("kept"),
+                        )
+                    })
                     .when_some(pr, |el, pr| el.child(pr_badge(pr, theme))),
             )
             .child(
@@ -1935,11 +2426,31 @@ impl SuperGitApp {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .children(meta)
-                    .when_some(agent, |el, a| {
+                    .when_some(native, |el, kind| {
+                        let target = info.wt.path.clone();
+                        el.child(
+                            Button::new(("worktree-attention", ix))
+                                .label(format!("Claude {}", kind.label()))
+                                .text_color(attention_color(kind, theme))
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(entry) = this
+                                        .attention_entries(kind, cx)
+                                        .into_iter()
+                                        .find(|entry| entry.path == target)
+                                    {
+                                        this.open_destination(entry, window, cx);
+                                    }
+                                })),
+                        )
+                    })
+                    .when_some(external, |el, a| {
                         el.child(
                             div()
                                 .text_color(agent_color(a, theme))
-                                .child(format!("claude {}", a.label())),
+                                .child(format!("Claude {} (estimated)", a.label())),
                         )
                     }),
             )
@@ -1951,6 +2462,31 @@ impl SuperGitApp {
                     .truncate()
                     .child(info.wt.dir_name()),
             )
+            .context_menu(move |menu, _, _cx| {
+                let keep_owner = owner.clone();
+                let keep_path = context_path.clone();
+                let cleanup_owner = owner.clone();
+                let cleanup_path = context_path.clone();
+                menu.item(
+                    PopupMenuItem::new(if kept {
+                        "✓ Keep active"
+                    } else {
+                        "Keep active"
+                    })
+                    .on_click(move |_, _, cx| {
+                        let _ = keep_owner
+                            .update(cx, |this, cx| this.toggle_keep_path(keep_path.clone(), cx));
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Preview cleanup…").on_click(move |_, window, cx| {
+                        let _ = cleanup_owner.update(cx, |this, cx| {
+                            this.open_cleanup_preview(vec![cleanup_path.clone()], window, cx)
+                        });
+                    }),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2252,6 +2788,243 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    fn context_snapshot(
+        &self,
+        explicit_file: Option<&str>,
+        scope: ContextScope,
+        cx: &App,
+    ) -> anyhow::Result<Attachment> {
+        let path = self
+            .selected
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Select a worktree first"))?;
+        let (state, patch, comparison, anchor) = match self.tab {
+            MainTab::Changes => (
+                &self.changes_diff,
+                &self.details.patch,
+                self.details
+                    .base
+                    .as_ref()
+                    .map(|base| {
+                        format!(
+                            "Branch changes vs merge base of {base} ({})",
+                            self.details
+                                .merge_base
+                                .as_deref()
+                                .map(|oid| &oid[..oid.len().min(8)])
+                                .unwrap_or("unavailable")
+                        )
+                    })
+                    .unwrap_or_else(|| "Uncommitted changes vs HEAD".into()),
+                self.repository_view()
+                    .worktrees
+                    .get(&path)
+                    .and_then(|view| view.changes_position.as_ref()),
+            ),
+            MainTab::History => (
+                &self.commit_diff,
+                &self.commit_patch,
+                format!(
+                    "Commit {}",
+                    self.selected_commit.as_deref().unwrap_or("unavailable")
+                ),
+                self.repository_view()
+                    .worktrees
+                    .get(&path)
+                    .and_then(|view| view.commit_position.as_ref()),
+            ),
+            _ => anyhow::bail!("Open Changes or History and select a file or source lines first"),
+        };
+        let patch_text = patch.value().ok_or_else(|| {
+            anyhow::anyhow!("Wait for an available diff before attaching context")
+        })?;
+        let state = state.read(cx);
+        let selected = state
+            .selected_lines()
+            .filter(|range| explicit_file.is_none_or(|file| range.path().as_ref() == file));
+        let relative = explicit_file
+            .map(str::to_string)
+            .or_else(|| selected.as_ref().map(|range| range.path().to_string()))
+            .or_else(|| anchor.map(|anchor| anchor.path.clone()))
+            .or_else(|| (state.files().len() == 1).then(|| state.files()[0].path().to_string()))
+            .ok_or_else(|| anyhow::anyhow!("Select lines or a file in the diff first"))?;
+        let file = state
+            .files()
+            .iter()
+            .find(|file| file.path().as_ref() == relative)
+            .ok_or_else(|| {
+                anyhow::anyhow!("The selected file is no longer in this diff. Select it again.")
+            })?;
+        let raw = agent_context::file_patch(patch_text, &relative)
+            .ok_or_else(|| anyhow::anyhow!("The selected diff snapshot is no longer available"))?;
+        let anchor = anchor.filter(|anchor| anchor.path == relative);
+        let original = selected
+            .as_ref()
+            .map(|range| range.side() == DiffSide::Original)
+            .or_else(|| anchor.map(|anchor| anchor.original))
+            .unwrap_or(file.modified_path().is_none());
+        let line = selected
+            .as_ref()
+            .map(|range| range.start())
+            .or_else(|| anchor.map(|anchor| anchor.line))
+            .unwrap_or(1);
+        let (selection, body) = if matches!(scope, ContextScope::Hunk) {
+            (
+                format!(
+                    "Hunk containing {} line {line}",
+                    if original { "original" } else { "modified" }
+                ),
+                agent_context::hunk_patch(raw, original, line)
+                    .ok_or_else(|| anyhow::anyhow!("Select a source line inside the hunk first"))?,
+            )
+        } else if !matches!(scope, ContextScope::File)
+            && explicit_file.is_none()
+            && let Some(range) = selected
+        {
+            (
+                format!(
+                    "{} {} → {} {}",
+                    if range.side() == DiffSide::Original {
+                        "Original"
+                    } else {
+                        "Modified"
+                    },
+                    range.start(),
+                    if range.end_side() == DiffSide::Original {
+                        "original"
+                    } else {
+                        "modified"
+                    },
+                    range.end()
+                ),
+                state.selected_text(cx),
+            )
+        } else {
+            ("File diff".into(), raw.to_string())
+        };
+        Ok(Attachment {
+            worktree: path,
+            path: relative,
+            comparison: format!(
+                "{comparison}{}",
+                if patch.error().is_some()
+                    || (self.tab == MainTab::Changes
+                        && (self.load_error.is_some() || self.details.status.error().is_some()))
+                {
+                    " · stale, last successful snapshot"
+                } else {
+                    ""
+                }
+            ),
+            selection,
+            body,
+            truncated: file.is_truncated(),
+            unavailable: file.is_binary(),
+        }
+        .bounded())
+    }
+
+    fn attach_context(
+        &mut self,
+        item: Attachment,
+        new: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected.as_ref() != Some(&item.worktree) {
+            self.flash(
+                "This selection belongs to another worktree. Reopen its diff to attach it.",
+                true,
+                cx,
+            );
+            return;
+        }
+        self.ensure_chats(&item.worktree, window, cx);
+        if new {
+            self.new_chat(window, cx);
+        }
+        if let Some(chat) = self.active_chat_entity() {
+            match chat.update(cx, |chat, cx| chat.attach(item, window, cx)) {
+                Ok(()) => {
+                    self.chat_open = true;
+                    self.queue_persist(cx);
+                    cx.notify();
+                }
+                Err(error) => self.flash(error.to_string(), true, cx),
+            }
+        }
+    }
+
+    fn ask_agent(&mut self, _: &AskAgent, window: &mut Window, cx: &mut Context<Self>) {
+        match self.context_snapshot(None, ContextScope::Auto, cx) {
+            Ok(item) => self.attach_context(item, false, window, cx),
+            Err(error) => self.flash(error.to_string(), true, cx),
+        }
+    }
+
+    fn ask_agent_new(
+        &mut self,
+        _: &AskAgentNewConversation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.context_snapshot(None, ContextScope::Auto, cx) {
+            Ok(item) => self.attach_context(item, true, window, cx),
+            Err(error) => self.flash(error.to_string(), true, cx),
+        }
+    }
+
+    fn context_menu(
+        &self,
+        mut menu: PopupMenu,
+        explicit_file: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> PopupMenu {
+        let choices = if explicit_file.is_some() {
+            vec![
+                (ContextScope::File, "Ask agent about file", false),
+                (ContextScope::File, "Ask agent in new conversation", true),
+            ]
+        } else {
+            vec![
+                (ContextScope::Auto, "Ask agent", false),
+                (ContextScope::Hunk, "Ask agent about hunk", false),
+                (ContextScope::File, "Ask agent about file", false),
+                (ContextScope::Auto, "Ask agent in new conversation", true),
+            ]
+        };
+        for (scope, label, new) in choices {
+            let snapshot = self.context_snapshot(explicit_file, scope, cx);
+            let owner = cx.entity().downgrade();
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .disabled(snapshot.is_err())
+                    .on_click(move |_, window, cx| {
+                        if let Ok(item) = &snapshot {
+                            let _ = owner.update(cx, |this, cx| {
+                                this.attach_context(item.clone(), new, window, cx)
+                            });
+                        }
+                    }),
+            );
+        }
+        menu
+    }
+
+    fn render_review_diff(&self, state: &Entity<DiffState>, cx: &mut Context<Self>) -> AnyElement {
+        let owner = cx.entity().downgrade();
+        div()
+            .size_full()
+            .child(Diff::new(state).line_number(true))
+            .context_menu(move |menu, _, cx| {
+                let Some(owner) = owner.upgrade() else {
+                    return menu;
+                };
+                owner.update(cx, |this, cx| this.context_menu(menu, None, cx))
+            })
+            .into_any_element()
+    }
+
     fn comparison_base(&self) -> Option<String> {
         let view = self
             .selected
@@ -2370,6 +3143,14 @@ impl SuperGitApp {
                         })),
                 );
         }
+        bar = bar.child(
+            Button::new("ask-agent-diff")
+                .label("Ask agent")
+                .xsmall()
+                .ghost()
+                .tooltip("Attach selected lines or a file (cmd-shift-a)")
+                .on_click(cx.listener(|this, _, window, cx| this.ask_agent(&AskAgent, window, cx))),
+        );
         v_flex().w_full().border_b_1().border_color(theme.border).child(bar)
             .child(div().px_3().pb_1().text_xs().text_color(theme.muted_foreground)
                 .child(if let Some(base) = &self.details.base {
@@ -2452,7 +3233,7 @@ impl SuperGitApp {
                         .flex_1()
                         .min_w_0()
                         .h_full()
-                        .child(Diff::new(&self.changes_diff).line_number(true)),
+                        .child(self.render_review_diff(&self.changes_diff, cx)),
                 ),
             )
             .into_any_element();
@@ -2512,11 +3293,12 @@ impl SuperGitApp {
                         cx.listener(move |this, _, _, cx| this.toggle_dir(list, path.clone(), cx)),
                     )
                     .into_any_element(),
-                TreeRow::File { ix, name, depth } => {
+                TreeRow::File { ix, name, depth } => Self::file_menu(
                     change_row(ix, &files[ix], name, tree_indent(depth), theme)
-                        .on_click(Self::open_file(list, files[ix].path.clone(), cx))
-                        .into_any_element()
-                }
+                        .on_click(Self::open_file(list, files[ix].path.clone(), cx)),
+                    files[ix].path.clone(),
+                    cx,
+                ),
             })
             .collect()
         } else {
@@ -2524,9 +3306,12 @@ impl SuperGitApp {
                 .iter()
                 .map(|&ix| {
                     let file = &files[ix];
-                    change_row(ix, file, file.path.clone(), px(12.), theme)
-                        .on_click(Self::open_file(list, file.path.clone(), cx))
-                        .into_any_element()
+                    Self::file_menu(
+                        change_row(ix, file, file.path.clone(), px(12.), theme)
+                            .on_click(Self::open_file(list, file.path.clone(), cx)),
+                        file.path.clone(),
+                        cx,
+                    )
                 })
                 .collect()
         };
@@ -2888,7 +3673,7 @@ impl SuperGitApp {
                     div()
                         .size_full()
                         .min_w_0()
-                        .child(Diff::new(&self.commit_diff).line_number(true)),
+                        .child(self.render_review_diff(&self.commit_diff, cx)),
                 ),
             )
             .into_any_element()
@@ -3040,11 +3825,7 @@ impl SuperGitApp {
             {
                 let chat =
                     cx.new(|cx| ChatSession::restore(path.clone(), conversation, window, cx));
-                cx.observe(&chat, |this, _, cx| {
-                    this.queue_persist(cx);
-                    cx.notify();
-                })
-                .detach();
+                self.watch_chat(path.clone(), &chat, cx);
                 restored.push(chat);
             }
             if !restored.is_empty() {
@@ -3062,11 +3843,7 @@ impl SuperGitApp {
         }
         if self.chats.get(path).is_none_or(Vec::is_empty) {
             let chat = cx.new(|cx| ChatSession::new(path.clone(), window, cx));
-            cx.observe(&chat, |this, _, cx| {
-                this.queue_persist(cx);
-                cx.notify();
-            })
-            .detach();
+            self.watch_chat(path.clone(), &chat, cx);
             self.chats.insert(path.clone(), vec![chat]);
             self.active_chat.insert(path.clone(), 0);
         }
@@ -3083,6 +3860,15 @@ impl SuperGitApp {
             .copied()
             .unwrap_or(0)
             .min(chats.len().saturating_sub(1));
+        if window.is_window_active()
+            && !self.settings_open
+            && self.switcher.is_none()
+            && self.cleanup_preview.is_none()
+            && let Some(chat) = chats.get(active)
+            && chat.read(cx).follows_tail(cx)
+        {
+            chat.update(cx, |chat, cx| chat.mark_seen(cx));
+        }
         let tabs = chats.iter().enumerate().map(|(ix, chat)| {
             let c = chat.read(cx);
             let title: String = c.title().chars().take(22).collect();
@@ -3112,6 +3898,11 @@ impl SuperGitApp {
                     el.child(div().size(px(6.)).rounded_full().bg(color))
                 })
                 .child(title)
+                .when(
+                    c.attention().unread
+                        || matches!(c.attention().kind, Kind::Running | Kind::Approval),
+                    |el| el.child(div().text_xs().child(c.attention().kind.label())),
+                )
                 .when(chats.len() > 1, |el| {
                     el.child(
                         div()
@@ -3297,6 +4088,11 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::toggle_claude))
             .on_action(cx.listener(Self::new_chat_action))
             .on_action(cx.listener(Self::open_switcher))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::ask_agent))
+            .on_action(cx.listener(Self::ask_agent_new))
+            .on_action(cx.listener(Self::toggle_keep_worktree))
+            .on_action(cx.listener(Self::preview_cleanup))
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
                 let show_chat = self.chat_open && self.selected.is_some();
@@ -3355,6 +4151,10 @@ impl Render for SuperGitApp {
             .when(self.switcher.is_some(), |el| {
                 el.child(self.render_switcher(cx))
             })
+            .when(self.settings_open, |el| el.child(self.render_settings(cx)))
+            .when(self.cleanup_preview.is_some(), |el| {
+                el.child(self.render_cleanup_preview(cx))
+            })
     }
 }
 
@@ -3371,6 +4171,16 @@ fn agent_color(state: AgentState, theme: &gpui_kit::component::Theme) -> Hsla {
         AgentState::NeedsAttention => theme.warning,
         AgentState::Finished => theme.success,
         AgentState::Idle => theme.muted_foreground,
+    }
+}
+
+fn attention_color(kind: Kind, theme: &gpui_kit::component::Theme) -> Hsla {
+    match kind {
+        Kind::Approval => theme.warning,
+        Kind::Failed => theme.danger,
+        Kind::Completed => theme.success,
+        Kind::Running => theme.blue,
+        Kind::Idle => theme.muted_foreground,
     }
 }
 

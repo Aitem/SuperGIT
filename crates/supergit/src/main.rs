@@ -1,11 +1,15 @@
+mod agent_context;
 mod app;
 mod appearance;
+mod attention;
 mod chat;
 mod dump;
 mod file_tree;
 mod icons;
 mod launch;
+mod lifecycle;
 mod model;
+mod notifications;
 mod recent;
 #[cfg(feature = "screenshot")]
 mod screenshot;
@@ -94,6 +98,7 @@ fn main() -> Result<()> {
     app.run(move |cx| {
         gpui_kit::init(cx);
         appearance::init(cx);
+        let mut notifications = notifications::init(cx);
 
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
@@ -103,6 +108,8 @@ fn main() -> Result<()> {
             KeyBinding::new("cmd-l", app::ToggleClaude, None),
             KeyBinding::new("cmd-n", app::NewClaudeChat, None),
             KeyBinding::new("cmd-p", app::OpenSwitcher, None),
+            KeyBinding::new("cmd-,", app::OpenSettings, None),
+            KeyBinding::new("cmd-shift-a", app::AskAgent, None),
             KeyBinding::new("up", app::SwitcherPrevious, Some("Switcher")),
             KeyBinding::new("down", app::SwitcherNext, Some("Switcher")),
             KeyBinding::new("escape", app::CloseSwitcher, Some("Switcher")),
@@ -167,6 +174,17 @@ fn main() -> Result<()> {
             });
         });
 
+        let notification_view = view.downgrade();
+        cx.spawn(async move |cx| {
+            while let Some(target) = notifications.next().await {
+                let _ = cx.update_window(_handle, |_, window, cx| {
+                    notification_view
+                        .update(cx, |app, cx| app.open_notification(target, window, cx))
+                        .ok();
+                });
+            }
+        })
+        .detach();
         let view = view.downgrade();
         cx.spawn(async move |cx| {
             while let Some(path) = open_rx.next().await {
@@ -187,6 +205,8 @@ fn main() -> Result<()> {
 pub(crate) fn set_app_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("SuperGIT").items([
+            MenuItem::action("Settings…", app::OpenSettings),
+            MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Quit SuperGIT", Quit),
@@ -198,12 +218,22 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::action("Refresh", app::Refresh),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Ask Agent About Diff Selection", app::AskAgent),
+            MenuItem::action(
+                "Ask Agent in New Conversation",
+                app::AskAgentNewConversation,
+            ),
+            MenuItem::separator(),
             MenuItem::action("Switch Worktree or Conversation…", app::OpenSwitcher),
             MenuItem::separator(),
             MenuItem::action("Toggle Claude Panel", app::ToggleClaude),
             MenuItem::action("New Claude Conversation", app::NewClaudeChat),
             MenuItem::separator(),
             MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),
+        ]),
+        Menu::new("Worktree").items([
+            MenuItem::action("Toggle Keep Active", app::ToggleKeepWorktree),
+            MenuItem::action("Preview Cleanup…", app::PreviewCleanup),
         ]),
     ]);
 }

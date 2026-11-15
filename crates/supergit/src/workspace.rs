@@ -41,6 +41,7 @@ pub struct ReviewPosition {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeView {
+    pub kept: bool,
     pub branch_changes: bool,
     pub base: String,
     pub tab: String,
@@ -52,6 +53,8 @@ pub struct WorktreeView {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedConversation {
+    pub attachments: Vec<crate::agent_context::Attachment>,
+    pub attention: crate::attention::Attention,
     pub local_id: String,
     pub provider: String,
     pub session_id: Option<String>,
@@ -64,6 +67,7 @@ pub struct SavedConversation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepositoryView {
+    pub completed_collapsed: bool,
     pub recent_targets: Vec<String>,
     pub selected: Option<PathBuf>,
     pub worktrees: BTreeMap<PathBuf, WorktreeView>,
@@ -84,6 +88,7 @@ pub struct RepositoryView {
 impl Default for RepositoryView {
     fn default() -> Self {
         Self {
+            completed_collapsed: true,
             recent_targets: Vec::new(),
             selected: None,
             worktrees: BTreeMap::new(),
@@ -128,6 +133,13 @@ pub fn load() -> Store {
         .map(|mut store| {
             for view in store.repositories.values_mut() {
                 view.sanitize();
+                for conversations in view.conversations.values_mut() {
+                    for conversation in conversations.iter_mut().filter(|conversation| {
+                        conversation.provider.is_empty() || conversation.provider == "claude"
+                    }) {
+                        conversation.attention = conversation.attention.clone().restored();
+                    }
+                }
             }
             store
         })
