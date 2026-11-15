@@ -12,11 +12,11 @@ Written in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates
 - **Claude, built in** — a native chat panel on the right (`cmd-l`), like the
   VS Code extension: streaming answers in Markdown, tool calls with inline
   diffs, **permission prompts as cards** (Allow / Allow all edits this session
-  / Deny), Stop, permission mode (Ask / Edits / Plan / Auto / Bypass). Every
-  worktree has its own conversations (tabs) that keep running while you look
-  at other worktrees; `cmd-n` starts a new one. Sessions are regular Claude Code
-  sessions — open any past one from the **Claude** tab (history included) or
-  continue it in a terminal.
+  / Deny), Stop, permission mode (Ask / Edits / Plan / Auto / Bypass; Auto by
+  default). Every worktree has its own conversations (tabs) that keep running
+  while you look at other worktrees; `cmd-n` starts a new one. Sessions are
+  regular Claude Code sessions — open any past one from the **Claude** tab
+  (history included) or continue it in a terminal.
 
 - **Worktrees sidebar** — every worktree of the repo with branch, changed files,
   ahead/behind, its PR (number, state, CI) and live Claude activity

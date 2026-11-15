@@ -42,6 +42,8 @@ Same protocol as the Agent SDKs and the VS Code extension:
   `control_response` (error when refused: `auto_mode_unavailable`,
   `bypass_not_launched` — bypass needs a session launched for it) and, on
   success, `system/status {permissionMode}`; the chat follows that echo.
+  Chats start in `auto` (`--permission-mode auto` always passed); where auto
+  is unavailable the CLI falls back to `default` and `system/init` says so.
 - Auto mode: the classifier's refusals arrive as `system/permission_denied`
   (`decision_reason_type: "classifier"`), slow checks as
   `system/permission_check_status` (`checking`/`done`), escalations as
