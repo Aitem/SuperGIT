@@ -1432,7 +1432,12 @@ impl SuperGitApp {
     }
 
     fn flash(&mut self, message: impl Into<String>, is_error: bool, cx: &mut Context<Self>) {
-        self.message = Some((message.into(), is_error));
+        let message = message
+            .into()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.message = Some((message, is_error));
         cx.notify();
     }
 
