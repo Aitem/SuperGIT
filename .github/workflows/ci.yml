@@ -18,10 +18,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
+  # No debuginfo in CI: dependencies are built at opt-level 2, where debuginfo
+  # is the expensive part; it also keeps target/ (and the cache) small.
+  # Panic messages still carry file:line.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 # The toolchain (version + components) comes from rust-toolchain.toml.
 # GPUI is built with `runtime_shaders`, so no Xcode/Metal toolchain is needed.
-# Caches are written only from main; PR runs restore main's cache.
+#
+# Caching (Swatinem/rust-cache, one cache per job): ~/.cargo registry + the
+# compiled dependencies in target/, keyed by toolchain + Cargo.lock. Saved from
+# any run — PRs and failed runs too — but only when that key is not cached yet,
+# i.e. on new dependencies or a new toolchain. A PR sees its own caches and
+# main's; main sees only its own.
 
 jobs:
   fmt:
@@ -44,7 +53,7 @@ jobs:
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       # --all-features also covers the `screenshot` feature.
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -58,7 +67,7 @@ jobs:
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Build
         run: cargo build --workspace --all-targets --locked
       # Live tests against the real `claude` CLI are #[ignore]d and stay off.
@@ -75,7 +84,7 @@ jobs:
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Build SuperGIT.app
         run: scripts/bundle-macos.sh
       - name: Verify bundle
