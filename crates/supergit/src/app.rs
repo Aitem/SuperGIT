@@ -9,6 +9,7 @@ use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex, v_flex};
@@ -18,6 +19,7 @@ use sg_agents::{AgentState, Session};
 use sg_git::{Commit, FileState, Repo, relative_time};
 use sg_github::{PrState, PullRequest};
 
+use crate::agent_context::{self, Attachment};
 use crate::attention::Kind;
 use crate::chat::ChatSession;
 use crate::launch::{self, TerminalApp};
@@ -43,7 +45,9 @@ actions!(
         CloseSwitcher,
         SwitcherNext,
         SwitcherPrevious,
-        OpenSettings
+        OpenSettings,
+        AskAgent,
+        AskAgentNewConversation
     ]
 );
 
@@ -81,6 +85,13 @@ enum LayoutPanel {
     Chat,
     Changes,
     History,
+}
+
+#[derive(Clone, Copy)]
+enum ContextScope {
+    Auto,
+    Hunk,
+    File,
 }
 
 struct ReviewView {
@@ -1197,6 +1208,22 @@ impl SuperGitApp {
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
         }
         self.details.update(details);
+        #[cfg(feature = "screenshot")]
+        if std::env::var_os("SUPERGIT_DEBUG_CONTEXT").is_some()
+            && std::env::var_os("SUPERGIT_DEBUG_CONTEXT_DONE").is_none()
+            && self.details.patch.value().is_some()
+        {
+            // SAFETY: isolated screenshot builds only, on the main thread.
+            unsafe { std::env::set_var("SUPERGIT_DEBUG_CONTEXT_DONE", "1") };
+            if let Some(window) = cx.windows().first().copied() {
+                let owner = cx.entity();
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        owner.update(cx, |this, cx| this.ask_agent(&AskAgent, window, cx));
+                    });
+                });
+            }
+        }
         if self.commit_task.is_none()
             && self.commit_patch.is_loading()
             && let Some(sha) = self.selected_commit.clone().or_else(|| {
@@ -2463,6 +2490,243 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    fn context_snapshot(
+        &self,
+        explicit_file: Option<&str>,
+        scope: ContextScope,
+        cx: &App,
+    ) -> anyhow::Result<Attachment> {
+        let path = self
+            .selected
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Select a worktree first"))?;
+        let (state, patch, comparison, anchor) = match self.tab {
+            MainTab::Changes => (
+                &self.changes_diff,
+                &self.details.patch,
+                self.details
+                    .base
+                    .as_ref()
+                    .map(|base| {
+                        format!(
+                            "Branch changes vs merge base of {base} ({})",
+                            self.details
+                                .merge_base
+                                .as_deref()
+                                .map(|oid| &oid[..oid.len().min(8)])
+                                .unwrap_or("unavailable")
+                        )
+                    })
+                    .unwrap_or_else(|| "Uncommitted changes vs HEAD".into()),
+                self.repository_view()
+                    .worktrees
+                    .get(&path)
+                    .and_then(|view| view.changes_position.as_ref()),
+            ),
+            MainTab::History => (
+                &self.commit_diff,
+                &self.commit_patch,
+                format!(
+                    "Commit {}",
+                    self.selected_commit.as_deref().unwrap_or("unavailable")
+                ),
+                self.repository_view()
+                    .worktrees
+                    .get(&path)
+                    .and_then(|view| view.commit_position.as_ref()),
+            ),
+            _ => anyhow::bail!("Open Changes or History and select a file or source lines first"),
+        };
+        let patch_text = patch.value().ok_or_else(|| {
+            anyhow::anyhow!("Wait for an available diff before attaching context")
+        })?;
+        let state = state.read(cx);
+        let selected = state
+            .selected_lines()
+            .filter(|range| explicit_file.is_none_or(|file| range.path().as_ref() == file));
+        let relative = explicit_file
+            .map(str::to_string)
+            .or_else(|| selected.as_ref().map(|range| range.path().to_string()))
+            .or_else(|| anchor.map(|anchor| anchor.path.clone()))
+            .or_else(|| (state.files().len() == 1).then(|| state.files()[0].path().to_string()))
+            .ok_or_else(|| anyhow::anyhow!("Select lines or a file in the diff first"))?;
+        let file = state
+            .files()
+            .iter()
+            .find(|file| file.path().as_ref() == relative)
+            .ok_or_else(|| {
+                anyhow::anyhow!("The selected file is no longer in this diff. Select it again.")
+            })?;
+        let raw = agent_context::file_patch(patch_text, &relative)
+            .ok_or_else(|| anyhow::anyhow!("The selected diff snapshot is no longer available"))?;
+        let anchor = anchor.filter(|anchor| anchor.path == relative);
+        let original = selected
+            .as_ref()
+            .map(|range| range.side() == DiffSide::Original)
+            .or_else(|| anchor.map(|anchor| anchor.original))
+            .unwrap_or(file.modified_path().is_none());
+        let line = selected
+            .as_ref()
+            .map(|range| range.start())
+            .or_else(|| anchor.map(|anchor| anchor.line))
+            .unwrap_or(1);
+        let (selection, body) = if matches!(scope, ContextScope::Hunk) {
+            (
+                format!(
+                    "Hunk containing {} line {line}",
+                    if original { "original" } else { "modified" }
+                ),
+                agent_context::hunk_patch(raw, original, line)
+                    .ok_or_else(|| anyhow::anyhow!("Select a source line inside the hunk first"))?,
+            )
+        } else if !matches!(scope, ContextScope::File)
+            && explicit_file.is_none()
+            && let Some(range) = selected
+        {
+            (
+                format!(
+                    "{} {} → {} {}",
+                    if range.side() == DiffSide::Original {
+                        "Original"
+                    } else {
+                        "Modified"
+                    },
+                    range.start(),
+                    if range.end_side() == DiffSide::Original {
+                        "original"
+                    } else {
+                        "modified"
+                    },
+                    range.end()
+                ),
+                state.selected_text(cx),
+            )
+        } else {
+            ("File diff".into(), raw.to_string())
+        };
+        Ok(Attachment {
+            worktree: path,
+            path: relative,
+            comparison: format!(
+                "{comparison}{}",
+                if patch.error().is_some()
+                    || (self.tab == MainTab::Changes
+                        && (self.load_error.is_some() || self.details.status.error().is_some()))
+                {
+                    " · stale, last successful snapshot"
+                } else {
+                    ""
+                }
+            ),
+            selection,
+            body,
+            truncated: file.is_truncated(),
+            unavailable: file.is_binary(),
+        }
+        .bounded())
+    }
+
+    fn attach_context(
+        &mut self,
+        item: Attachment,
+        new: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected.as_ref() != Some(&item.worktree) {
+            self.flash(
+                "This selection belongs to another worktree. Reopen its diff to attach it.",
+                true,
+                cx,
+            );
+            return;
+        }
+        self.ensure_chats(&item.worktree, window, cx);
+        if new {
+            self.new_chat(window, cx);
+        }
+        if let Some(chat) = self.active_chat_entity() {
+            match chat.update(cx, |chat, cx| chat.attach(item, window, cx)) {
+                Ok(()) => {
+                    self.chat_open = true;
+                    self.queue_persist(cx);
+                    cx.notify();
+                }
+                Err(error) => self.flash(error.to_string(), true, cx),
+            }
+        }
+    }
+
+    fn ask_agent(&mut self, _: &AskAgent, window: &mut Window, cx: &mut Context<Self>) {
+        match self.context_snapshot(None, ContextScope::Auto, cx) {
+            Ok(item) => self.attach_context(item, false, window, cx),
+            Err(error) => self.flash(error.to_string(), true, cx),
+        }
+    }
+
+    fn ask_agent_new(
+        &mut self,
+        _: &AskAgentNewConversation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.context_snapshot(None, ContextScope::Auto, cx) {
+            Ok(item) => self.attach_context(item, true, window, cx),
+            Err(error) => self.flash(error.to_string(), true, cx),
+        }
+    }
+
+    fn context_menu(
+        &self,
+        mut menu: PopupMenu,
+        explicit_file: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> PopupMenu {
+        let choices = if explicit_file.is_some() {
+            vec![
+                (ContextScope::File, "Ask agent about file", false),
+                (ContextScope::File, "Ask agent in new conversation", true),
+            ]
+        } else {
+            vec![
+                (ContextScope::Auto, "Ask agent", false),
+                (ContextScope::Hunk, "Ask agent about hunk", false),
+                (ContextScope::File, "Ask agent about file", false),
+                (ContextScope::Auto, "Ask agent in new conversation", true),
+            ]
+        };
+        for (scope, label, new) in choices {
+            let snapshot = self.context_snapshot(explicit_file, scope, cx);
+            let owner = cx.entity().downgrade();
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .disabled(snapshot.is_err())
+                    .on_click(move |_, window, cx| {
+                        if let Ok(item) = &snapshot {
+                            let _ = owner.update(cx, |this, cx| {
+                                this.attach_context(item.clone(), new, window, cx)
+                            });
+                        }
+                    }),
+            );
+        }
+        menu
+    }
+
+    fn render_review_diff(&self, state: &Entity<DiffState>, cx: &mut Context<Self>) -> AnyElement {
+        let owner = cx.entity().downgrade();
+        div()
+            .size_full()
+            .child(Diff::new(state).line_number(true))
+            .context_menu(move |menu, _, cx| {
+                let Some(owner) = owner.upgrade() else {
+                    return menu;
+                };
+                owner.update(cx, |this, cx| this.context_menu(menu, None, cx))
+            })
+            .into_any_element()
+    }
+
     fn comparison_base(&self) -> Option<String> {
         let view = self
             .selected
@@ -2581,6 +2845,14 @@ impl SuperGitApp {
                         })),
                 );
         }
+        bar = bar.child(
+            Button::new("ask-agent-diff")
+                .label("Ask agent")
+                .xsmall()
+                .ghost()
+                .tooltip("Attach selected lines or a file (cmd-shift-a)")
+                .on_click(cx.listener(|this, _, window, cx| this.ask_agent(&AskAgent, window, cx))),
+        );
         v_flex().w_full().border_b_1().border_color(theme.border).child(bar)
             .child(div().px_3().pb_1().text_xs().text_color(theme.muted_foreground)
                 .child(if let Some(base) = &self.details.base {
@@ -2646,6 +2918,8 @@ impl SuperGitApp {
         let rows = files.into_iter().enumerate().map(|(ix, f)| {
             let state = f.state();
             let path = f.path.clone();
+            let context_path = path.clone();
+            let owner = cx.entity().downgrade();
             h_flex()
                 .id(("change", ix))
                 .px_3()
@@ -2679,6 +2953,14 @@ impl SuperGitApp {
                 .when(f.staged.is_some(), |el| {
                     el.child(div().text_xs().text_color(theme.success).child("staged"))
                 })
+                .context_menu(move |menu, _, cx| {
+                    let Some(owner) = owner.upgrade() else {
+                        return menu;
+                    };
+                    owner.update(cx, |this, cx| {
+                        this.context_menu(menu, Some(&context_path), cx)
+                    })
+                })
         });
         let content = h_resizable("changes-layout")
             .with_state(&self.changes_layout)
@@ -2710,7 +2992,7 @@ impl SuperGitApp {
                         .flex_1()
                         .min_w_0()
                         .h_full()
-                        .child(Diff::new(&self.changes_diff).line_number(true)),
+                        .child(self.render_review_diff(&self.changes_diff, cx)),
                 ),
             )
             .into_any_element();
@@ -2836,7 +3118,7 @@ impl SuperGitApp {
                 } else {
                     div()
                         .size_full()
-                        .child(Diff::new(&self.commit_diff).line_number(true))
+                        .child(self.render_review_diff(&self.commit_diff, cx))
                         .into_any_element()
                 }))
             })
@@ -3252,6 +3534,8 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::new_chat_action))
             .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::ask_agent))
+            .on_action(cx.listener(Self::ask_agent_new))
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
                 let show_chat = self.chat_open && self.selected.is_some();
