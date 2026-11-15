@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
+use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -21,6 +21,7 @@ use crate::chat::ChatSession;
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::settings::Appearance;
+use crate::workspace::{self, RepositoryView, ReviewPosition, WindowRect};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Network requests run independently so they cannot delay local refreshes.
@@ -43,6 +44,43 @@ enum MainTab {
     History,
     Sessions,
     PullRequests,
+}
+
+impl MainTab {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Changes => "changes",
+            Self::History => "history",
+            Self::Sessions => "claude",
+            Self::PullRequests => "prs",
+        }
+    }
+
+    fn from_name(name: &str) -> Self {
+        match name {
+            "history" => Self::History,
+            "claude" | "sessions" => Self::Sessions,
+            "prs" | "pr" => Self::PullRequests,
+            _ => Self::Changes,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LayoutPanel {
+    Sidebar,
+    Chat,
+    Changes,
+    History,
+}
+
+struct ReviewView {
+    tab: MainTab,
+    details: Details,
+    selected_commit: Option<String>,
+    commit_patch: LoadState<String>,
+    changes_diff: Entity<DiffState>,
+    commit_diff: Entity<DiffState>,
 }
 
 const TABS: [MainTab; 4] = [
@@ -90,6 +128,10 @@ pub struct SuperGitApp {
     chat_open: bool,
     message: Option<(String, bool)>,
 
+    persisted: workspace::Store,
+    review_views: HashMap<PathBuf, ReviewView>,
+    persist_task: Option<Task<()>>,
+    window_rect: Option<WindowRect>,
     poll_task: Option<Task<()>>,
     prs_task: Option<Task<()>>,
     details_task: Option<Task<()>>,
@@ -123,6 +165,27 @@ impl SuperGitApp {
         let changes_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
         let commit_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
 
+        let persisted = workspace::load();
+        let chat_open = repo
+            .as_ref()
+            .and_then(|repo| persisted.repositories.get(&repo.root))
+            .map(|view| view.chat_open)
+            .unwrap_or(true);
+        let quit_subscription = cx.on_app_quit(|this, cx| {
+            this.persist_workspace(cx);
+            async {}
+        });
+        let release_subscription = cx.on_release(|this, cx| this.persist_workspace(cx));
+        let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
+            let bounds = window.window_bounds().get_bounds();
+            this.window_rect = Some(WindowRect {
+                x: bounds.origin.x.as_f32(),
+                y: bounds.origin.y.as_f32(),
+                width: bounds.size.width.as_f32(),
+                height: bounds.size.height.as_f32(),
+            });
+            this.queue_persist(cx);
+        });
         let mut this = Self {
             repo,
             recent: crate::recent::load(),
@@ -151,17 +214,305 @@ impl SuperGitApp {
             confirm_remove: None,
             chats: HashMap::new(),
             active_chat: HashMap::new(),
-            chat_open: true,
+            chat_open,
             message: None,
+            persisted,
+            review_views: HashMap::new(),
+            persist_task: None,
+            window_rect: None,
             poll_task: None,
             prs_task: None,
             details_task: None,
             commit_task: None,
             action_task: None,
-            _subscriptions: vec![subscription, appearance_subscription],
+            _subscriptions: vec![
+                subscription,
+                appearance_subscription,
+                quit_subscription,
+                release_subscription,
+                bounds_subscription,
+            ],
         };
         this.start_polling(cx);
         this
+    }
+
+    fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32, f32) {
+        let total = window.viewport_size().width.as_f32();
+        let show_chat = self.chat_open && self.selected.is_some();
+        let sidebar_max = (total - if show_chat { 680. } else { 360. }).clamp(220., 520.);
+        let saved = self.repository_view();
+        let sidebar = self
+            .sidebar_layout
+            .read(cx)
+            .sizes()
+            .first()
+            .map(|v| v.as_f32())
+            .unwrap_or(saved.sidebar_width)
+            .clamp(220., sidebar_max);
+        let chat_max = (total - sidebar - 360.).clamp(320., 960.);
+        let chat = if show_chat {
+            self.chat_layout
+                .read(cx)
+                .sizes()
+                .get(1)
+                .map(|v| v.as_f32())
+                .unwrap_or(saved.chat_width)
+                .clamp(320., chat_max)
+        } else {
+            0.
+        };
+        (sidebar_max, chat_max, (total - sidebar - chat).max(360.))
+    }
+
+    fn repository_view(&self) -> &RepositoryView {
+        static EMPTY: std::sync::OnceLock<RepositoryView> = std::sync::OnceLock::new();
+        self.repo
+            .as_ref()
+            .and_then(|repo| self.persisted.repositories.get(&repo.root))
+            .unwrap_or_else(|| EMPTY.get_or_init(RepositoryView::default))
+    }
+
+    fn queue_persist(&mut self, cx: &mut Context<Self>) {
+        self.persist_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let _ = this.update(cx, |this, cx| this.persist_workspace(cx));
+        }));
+    }
+
+    fn capture_saved_review(&mut self, cx: &App) {
+        let (Some(repo), Some(path)) = (&self.repo, &self.selected) else {
+            return;
+        };
+        let position = |state: &Entity<DiffState>| {
+            state.read(cx).selected_lines().map(|range| ReviewPosition {
+                path: range.path().to_string(),
+                line: range.start(),
+                original: range.side() == DiffSide::Original,
+            })
+        };
+        let changes = position(&self.changes_diff);
+        let commit = position(&self.commit_diff);
+        let view = self
+            .persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default()
+            .worktrees
+            .entry(path.clone())
+            .or_default();
+        view.tab = self.tab.name().into();
+        view.commit = self.selected_commit.clone();
+        if changes.is_some() {
+            view.changes_position = changes;
+        }
+        if commit.is_some() {
+            view.commit_position = commit;
+        }
+    }
+
+    fn persist_workspace(&mut self, cx: &App) {
+        self.capture_saved_review(cx);
+        let Some(root) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
+            if let Some(window) = self.window_rect {
+                workspace::save_window(window);
+            }
+            return;
+        };
+        let view = self.persisted.repositories.entry(root.clone()).or_default();
+        if !self.worktrees.is_empty() {
+            view.selected = self.selected.clone();
+            view.chat_open = self.chat_open;
+        }
+        for worktree in &self.worktrees {
+            let path = worktree.path();
+            if let Some(chats) = self.chats.get(path) {
+                let mut snapshots: Vec<_> = chats
+                    .iter()
+                    .map(|chat| chat.read(cx).snapshot(cx))
+                    .collect();
+                if let Some(saved) = view.conversations.get(path) {
+                    snapshots.extend(
+                        saved
+                            .iter()
+                            .filter(|conversation| {
+                                !conversation.provider.is_empty()
+                                    && conversation.provider != "claude"
+                            })
+                            .cloned(),
+                    );
+                }
+                view.conversations.insert(path.to_path_buf(), snapshots);
+                view.active_conversations.insert(
+                    path.to_path_buf(),
+                    self.active_chat.get(path).copied().unwrap_or(0),
+                );
+            }
+        }
+        workspace::save_repository(&root, view, self.window_rect);
+    }
+
+    fn cache_review(&mut self, cx: &App) {
+        self.capture_saved_review(cx);
+        if let Some(path) = &self.selected {
+            self.review_views.insert(
+                path.clone(),
+                ReviewView {
+                    tab: self.tab,
+                    details: self.details.clone(),
+                    selected_commit: self.selected_commit.clone(),
+                    commit_patch: self.commit_patch.clone(),
+                    changes_diff: self.changes_diff.clone(),
+                    commit_diff: self.commit_diff.clone(),
+                },
+            );
+        }
+    }
+
+    fn restore_review(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        if let Some(cached) = self.review_views.remove(&path) {
+            self.tab = cached.tab;
+            self.details = cached.details;
+            self.selected_commit = cached.selected_commit;
+            self.commit_patch = cached.commit_patch;
+            self.changes_diff = cached.changes_diff;
+            self.commit_diff = cached.commit_diff;
+            return;
+        }
+        let saved = self
+            .repository_view()
+            .worktrees
+            .get(&path)
+            .cloned()
+            .unwrap_or_default();
+        self.tab = if std::env::var_os("SUPERGIT_TAB").is_some() {
+            initial_tab()
+        } else {
+            MainTab::from_name(&saved.tab)
+        };
+        self.selected_commit = saved.commit;
+        for (commit, entity) in [
+            (false, self.changes_diff.clone()),
+            (true, self.commit_diff.clone()),
+        ] {
+            let subscription = cx.subscribe(&entity, move |this, source, event: &DiffEvent, cx| {
+                let active = if commit {
+                    &this.commit_diff
+                } else {
+                    &this.changes_diff
+                };
+                if *active != source {
+                    return;
+                }
+                if let DiffEvent::SelectionChanged(Some(range)) = event {
+                    this.remember_position(
+                        ReviewPosition {
+                            path: range.path().to_string(),
+                            line: range.start(),
+                            original: range.side() == DiffSide::Original,
+                        },
+                        commit,
+                        cx,
+                    );
+                }
+            });
+            self._subscriptions.push(subscription);
+        }
+    }
+
+    fn remember_position(
+        &mut self,
+        position: ReviewPosition,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(repo), Some(path)) = (&self.repo, &self.selected) else {
+            return;
+        };
+        let view = self
+            .persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default()
+            .worktrees
+            .entry(path.clone())
+            .or_default();
+        if commit {
+            view.commit_position = Some(position);
+        } else {
+            view.changes_position = Some(position);
+        }
+        self.queue_persist(cx);
+    }
+
+    fn restore_position(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let saved = self
+            .selected
+            .as_ref()
+            .and_then(|path| self.repository_view().worktrees.get(path));
+        let position = saved.and_then(|view| {
+            if commit {
+                view.commit_position.clone()
+            } else {
+                view.changes_position.clone()
+            }
+        });
+        if let Some(position) = position {
+            let state = if commit {
+                &self.commit_diff
+            } else {
+                &self.changes_diff
+            };
+            state.update(cx, |state, cx| {
+                state.scroll_to_line(
+                    DiffLinePosition::new(
+                        position.path,
+                        if position.original {
+                            DiffSide::Original
+                        } else {
+                            DiffSide::Modified
+                        },
+                        position.line,
+                    ),
+                    cx,
+                )
+            });
+        }
+    }
+
+    fn remember_layout(
+        &mut self,
+        panel: LayoutPanel,
+        state: &Entity<ResizableState>,
+        cx: &mut Context<Self>,
+    ) {
+        let ix = if matches!(panel, LayoutPanel::Chat) {
+            1
+        } else {
+            0
+        };
+        let Some(width) = state.read(cx).sizes().get(ix).map(|width| width.as_f32()) else {
+            return;
+        };
+        let Some(repo) = &self.repo else { return };
+        let view = self
+            .persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default();
+        match panel {
+            LayoutPanel::Sidebar => view.sidebar_width = width,
+            LayoutPanel::Chat => view.chat_width = width,
+            LayoutPanel::Changes => view.changes_width = width,
+            LayoutPanel::History => view.history_width = width,
+        }
+        view.sanitize();
+        self.queue_persist(cx);
     }
 
     // ---- data flow -------------------------------------------------------
@@ -240,17 +591,36 @@ impl SuperGitApp {
             .as_ref()
             .is_some_and(|p| self.worktrees.iter().any(|w| &w.wt.path == p));
         if !valid {
-            // Prefer the worktree SuperGIT was launched from.
-            self.selected = self
-                .worktrees
-                .iter()
-                .filter(|w| self.launch_dir.starts_with(&w.wt.path))
-                .max_by_key(|w| w.wt.path.as_os_str().len())
-                .or(self.worktrees.first())
-                .map(|w| w.wt.path.clone());
+            self.cache_review(cx);
+            let preferred = self.repo.as_ref().and_then(|repo| {
+                (self.launch_dir == repo.root)
+                    .then(|| {
+                        self.persisted
+                            .repositories
+                            .get(&repo.root)
+                            .and_then(|view| view.selected.clone())
+                    })
+                    .flatten()
+            });
+            self.selected = preferred
+                .filter(|path| {
+                    self.worktrees.iter().any(|info| {
+                        info.path() == path && info.path().is_dir() && info.wt.prunable.is_none()
+                    })
+                })
+                .or_else(|| {
+                    self.worktrees
+                        .iter()
+                        .filter(|w| self.launch_dir.starts_with(&w.wt.path))
+                        .max_by_key(|w| w.wt.path.as_os_str().len())
+                        .or(self.worktrees.first())
+                        .map(|w| w.wt.path.clone())
+                });
         }
         if self.selected != previous {
             self.reset_details(cx);
+            self.restore_review(cx);
+            self.queue_persist(cx);
         }
         self.reload_details(cx);
         #[cfg(feature = "screenshot")]
@@ -353,9 +723,11 @@ impl SuperGitApp {
             && (self.details.patch.value() != Some(patch) || details.path != self.details.path)
         {
             match DiffFile::parse(patch) {
-                Ok(files) => self
-                    .changes_diff
-                    .update(cx, |state, cx| state.set_files(files, cx)),
+                Ok(files) => {
+                    self.changes_diff
+                        .update(cx, |state, cx| state.set_files(files, cx));
+                    self.restore_position(false, cx);
+                }
                 Err(error) => {
                     details.patch =
                         LoadState::from_result(Err(format!("Cannot display diff: {error}")));
@@ -375,13 +747,15 @@ impl SuperGitApp {
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
         }
         self.details.update(details);
-        if self.selected_commit.is_none()
-            && let Some(sha) = self
-                .details
-                .commits
-                .value()
-                .and_then(|commits| commits.first())
-                .map(|c| c.sha.clone())
+        if self.commit_task.is_none()
+            && self.commit_patch.is_loading()
+            && let Some(sha) = self.selected_commit.clone().or_else(|| {
+                self.details
+                    .commits
+                    .value()
+                    .and_then(|commits| commits.first())
+                    .map(|c| c.sha.clone())
+            })
         {
             self.select_commit(sha, cx);
         }
@@ -396,20 +770,21 @@ impl SuperGitApp {
         self.details = Details::default();
         self.selected_commit = None;
         self.commit_patch = LoadState::Loading;
-        self.changes_diff
-            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
-        self.commit_diff
-            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        self.changes_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
+        self.commit_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.selected.as_ref() == Some(&path) {
             return;
         }
+        self.cache_review(cx);
         self.selected = Some(path);
         self.confirm_remove = None;
         self.reset_details(cx);
+        self.restore_review(cx);
         self.reload_details(cx);
+        self.queue_persist(cx);
         cx.notify();
     }
 
@@ -418,6 +793,17 @@ impl SuperGitApp {
             return;
         };
         if self.selected_commit.as_ref() != Some(&sha) {
+            self.capture_saved_review(cx);
+            if let (Some(repo), Some(path)) = (&self.repo, &self.selected) {
+                self.persisted
+                    .repositories
+                    .entry(repo.root.clone())
+                    .or_default()
+                    .worktrees
+                    .entry(path.clone())
+                    .or_default()
+                    .commit_position = None;
+            }
             self.commit_patch = LoadState::Loading;
             self.commit_diff
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
@@ -450,6 +836,9 @@ impl SuperGitApp {
                     Ok(patch)
                 });
                 this.commit_patch.update(LoadState::from_result(patch));
+                this.commit_task = None;
+                this.restore_position(true, cx);
+                this.queue_persist(cx);
                 cx.notify();
             })
             .ok();
@@ -479,6 +868,8 @@ impl SuperGitApp {
                 return;
             }
         };
+        self.persist_workspace(cx);
+        self.cache_review(cx);
         crate::recent::remember(&repo.root);
         self.recent = crate::recent::load();
         let same = self.repo.as_ref().is_some_and(|r| r.root == repo.root);
@@ -486,6 +877,11 @@ impl SuperGitApp {
         if !same {
             self.repo = Some(repo);
             self.reset_view(cx);
+            self.sidebar_layout = cx.new(|_| ResizableState::default());
+            self.chat_layout = cx.new(|_| ResizableState::default());
+            self.changes_layout = cx.new(|_| ResizableState::default());
+            self.history_layout = cx.new(|_| ResizableState::default());
+            self.chat_open = self.repository_view().chat_open;
         } else {
             self.selected = None; // re-pick the worktree containing `path`
         }
@@ -529,6 +925,8 @@ impl SuperGitApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.persist_workspace(cx);
+        self.cache_review(cx);
         self.repo = None;
         self.poll_task = None;
         self.prs_task = None;
@@ -547,11 +945,16 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) {
         // Re-render (sidebar dots, title counts) whenever a conversation changes.
-        cx.observe(&chat, |_, _, cx| cx.notify()).detach();
+        cx.observe(&chat, |this, _, cx| {
+            this.queue_persist(cx);
+            cx.notify();
+        })
+        .detach();
         let list = self.chats.entry(path.clone()).or_default();
         list.push(chat.clone());
         self.active_chat.insert(path, list.len() - 1);
         self.chat_open = true;
+        self.queue_persist(cx);
         let input = chat.read(cx).input();
         input.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
@@ -621,11 +1024,13 @@ impl SuperGitApp {
             self.active_chat
                 .insert(path, next.min(list.len().saturating_sub(1)));
         }
+        self.queue_persist(cx);
         cx.notify();
     }
 
     pub fn toggle_claude(&mut self, _: &ToggleClaude, window: &mut Window, cx: &mut Context<Self>) {
         self.chat_open = !self.chat_open;
+        self.queue_persist(cx);
         if self.chat_open
             && let Some(chat) = self.active_chat_entity()
         {
@@ -1121,9 +1526,14 @@ impl SuperGitApp {
             .filter(|p| matches!(p.state, PrState::Open | PrState::Draft))
             .count();
 
+        let (_, _, main_width) = self.pane_widths(window, cx);
         let content = match self.tab {
-            MainTab::Changes => self.render_changes(&info, &theme, cx).into_any_element(),
-            MainTab::History => self.render_history(&theme, cx).into_any_element(),
+            MainTab::Changes => self
+                .render_changes(&info, main_width, &theme, cx)
+                .into_any_element(),
+            MainTab::History => self
+                .render_history(main_width, &theme, cx)
+                .into_any_element(),
             MainTab::Sessions => self.render_sessions(&info, &theme, cx).into_any_element(),
             MainTab::PullRequests => self.render_prs(&info, &theme, cx).into_any_element(),
         };
@@ -1141,6 +1551,7 @@ impl SuperGitApp {
                     .selected_index(tab_ix)
                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
                         this.tab = TABS[*ix];
+                        this.queue_persist(cx);
                         cx.notify();
                     }))
                     .child(Tab::new().label(format!("Changes · {changes}")))
@@ -1360,6 +1771,7 @@ impl SuperGitApp {
     fn render_changes(
         &self,
         info: &WorktreeInfo,
+        width: f32,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1416,6 +1828,15 @@ impl SuperGitApp {
                 .cursor_pointer()
                 .hover(|el| el.bg(theme.list_hover))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remember_position(
+                        ReviewPosition {
+                            path: path.clone(),
+                            line: 1,
+                            original: false,
+                        },
+                        false,
+                        cx,
+                    );
                     this.changes_diff
                         .update(cx, |state, cx| state.scroll_to_file(&path, cx));
                 }))
@@ -1434,10 +1855,16 @@ impl SuperGitApp {
         });
         let content = h_resizable("changes-layout")
             .with_state(&self.changes_layout)
+            .on_resize(cx.listener(|this, state, _, cx| {
+                this.remember_layout(LayoutPanel::Changes, state, cx)
+            }))
             .child(
                 resizable_panel()
-                    .size(px(300.))
-                    .size_range(px(140.)..px(600.))
+                    .size(px(self
+                        .repository_view()
+                        .changes_width
+                        .min((width - 180.).clamp(140., 600.))))
+                    .size_range(px(140.)..px((width - 180.).clamp(140., 600.)))
                     .child(
                         v_flex()
                             .id("change-list")
@@ -1469,6 +1896,7 @@ impl SuperGitApp {
 
     fn render_history(
         &self,
+        width: f32,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1518,10 +1946,16 @@ impl SuperGitApp {
         });
         let content = h_resizable("history-layout")
             .with_state(&self.history_layout)
+            .on_resize(cx.listener(|this, state, _, cx| {
+                this.remember_layout(LayoutPanel::History, state, cx)
+            }))
             .child(
                 resizable_panel()
-                    .size(px(300.))
-                    .size_range(px(160.)..px(800.))
+                    .size(px(self
+                        .repository_view()
+                        .history_width
+                        .min((width - 180.).clamp(160., 800.))))
+                    .size_range(px(160.)..px((width - 180.).clamp(160., 800.)))
                     .child(
                         v_flex()
                             .id("commit-list")
@@ -1718,9 +2152,43 @@ impl SuperGitApp {
         let path = self.selected.clone().unwrap_or_default();
         // Every worktree gets a ready-to-type conversation; the `claude`
         // process only starts with the first message.
+        if !self.chats.contains_key(&path) {
+            let saved = self.repository_view().clone();
+            let conversations = saved.conversations.get(&path).cloned().unwrap_or_default();
+            let mut restored = Vec::new();
+            for conversation in conversations
+                .iter()
+                .filter(|c| c.provider == "claude" || c.provider.is_empty())
+            {
+                let chat =
+                    cx.new(|cx| ChatSession::restore(path.clone(), conversation, window, cx));
+                cx.observe(&chat, |this, _, cx| {
+                    this.queue_persist(cx);
+                    cx.notify();
+                })
+                .detach();
+                restored.push(chat);
+            }
+            if !restored.is_empty() {
+                self.active_chat.insert(
+                    path.clone(),
+                    saved
+                        .active_conversations
+                        .get(&path)
+                        .copied()
+                        .unwrap_or(0)
+                        .min(restored.len() - 1),
+                );
+                self.chats.insert(path.clone(), restored);
+            }
+        }
         if self.chats.get(&path).is_none_or(Vec::is_empty) {
             let chat = cx.new(|cx| ChatSession::new(path.clone(), window, cx));
-            cx.observe(&chat, |_, _, cx| cx.notify()).detach();
+            cx.observe(&chat, |this, _, cx| {
+                this.queue_persist(cx);
+                cx.notify();
+            })
+            .detach();
             self.chats.insert(path.clone(), vec![chat]);
             self.active_chat.insert(path.clone(), 0);
         }
@@ -1754,6 +2222,7 @@ impl SuperGitApp {
                 .hover(|el| el.bg(theme.list_hover))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.active_chat.insert(path.clone(), ix);
+                    this.queue_persist(cx);
                     cx.notify();
                 }))
                 .when_some(dot, |el, color| {
@@ -1945,11 +2414,15 @@ impl Render for SuperGitApp {
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
                 let show_chat = self.chat_open && self.selected.is_some();
+                let (sidebar_max, chat_max, _) = self.pane_widths(window, cx);
                 let main = self.render_main(window, cx);
                 let workspace = if show_chat {
                     let chat = self.render_claude_panel(window, cx);
                     h_resizable("chat-layout")
                         .with_state(&self.chat_layout)
+                        .on_resize(cx.listener(|this, state, _, cx| {
+                            this.remember_layout(LayoutPanel::Chat, state, cx)
+                        }))
                         .child(
                             resizable_panel()
                                 .size_range(px(360.)..Pixels::MAX)
@@ -1957,8 +2430,8 @@ impl Render for SuperGitApp {
                         )
                         .child(
                             resizable_panel()
-                                .size(px(480.))
-                                .size_range(px(320.)..px(960.))
+                                .size(px(self.repository_view().chat_width.min(chat_max)))
+                                .size_range(px(320.)..px(chat_max))
                                 .child(chat),
                         )
                         .into_any_element()
@@ -1971,10 +2444,13 @@ impl Render for SuperGitApp {
                     .child(
                         h_resizable("sidebar-layout")
                             .with_state(&self.sidebar_layout)
+                            .on_resize(cx.listener(|this, state, _, cx| {
+                                this.remember_layout(LayoutPanel::Sidebar, state, cx)
+                            }))
                             .child(
                                 resizable_panel()
-                                    .size(px(320.))
-                                    .size_range(px(220.)..px(520.))
+                                    .size(px(self.repository_view().sidebar_width.min(sidebar_max)))
+                                    .size_range(px(220.)..px(sidebar_max))
                                     .child(self.render_sidebar(cx)),
                             )
                             .child(

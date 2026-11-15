@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 /// `~/Library/Application Support/SuperGIT`.
 pub fn support_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("SUPERGIT_STATE_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join("Library/Application Support/SuperGIT"))
 }
@@ -69,12 +72,42 @@ pub fn save(settings: &Settings) {
     let Some(file) = file() else {
         return;
     };
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if let Ok(json) = serde_json::to_string_pretty(settings)
+        && let Err(error) = atomic_write(&file, json.as_bytes())
+    {
+        eprintln!("cannot save settings: {error}");
     }
-    if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(file, json);
+}
+
+/// Replace a complete JSON file atomically; drafts are private to the user.
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing settings directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".supergit-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        out.write_all(bytes)?;
+        out.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
+    Ok(result?)
 }
 
 #[cfg(test)]
@@ -89,5 +122,25 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.appearance, Appearance::System);
         assert_eq!(Appearance::System.next().next().next(), Appearance::System);
+    }
+
+    #[test]
+    fn atomic_replacement_keeps_private_permissions_and_valid_json() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("supergit_settings_atomic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        atomic_write(&path, br#"{"draft":"first"}"#).unwrap();
+        atomic_write(&path, br#"{"draft":"second"}"#).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["draft"], "second");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

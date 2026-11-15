@@ -20,7 +20,12 @@ pub fn schedule(handle: AnyWindowHandle, cx: &mut App) {
         cx.background_executor()
             .timer(Duration::from_secs_f64(delay))
             .await;
-        let image = cx.update_window(handle, |_, window, _| window.render_to_image());
+        let image = cx.update_window(handle, |_, window, cx| {
+            // macOS can stop presenting an unfocused window. Capture fresh
+            // entity state instead of the last frame presented on screen.
+            window.draw(cx).clear(cx);
+            window.render_to_image()
+        });
         match image {
             Ok(Ok(image)) => match image.save(&out) {
                 Ok(()) => eprintln!("screenshot saved: {out}"),

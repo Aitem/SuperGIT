@@ -94,6 +94,11 @@ SUPERGIT_TAB=claude SUPERGIT_SCREENSHOT=/tmp/ui.png SUPERGIT_SCREENSHOT_DELAY=6 
 Then read the PNG. Use this to verify every UI change. Screenshot runs open a
 real (unfocused) window — keep them few, the user may be working.
 
+Set `SUPERGIT_STATE_DIR=/tmp/supergit-profile` for isolated UI checks. Settings,
+recent repositories and workspace restoration then use that directory instead
+of the user's normal application support directory. Agent transcripts remain
+owned by the agent provider. Restored conversations never start automatically.
+
 `$SUPERGIT_TEST_REPO` is not set by the project: point it (in your shell or a
 local, untracked `CLAUDE.local.md`) at a real repository with several
 worktrees, Claude sessions and PRs for realistic data. Treat it as read-only:

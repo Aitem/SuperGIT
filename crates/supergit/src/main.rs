@@ -9,6 +9,7 @@ mod recent;
 mod screenshot;
 mod settings;
 mod shell_env;
+mod workspace;
 
 use std::path::PathBuf;
 
@@ -108,13 +109,36 @@ fn main() -> Result<()> {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        let mut bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        if let Some(saved) = workspace::load().window {
+            let display = cx
+                .displays()
+                .into_iter()
+                .find(|display| display.bounds().contains(&point(px(saved.x), px(saved.y))))
+                .or_else(|| cx.primary_display());
+            if let Some(display) = display {
+                let available = display.bounds();
+                let restored = saved.clamped(workspace::WindowRect {
+                    x: available.origin.x.as_f32(),
+                    y: available.origin.y.as_f32(),
+                    width: available.size.width.as_f32(),
+                    height: available.size.height.as_f32(),
+                });
+                bounds = Bounds::new(
+                    point(px(restored.x), px(restored.y)),
+                    size(px(restored.width), px(restored.height)),
+                );
+            }
+        }
         // Screenshot runs must not steal focus (or keystrokes) from the user.
         let headless = std::env::var_os("SUPERGIT_SCREENSHOT").is_some();
         let options = WindowOptions {
             focus: !headless,
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(1100.), px(600.))),
+            window_min_size: Some(size(
+                px(1100_f32.min(bounds.size.width.as_f32())),
+                px(600_f32.min(bounds.size.height.as_f32())),
+            )),
             ..TitleBar::window_options()
         };
         let (_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
