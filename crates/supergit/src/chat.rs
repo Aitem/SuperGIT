@@ -27,6 +27,8 @@ const OUTPUT_LINES: usize = 40;
 pub struct ChatSession {
     /// Where `claude` runs (a resumed session must run where it started).
     cwd: PathBuf,
+    local_id: String,
+    transcript: Option<PathBuf>,
     convo: Conversation,
     process: Option<Arc<ClaudeProcess>>,
     mode: PermissionMode,
@@ -61,7 +63,60 @@ impl ChatSession {
             .start_cwd
             .clone()
             .unwrap_or_else(|| worktree.clone());
-        Self::build(worktree, cwd, convo, window, cx)
+        let mut chat = Self::build(worktree, cwd, convo, window, cx);
+        chat.transcript = Some(session.transcript.clone());
+        chat
+    }
+
+    /// Restore visible history and an unsent draft, without starting a process.
+    pub fn restore(
+        worktree: PathBuf,
+        saved: &crate::workspace::SavedConversation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let history = saved
+            .transcript
+            .as_ref()
+            .and_then(|path| Conversation::from_transcript(path).ok());
+        let mut convo = history.unwrap_or_default();
+        if saved.transcript.as_ref().is_some_and(|p| p.is_file()) {
+            convo.session_id = saved.session_id.clone();
+        }
+        if convo.title.is_none() && !saved.title.is_empty() && saved.title != "New conversation" {
+            convo.title = Some(saved.title.clone());
+        }
+        let cwd = if saved.cwd.is_dir() {
+            saved.cwd.clone()
+        } else {
+            worktree.clone()
+        };
+        let mut chat = Self::build(worktree, cwd, convo, window, cx);
+        if !saved.local_id.is_empty() {
+            chat.local_id = saved.local_id.clone();
+        }
+        chat.transcript = saved.transcript.clone().filter(|p| p.is_file());
+        chat.input.update(cx, |input, cx| {
+            input.set_value(saved.draft.clone(), window, cx)
+        });
+        chat
+    }
+
+    pub fn snapshot(&self, cx: &App) -> crate::workspace::SavedConversation {
+        crate::workspace::SavedConversation {
+            local_id: self.local_id.clone(),
+            provider: "claude".into(),
+            session_id: self.convo.session_id.clone(),
+            transcript: self.transcript.clone().or_else(|| {
+                Some(
+                    sg_agents::project_dir(&self.cwd)?
+                        .join(format!("{}.jsonl", self.convo.session_id.as_ref()?)),
+                )
+            }),
+            cwd: self.cwd.clone(),
+            title: self.title(),
+            draft: self.input.read(cx).value().to_string(),
+        }
     }
 
     fn build(
@@ -80,6 +135,8 @@ impl ChatSession {
         let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = event {
                 this.send(window, cx);
+            } else if matches!(event, InputEvent::Change) {
+                cx.notify();
             }
         });
         let count = convo.items.len();
@@ -92,6 +149,14 @@ impl ChatSession {
         let _ = worktree;
         Self {
             cwd,
+            local_id: format!(
+                "draft-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
+            transcript: None,
             convo,
             process: None,
             mode,
