@@ -5,6 +5,7 @@ mod attention;
 mod chat;
 mod dump;
 mod file_tree;
+mod graph;
 mod icons;
 mod launch;
 mod lifecycle;

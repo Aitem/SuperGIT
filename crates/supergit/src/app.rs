@@ -30,6 +30,7 @@ use crate::agent_context::{self, Attachment};
 use crate::attention::Kind;
 use crate::chat::ChatSession;
 use crate::file_tree::{self, TreeRow};
+use crate::graph;
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::notifications;
@@ -3585,12 +3586,23 @@ impl SuperGitApp {
             .map(|w| w.as_f32())
             .unwrap_or(self.repository_view().history_width)
             .min(commits_max);
-        let rows = commits.iter().enumerate().map(|(ix, c)| {
-            let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
-            let sha = c.sha.clone();
-            commit_row(ix, c, selected, theme)
-                .on_click(cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)))
-        });
+        let (graph, lanes) = graph::layout(
+            commits
+                .iter()
+                .map(|c| (c.sha.as_str(), c.parents.as_slice())),
+        );
+        let lanes = lanes.clamp(1, GRAPH_MAX_LANES);
+        let rows = commits
+            .iter()
+            .zip(graph)
+            .enumerate()
+            .map(|(ix, (c, graph))| {
+                let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
+                let sha = c.sha.clone();
+                commit_row(ix, c, graph, lanes, selected, theme).on_click(
+                    cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)),
+                )
+            });
         let content = h_resizable("history-layout")
             .with_state(&self.history_layout)
             .on_resize(cx.listener(|this, state, _, cx| {
@@ -4700,29 +4712,100 @@ fn tree_dir_row(
         })
 }
 
+/// Commit rows have one height so the graph's lines meet across rows.
+const COMMIT_ROW_HEIGHT: f32 = 28.;
+const GRAPH_LANE_WIDTH: f32 = 12.;
+/// Lanes beyond this are not drawn; HEAD's history rarely needs them.
+const GRAPH_MAX_LANES: usize = 10;
+
+/// The branch graph cell of a commit row: lines through and out of the
+/// commit, and its dot (hollow for a merge).
+fn commit_graph(
+    row: graph::GraphRow,
+    lanes: usize,
+    merge: bool,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let palette = [
+        theme.blue,
+        theme.magenta,
+        theme.green,
+        theme.yellow,
+        theme.red,
+    ];
+    let background = theme.background;
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let x = |lane: usize| {
+                bounds.left() + px(GRAPH_LANE_WIDTH * lane as f32 + GRAPH_LANE_WIDTH / 2.)
+            };
+            let (top, mid, bottom) = (bounds.top(), bounds.center().y, bounds.bottom());
+            for edge in &row.edges {
+                if edge.from >= lanes || edge.to >= lanes {
+                    continue;
+                }
+                let (start, end) = match edge.kind {
+                    graph::EdgeKind::Pass => {
+                        (point(x(edge.from), top), point(x(edge.from), bottom))
+                    }
+                    graph::EdgeKind::In => (point(x(edge.from), top), point(x(edge.to), mid)),
+                    graph::EdgeKind::Out => (point(x(edge.from), mid), point(x(edge.to), bottom)),
+                };
+                let mut path = PathBuilder::stroke(px(1.5));
+                path.move_to(start);
+                if start.x == end.x {
+                    path.line_to(end);
+                } else {
+                    let half = (start.y + end.y) / 2.;
+                    path.cubic_bezier_to(end, point(start.x, half), point(end.x, half));
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, palette[edge.color % palette.len()]);
+                }
+            }
+            if row.lane < lanes {
+                let color = palette[row.color % palette.len()];
+                let radius = px(4.);
+                let center = point(x(row.lane), mid);
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(center.x - radius, center.y - radius),
+                        size(radius * 2., radius * 2.),
+                    ),
+                    radius,
+                    if merge { background } else { color },
+                    px(1.5),
+                    color,
+                    BorderStyle::Solid,
+                ));
+            }
+        },
+    )
+    .flex_none()
+    .w(px(GRAPH_LANE_WIDTH * lanes as f32))
+    .h_full()
+}
+
 fn commit_row(
     ix: usize,
     c: &Commit,
+    graph: graph::GraphRow,
+    lanes: usize,
     selected: bool,
     theme: &gpui_kit::component::Theme,
 ) -> Stateful<Div> {
     h_flex()
         .id(("commit", ix))
-        .px_3()
-        .py_1()
+        .h(px(COMMIT_ROW_HEIGHT))
+        .pl_2()
+        .pr_3()
         .gap_2()
         .text_sm()
         .cursor_pointer()
         .when(selected, |el| el.bg(theme.list_active))
         .hover(|el| el.bg(theme.list_hover))
-        .child(
-            div()
-                .flex_none()
-                .font_family(theme.mono_font_family.clone())
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(c.short_sha().to_string()),
-        )
+        .child(commit_graph(graph, lanes, c.is_merge(), theme))
         .when(c.by_agent, |el| {
             el.child(
                 div()
