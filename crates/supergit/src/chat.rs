@@ -31,7 +31,12 @@ pub struct ChatSession {
     transcript: Option<PathBuf>,
     convo: Conversation,
     process: Option<Arc<ClaudeProcess>>,
-    mode: PermissionMode,
+    /// Picked by the user or last reported by the CLI. `None` until either
+    /// happens: the CLI then starts in its settings' default mode.
+    mode: Option<PermissionMode>,
+    /// A `set_permission_mode` awaiting the CLI's answer, with the mode to
+    /// show again if it refuses.
+    mode_request: Option<(String, Option<PermissionMode>)>,
     input: Entity<TextareaState>,
     scroller: Entity<MessageScrollerState>,
     diffs: HashMap<String, (Entity<DiffState>, usize)>,
@@ -144,8 +149,7 @@ impl ChatSession {
         let mode = convo
             .permission_mode
             .as_deref()
-            .and_then(PermissionMode::from_wire)
-            .unwrap_or_default();
+            .and_then(PermissionMode::from_wire);
         let _ = worktree;
         Self {
             cwd,
@@ -160,6 +164,7 @@ impl ChatSession {
             convo,
             process: None,
             mode,
+            mode_request: None,
             input,
             scroller,
             diffs: HashMap::new(),
@@ -228,14 +233,34 @@ impl ChatSession {
         let before = self.convo.items.len();
         match event {
             ProcessEvent::Message(v) => {
-                if let Some(Reply::Unsupported {
-                    request_id,
-                    subtype,
-                }) = self.convo.apply(&v)
-                    && let Some(p) = &self.process
+                let reported = self.convo.permission_mode.clone();
+                match self.convo.apply(&v) {
+                    Some(Reply::Unsupported {
+                        request_id,
+                        subtype,
+                    }) => {
+                        if let Some(p) = &self.process {
+                            let _ = p.control_error(
+                                &request_id,
+                                &format!("SuperGIT does not handle {subtype}"),
+                            );
+                        }
+                    }
+                    Some(Reply::ControlResponse { request_id, error }) => {
+                        self.on_control_response(&request_id, error)
+                    }
+                    None => {}
+                }
+                // The CLI changed modes (our request, a settings default at
+                // start, an approved plan): follow it.
+                if self.convo.permission_mode != reported
+                    && let Some(mode) = self
+                        .convo
+                        .permission_mode
+                        .as_deref()
+                        .and_then(PermissionMode::from_wire)
                 {
-                    let _ = p
-                        .control_error(&request_id, &format!("SuperGIT does not handle {subtype}"));
+                    self.mode = Some(mode);
                 }
             }
             ProcessEvent::Stderr(line) => {
@@ -251,6 +276,29 @@ impl ChatSession {
             }
         }
         self.items_changed(before, cx);
+    }
+
+    fn on_control_response(&mut self, request_id: &str, error: Option<String>) {
+        let Some((pending, previous)) = self.mode_request.take() else {
+            return;
+        };
+        if pending != request_id {
+            self.mode_request = Some((pending, previous));
+            return;
+        }
+        let Some(error) = error else { return };
+        let wanted = self.mode.map_or("this mode", |m| m.label());
+        // Show the mode the CLI is actually in.
+        self.mode = self
+            .convo
+            .permission_mode
+            .as_deref()
+            .and_then(PermissionMode::from_wire)
+            .or(previous);
+        self.convo.items.push(Item::Notice {
+            text: format!("Can't switch to {wanted}: {error}"),
+            is_error: true,
+        });
     }
 
     fn items_changed(&mut self, before: usize, cx: &mut Context<Self>) {
@@ -299,10 +347,14 @@ impl ChatSession {
         cx.notify();
     }
 
+    /// Applies at once to a running session (reverted with a notice if the
+    /// CLI refuses), otherwise when the next turn starts the process.
     fn set_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
-        self.mode = mode;
-        if let Some(p) = &self.process {
-            let _ = p.set_permission_mode(mode);
+        let previous = self.mode.replace(mode);
+        if let Some(p) = &self.process
+            && let Ok(request_id) = p.set_permission_mode(mode)
+        {
+            self.mode_request = Some((request_id, previous));
         }
         cx.notify();
     }
@@ -325,7 +377,7 @@ impl ChatSession {
                     .iter()
                     .any(|s| s.get("mode").and_then(|m| m.as_str()) == Some("acceptEdits"))
                 {
-                    self.mode = PermissionMode::AcceptEdits;
+                    self.mode = Some(PermissionMode::AcceptEdits);
                 }
                 process.allow(
                     &request_id,
@@ -461,6 +513,7 @@ impl ChatSession {
     ) -> impl IntoElement {
         let summary = tools::summary(&tool.name, &tool.input, Some(&self.cwd));
         let (dot, label_color) = match &tool.result {
+            None if tool.checking => (theme.warning, theme.foreground),
             None => (theme.blue, theme.foreground),
             Some(r) if r.is_error => (theme.danger, theme.danger),
             Some(_) => (theme.success, theme.foreground),
@@ -516,7 +569,16 @@ impl ChatSession {
                             .text_color(theme.muted_foreground)
                             .truncate()
                             .child(summary),
-                    ),
+                    )
+                    .when(tool.checking, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(theme.warning)
+                                .child("safety check…"),
+                        )
+                    }),
             )
             .when_some(diff, |el, (state, lines)| {
                 el.child(diff_box(&state, lines, theme))
@@ -598,6 +660,9 @@ impl ChatSession {
                         )
                     }),
             )
+            .when_some(p.reason.clone().filter(|_| pending), |el, reason| {
+                el.child(div().text_xs().text_color(theme.warning).child(reason))
+            })
             .children(preview)
             .child(if pending {
                 h_flex()
@@ -649,7 +714,7 @@ impl ChatSession {
             .into_iter()
             .enumerate()
             .map(|(i, mode)| {
-                let active = mode == self.mode;
+                let active = mode == self.mode.unwrap_or_default();
                 Button::new(("mode", i))
                     .label(mode.label())
                     .xsmall()
@@ -659,6 +724,9 @@ impl ChatSession {
                         PermissionMode::Default => "Ask before edits and commands",
                         PermissionMode::AcceptEdits => "Auto-accept file edits",
                         PermissionMode::Plan => "Plan only, no changes",
+                        PermissionMode::Auto => {
+                            "Claude decides; a safety check blocks risky actions"
+                        }
                         PermissionMode::BypassPermissions => "Never ask (careful)",
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
