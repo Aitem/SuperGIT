@@ -78,9 +78,12 @@ SUPERGIT_TAB=claude SUPERGIT_SCREENSHOT=/tmp/ui.png SUPERGIT_SCREENSHOT_DELAY=6 
 ```
 
 Then read the PNG. Use this to verify every UI change. Screenshot runs open a
-real (unfocused) window — keep them few, the user may be working. `$SUPERGIT_TEST_REPO` is a
-real repository with several worktrees, many sessions and PRs — good test data
-(read-only: never commit, push or create worktrees there without asking).
+real (unfocused) window — keep them few, the user may be working.
+
+`$SUPERGIT_TEST_REPO` is not set by the project: point it (in your shell or a
+local, untracked `CLAUDE.local.md`) at a real repository with several
+worktrees, Claude sessions and PRs for realistic data. Treat it as read-only:
+never commit, push or create worktrees there without asking.
 
 ## Conventions and gotchas
 

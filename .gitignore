@@ -1,6 +1,20 @@
+# Build output (includes the .noindex app staging folder)
 /target
+**/*.rs.bk
+*.profraw
+
+# macOS / editors
 .DS_Store
+.idea/
+.vscode/
 *.swp
-/.idea
-/.vscode
+
+# Local, personal configuration — never commit
+.env
+.env.*
+CLAUDE.local.md
 .claude/settings.local.json
+.claude/worktrees/
+
+# Ad-hoc screenshots from `--features screenshot` runs
+/screenshots/
