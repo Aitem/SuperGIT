@@ -106,6 +106,101 @@ struct RawCheck {
 
 const FIELDS: &str = "number,title,headRefName,headRefOid,headRepository,baseRefName,state,isDraft,url,author,reviewDecision,statusCheckRollup,additions,deletions,createdAt,mergedAt,updatedAt";
 
+/// A commit author as GitHub knows them: the email on their commits and
+/// the account it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Author {
+    pub email: String,
+    pub login: String,
+    pub avatar_url: String,
+}
+
+const AUTHORS_QUERY: &str = "query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { target { ... on Commit {
+      history(first: 100) { nodes { author { email user { login avatarUrl(size: 64) } } } }
+    } } }
+  }
+}";
+
+/// The accounts behind the default branch's latest commits, one per email.
+/// A single GraphQL call; it reads the repository's history and sends no
+/// emails anywhere.
+pub fn commit_authors(repo: &Path) -> Result<Vec<Author>> {
+    let out = Command::new("gh")
+        .args([
+            "api",
+            "graphql",
+            "-F",
+            "owner={owner}",
+            "-F",
+            "name={repo}",
+            "-f",
+        ])
+        .arg(format!("query={AUTHORS_QUERY}"))
+        .current_dir(repo)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "gh api graphql: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_authors(&out.stdout)
+}
+
+fn parse_authors(json: &[u8]) -> Result<Vec<Author>> {
+    let value: serde_json::Value = serde_json::from_slice(json)?;
+    let nodes = value
+        .pointer("/data/repository/defaultBranchRef/target/history/nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut authors: Vec<Author> = Vec::new();
+    for node in nodes {
+        let author = &node["author"];
+        let (Some(email), Some(login), Some(url)) = (
+            author["email"].as_str(),
+            author["user"]["login"].as_str(),
+            author["user"]["avatarUrl"].as_str(),
+        ) else {
+            continue;
+        };
+        if !authors.iter().any(|a| a.email.eq_ignore_ascii_case(email)) {
+            authors.push(Author {
+                email: email.to_string(),
+                login: login.to_string(),
+                avatar_url: url.to_string(),
+            });
+        }
+    }
+    Ok(authors)
+}
+
+/// GitHub's private commit emails name the account themselves:
+/// `123+login@users.noreply.github.com` (or the older `login@…`). Returns
+/// the login and an avatar URL without asking GitHub.
+pub fn noreply_avatar(email: &str) -> Option<(String, String)> {
+    let local = email
+        .to_ascii_lowercase()
+        .strip_suffix("@users.noreply.github.com")?
+        .to_string();
+    match local.split_once('+') {
+        Some((id, login)) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => Some((
+            login.to_string(),
+            format!("https://avatars.githubusercontent.com/u/{id}?s=64"),
+        )),
+        _ if !local.is_empty() && !local.contains('+') => Some((
+            local.clone(),
+            format!("https://github.com/{local}.png?size=64"),
+        )),
+        _ => None,
+    }
+}
+
 /// Whether `gh` is installed and on PATH.
 pub fn gh_available() -> bool {
     Command::new("gh")
@@ -280,6 +375,46 @@ pub fn merged_pr_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noreply_emails_name_their_account() {
+        assert_eq!(
+            noreply_avatar("12345+Octo-Cat@users.noreply.github.com"),
+            Some((
+                "octo-cat".into(),
+                "https://avatars.githubusercontent.com/u/12345?s=64".into()
+            ))
+        );
+        assert_eq!(
+            noreply_avatar("octocat@users.noreply.github.com"),
+            Some((
+                "octocat".into(),
+                "https://github.com/octocat.png?size=64".into()
+            ))
+        );
+        assert_eq!(noreply_avatar("someone@example.com"), None);
+        assert_eq!(noreply_avatar("x+y@users.noreply.github.com"), None);
+    }
+
+    #[test]
+    fn authors_come_one_per_email_and_skip_unknown_accounts() {
+        let json = br#"{"data":{"repository":{"defaultBranchRef":{"target":{"history":{"nodes":[
+            {"author":{"email":"a@x.io","user":{"login":"alice","avatarUrl":"https://av/a"}}},
+            {"author":{"email":"A@X.io","user":{"login":"alice","avatarUrl":"https://av/a"}}},
+            {"author":{"email":"ghost@x.io","user":null}},
+            {"author":{"email":"b@x.io","user":{"login":"bob","avatarUrl":"https://av/b"}}}
+        ]}}}}}}"#;
+        let authors = parse_authors(json).unwrap();
+        assert_eq!(
+            authors.iter().map(|a| a.login.as_str()).collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert!(
+            parse_authors(br#"{"data":{"repository":null}}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn automatic_cleanup_requires_exact_repository_tip_and_merge_time() {

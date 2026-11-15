@@ -2,6 +2,7 @@ mod agent_context;
 mod app;
 mod appearance;
 mod attention;
+mod avatars;
 mod chat;
 mod dump;
 mod file_tree;
