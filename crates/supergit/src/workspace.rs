@@ -81,7 +81,12 @@ pub struct RepositoryView {
     pub chat_width: f32,
     pub changes_width: f32,
     pub history_width: f32,
+    /// File list beside a commit's diff in the History tab.
+    pub commit_files_width: f32,
     pub chat_open: bool,
+    /// File lists (Changes, and a commit's files in History) show a folder
+    /// tree instead of flat paths.
+    pub changes_tree: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,7 +112,9 @@ impl Default for RepositoryView {
             chat_width: 480.,
             changes_width: 300.,
             history_width: 300.,
+            commit_files_width: 240.,
             chat_open: true,
+            changes_tree: false,
         }
     }
 }
@@ -118,6 +125,7 @@ impl RepositoryView {
         self.chat_width = finite(self.chat_width, 480.).clamp(320., 960.);
         self.changes_width = finite(self.changes_width, 300.).clamp(140., 600.);
         self.history_width = finite(self.history_width, 300.).clamp(160., 800.);
+        self.commit_files_width = finite(self.commit_files_width, 240.).clamp(140., 600.);
     }
 }
 

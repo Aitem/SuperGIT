@@ -4,27 +4,31 @@
 mod base;
 mod worktrees;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable as _, Selectable as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState};
+use gpui_kit::component::diff::{
+    Diff, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffSide, DiffState,
+};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_agents::{AgentState, Session};
-use sg_git::{Commit, FileState, Repo, relative_time};
+use sg_git::{Commit, CommitDetails, FileChange, FileState, Repo, relative_time};
 use sg_github::{PrState, PullRequest};
 
 use crate::agent_context::{self, Attachment};
 use crate::attention::Kind;
 use crate::chat::ChatSession;
+use crate::file_tree::{self, TreeRow};
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::notifications;
@@ -57,10 +61,12 @@ actions!(
     ]
 );
 
+type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainTab {
-    Changes,
     History,
+    Changes,
     Sessions,
     PullRequests,
 }
@@ -77,10 +83,10 @@ impl MainTab {
 
     fn from_name(name: &str) -> Self {
         match name {
-            "history" => Self::History,
+            "changes" => Self::Changes,
             "claude" | "sessions" => Self::Sessions,
             "prs" | "pr" => Self::PullRequests,
-            _ => Self::Changes,
+            _ => Self::History,
         }
     }
 }
@@ -91,6 +97,14 @@ enum LayoutPanel {
     Chat,
     Changes,
     History,
+    CommitFiles,
+}
+
+/// A file list beside a diff: the Changes tab's, or the selected commit's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileList {
+    Changes,
+    Commit,
 }
 
 #[derive(Clone, Copy)]
@@ -117,8 +131,8 @@ struct Switcher {
 }
 
 const TABS: [MainTab; 4] = [
-    MainTab::Changes,
     MainTab::History,
+    MainTab::Changes,
     MainTab::Sessions,
     MainTab::PullRequests,
 ];
@@ -171,10 +185,20 @@ pub struct SuperGitApp {
     selected_commit: Option<String>,
     commit_diff: Entity<DiffState>,
     commit_patch: LoadState<String>,
+    /// The selected commit's card (full message, dates); matched by sha.
+    commit_details: Option<CommitDetails>,
     details_generation: u64,
     commit_generation: u64,
 
     branch_input: Entity<InputState>,
+    /// Filters the Changes tab's file list by path.
+    changes_filter: Entity<InputState>,
+    /// Folders collapsed in the Changes tab's tree view.
+    changes_collapsed: HashSet<String>,
+    /// Filters the selected commit's file list in the History tab.
+    commit_filter: Entity<InputState>,
+    commit_collapsed: HashSet<String>,
+    commit_files_layout: Entity<ResizableState>,
 
     /// Native Claude conversations per worktree (tabs in the right panel).
     /// They keep running while other worktrees are selected.
@@ -225,6 +249,15 @@ impl SuperGitApp {
                 }
             },
         );
+        let changes_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
+        let commit_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
+        let filter_subscriptions = [&changes_filter, &commit_filter].map(|input| {
+            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+        });
         // In "System" mode the theme follows macOS light/dark live.
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
             crate::appearance::system_appearance_changed(window, cx);
@@ -299,9 +332,15 @@ impl SuperGitApp {
             selected_commit: None,
             commit_diff,
             commit_patch: LoadState::Loading,
+            commit_details: None,
             details_generation: 0,
             commit_generation: 0,
             branch_input,
+            changes_filter,
+            changes_collapsed: HashSet::new(),
+            commit_filter,
+            commit_collapsed: HashSet::new(),
+            commit_files_layout: cx.new(|_| ResizableState::default()),
             chats: HashMap::new(),
             active_chat: HashMap::new(),
             chat_open,
@@ -324,6 +363,7 @@ impl SuperGitApp {
                 bounds_subscription,
             ],
         };
+        this._subscriptions.extend(filter_subscriptions);
         this.focus_handle.focus(window, cx);
         this.start_polling(cx);
         this
@@ -577,6 +617,63 @@ impl SuperGitApp {
         }
     }
 
+    /// Flat paths or a folder tree in the Changes tab (remembered per repository).
+    fn set_changes_tree(&mut self, tree: bool, cx: &mut Context<Self>) {
+        let Some(repo) = &self.repo else { return };
+        self.persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default()
+            .changes_tree = tree;
+        self.queue_persist(cx);
+        cx.notify();
+    }
+
+    /// Click handler for a file in `list`: scroll its diff to the file.
+    fn open_file(list: FileList, path: String, cx: &mut Context<Self>) -> ClickHandler {
+        Box::new(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            let commit = list == FileList::Commit;
+            this.remember_position(
+                ReviewPosition {
+                    path: path.clone(),
+                    line: 1,
+                    original: false,
+                },
+                commit,
+                cx,
+            );
+            let diff = if commit {
+                &this.commit_diff
+            } else {
+                &this.changes_diff
+            };
+            diff.update(cx, |state, cx| state.scroll_to_file(&path, cx));
+        }))
+    }
+
+    /// Right-click on a file row: ask an agent about that file.
+    fn file_menu(row: Stateful<Div>, path: String, cx: &mut Context<Self>) -> AnyElement {
+        let owner = cx.entity().downgrade();
+        row.context_menu(move |menu, _, cx| {
+            let Some(owner) = owner.upgrade() else {
+                return menu;
+            };
+            owner.update(cx, |this, cx| this.context_menu(menu, Some(&path), cx))
+        })
+        .into_any_element()
+    }
+
+    fn toggle_dir(&mut self, list: FileList, path: String, cx: &mut Context<Self>) {
+        let collapsed = match list {
+            FileList::Changes => &mut self.changes_collapsed,
+            FileList::Commit => &mut self.commit_collapsed,
+        };
+        if !collapsed.remove(&path) {
+            collapsed.insert(path);
+        }
+        cx.notify();
+    }
+
     fn remember_layout(
         &mut self,
         panel: LayoutPanel,
@@ -602,6 +699,7 @@ impl SuperGitApp {
             LayoutPanel::Chat => view.chat_width = width,
             LayoutPanel::Changes => view.changes_width = width,
             LayoutPanel::History => view.history_width = width,
+            LayoutPanel::CommitFiles => view.commit_files_width = width,
         }
         view.sanitize();
         self.queue_persist(cx);
@@ -1399,11 +1497,14 @@ impl SuperGitApp {
         self.commit_task = Some(cx.spawn(async move |this, cx| {
             let request_path = path.clone();
             let request_sha = sha.clone();
-            let patch = cx
+            let (patch, details) = cx
                 .background_executor()
                 .spawn(async move {
-                    sg_git::commit_patch(&request_path, &request_sha)
-                        .map_err(model::git_error_message)
+                    let patch = sg_git::commit_patch(&request_path, &request_sha)
+                        .map_err(model::git_error_message);
+                    // The card is extra: without it the diff still shows.
+                    let details = sg_git::commit_details(&request_path, &request_sha).ok();
+                    (patch, details)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1421,6 +1522,7 @@ impl SuperGitApp {
                     Ok(patch)
                 });
                 this.commit_patch.update(LoadState::from_result(patch));
+                this.commit_details = details;
                 this.commit_task = None;
                 this.restore_position(true, cx);
                 this.queue_persist(cx);
@@ -1471,6 +1573,7 @@ impl SuperGitApp {
             self.chat_layout = cx.new(|_| ResizableState::default());
             self.changes_layout = cx.new(|_| ResizableState::default());
             self.history_layout = cx.new(|_| ResizableState::default());
+            self.commit_files_layout = cx.new(|_| ResizableState::default());
             self.chat_open = self.repository_view().chat_open;
         } else {
             self.selected = None; // re-pick the worktree containing `path`
@@ -2475,6 +2578,13 @@ impl SuperGitApp {
                 .unwrap_or_else(|_| "—".into())
         };
         let sessions = info.sessions.len();
+        // Commits since the branch forked from main; none on main itself.
+        let history = match &self.details.fork {
+            Some(fork) if self.details.path == info.wt.path => {
+                format!("History · {}", fork.commits)
+            }
+            _ => "History".to_string(),
+        };
         let open_prs = self
             .prs
             .iter()
@@ -2519,8 +2629,8 @@ impl SuperGitApp {
                         this.queue_persist(cx);
                         cx.notify();
                     }))
+                    .child(Tab::new().label(history))
                     .child(Tab::new().label(format!("Changes · {changes}")))
-                    .child(Tab::new().label("History"))
                     .child(Tab::new().label(format!("Claude · {sessions}")))
                     .child(Tab::new().label(format!("Pull requests · {open_prs}"))),
             )
@@ -3154,53 +3264,6 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
-        let rows = files.into_iter().enumerate().map(|(ix, f)| {
-            let state = f.state();
-            let path = f.path.clone();
-            let context_path = path.clone();
-            let owner = cx.entity().downgrade();
-            h_flex()
-                .id(("change", ix))
-                .px_3()
-                .py_1()
-                .gap_2()
-                .text_sm()
-                .cursor_pointer()
-                .hover(|el| el.bg(theme.list_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.remember_position(
-                        ReviewPosition {
-                            path: path.clone(),
-                            line: 1,
-                            original: false,
-                        },
-                        false,
-                        cx,
-                    );
-                    this.changes_diff
-                        .update(cx, |state, cx| state.scroll_to_file(&path, cx));
-                }))
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_none()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(file_state_color(state, theme))
-                        .child(state.letter()),
-                )
-                .child(div().min_w_0().truncate().child(f.path.clone()))
-                .when(f.staged.is_some(), |el| {
-                    el.child(div().text_xs().text_color(theme.success).child("staged"))
-                })
-                .context_menu(move |menu, _, cx| {
-                    let Some(owner) = owner.upgrade() else {
-                        return menu;
-                    };
-                    owner.update(cx, |this, cx| {
-                        this.context_menu(menu, Some(&context_path), cx)
-                    })
-                })
-        });
         let content = h_resizable("changes-layout")
             .with_state(&self.changes_layout)
             .on_resize(cx.listener(|this, state, _, cx| {
@@ -3213,17 +3276,7 @@ impl SuperGitApp {
                         .changes_width
                         .min((width - 180.).clamp(140., 600.))))
                     .size_range(px(140.)..px((width - 180.).clamp(140., 600.)))
-                    .child(
-                        v_flex()
-                            .id("change-list")
-                            .w_full()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .border_r_1()
-                            .border_color(theme.border)
-                            .children(rows),
-                    ),
+                    .child(self.render_file_list(FileList::Changes, &files, theme, cx)),
             )
             .child(
                 resizable_panel().size_range(px(180.)..Pixels::MAX).child(
@@ -3240,6 +3293,137 @@ impl SuperGitApp {
             .relative()
             .children(notice)
             .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
+
+    /// The file list beside a diff: a filter, the flat/tree toggle, and rows
+    /// that scroll the diff to their file. Shared by Changes and History.
+    fn render_file_list(
+        &self,
+        list: FileList,
+        files: &[FileChange],
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (id, filter, collapsed) = match list {
+            FileList::Changes => ("change-list", &self.changes_filter, &self.changes_collapsed),
+            FileList::Commit => ("commit-files", &self.commit_filter, &self.commit_collapsed),
+        };
+        let filter = filter.clone();
+        // Screenshot builds: `SUPERGIT_CHANGES_TREE=1` shows the tree.
+        let tree = self.repository_view().changes_tree
+            || (cfg!(feature = "screenshot")
+                && std::env::var_os("SUPERGIT_CHANGES_TREE").is_some());
+        let query = filter.read(cx).value().to_string();
+        let visible: Vec<usize> = (0..files.len())
+            .filter(|&ix| file_tree::matches(&files[ix].path, &query))
+            .collect();
+        let rows: Vec<AnyElement> = if tree {
+            // While filtering, every folder holding a match is open.
+            let no_collapsed = HashSet::new();
+            let collapsed = if query.trim().is_empty() {
+                collapsed
+            } else {
+                &no_collapsed
+            };
+            file_tree::rows(
+                visible.iter().map(|&ix| (ix, files[ix].path.as_str())),
+                collapsed,
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(row, entry)| match entry {
+                TreeRow::Dir {
+                    path,
+                    name,
+                    depth,
+                    collapsed,
+                    files,
+                } => tree_dir_row(row, name, depth, collapsed, files, theme)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_dir(list, path.clone(), cx)),
+                    )
+                    .into_any_element(),
+                TreeRow::File { ix, name, depth } => Self::file_menu(
+                    change_row(ix, &files[ix], name, tree_indent(depth), theme)
+                        .on_click(Self::open_file(list, files[ix].path.clone(), cx)),
+                    files[ix].path.clone(),
+                    cx,
+                ),
+            })
+            .collect()
+        } else {
+            visible
+                .iter()
+                .map(|&ix| {
+                    let file = &files[ix];
+                    Self::file_menu(
+                        change_row(ix, file, file.path.clone(), px(12.), theme)
+                            .on_click(Self::open_file(list, file.path.clone(), cx)),
+                        file.path.clone(),
+                        cx,
+                    )
+                })
+                .collect()
+        };
+        let header = h_flex()
+            .flex_none()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&filter).small().cleanable(true).prefix(
+                        Icon::new(IconName::Search)
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    ),
+                ),
+            )
+            .children(
+                [
+                    (false, IconName::List, "Flat list"),
+                    (true, IconName::ListTree, "Folder tree"),
+                ]
+                .map(|(as_tree, icon, tooltip)| {
+                    Button::new(SharedString::from(format!(
+                        "{id}-{}",
+                        if as_tree { "tree" } else { "flat" }
+                    )))
+                    .icon(icon)
+                    .small()
+                    .ghost()
+                    .selected(tree == as_tree)
+                    .toggled(tree == as_tree)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_changes_tree(as_tree, cx)))
+                }),
+            );
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(header)
+            .child(
+                v_flex()
+                    .id(id)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(rows.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("No files match"),
+                        )
+                    })
+                    .children(rows),
+            )
             .into_any_element()
     }
 
@@ -3287,6 +3471,15 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
+        let commits_max = (width - 180.).clamp(160., 800.);
+        let commits_width = self
+            .history_layout
+            .read(cx)
+            .sizes()
+            .first()
+            .map(|w| w.as_f32())
+            .unwrap_or(self.repository_view().history_width)
+            .min(commits_max);
         let rows = commits.iter().enumerate().map(|(ix, c)| {
             let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
             let sha = c.sha.clone();
@@ -3320,7 +3513,7 @@ impl SuperGitApp {
             .child(
                 resizable_panel()
                     .size_range(px(180.)..Pixels::MAX)
-                    .child(self.render_commit_patch(cx)),
+                    .child(self.render_commit_patch(width - commits_width, cx)),
             );
         v_flex()
             .size_full()
@@ -3329,7 +3522,10 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    fn render_commit_patch(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The selected commit: its files (filter, flat or tree) beside its diff,
+    /// laid out like the Changes tab. `width` is the room right of the
+    /// commit list.
+    fn render_commit_patch(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         if self.selected_commit.is_none() {
             return self.render_data_notice("Select a commit", None, false, cx);
         }
@@ -3348,19 +3544,189 @@ impl SuperGitApp {
                 cx,
             )
         });
+        let card = self
+            .commit_details
+            .as_ref()
+            .filter(|d| self.selected_commit.as_deref() == Some(d.commit.sha.as_str()))
+            .map(|details| self.render_commit_card(details, cx));
         v_flex()
             .size_full()
             .children(notice)
+            .children(card)
             .when_some(self.commit_patch.value(), |el, patch| {
                 el.child(div().flex_1().min_h_0().child(if patch.is_empty() {
                     self.render_data_notice("No changes in this commit", None, false, cx)
                 } else {
-                    div()
-                        .size_full()
-                        .child(self.render_review_diff(&self.commit_diff, cx))
-                        .into_any_element()
+                    self.render_commit_files(width, cx)
                 }))
             })
+            .into_any_element()
+    }
+
+    /// Above a commit's files and diff: its message, author, date, sha
+    /// (copyable), parents (clickable), refs and change totals.
+    fn render_commit_card(&self, details: &CommitDetails, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let commit = &details.commit;
+        let (files, additions, deletions) = {
+            let diff = self.commit_diff.read(cx);
+            let files = diff.files();
+            (
+                files.len(),
+                files.iter().map(DiffFile::additions).sum::<usize>(),
+                files.iter().map(DiffFile::deletions).sum::<usize>(),
+            )
+        };
+        let sha = commit.sha.clone();
+        let parents = commit.parents.iter().enumerate().map(|(ix, parent)| {
+            let parent = parent.clone();
+            Button::new(("commit-parent", ix))
+                .label(parent[..parent.len().min(8)].to_string())
+                .xsmall()
+                .ghost()
+                .tooltip("Show this parent commit")
+                .on_click(cx.listener(move |this, _, _, cx| this.select_commit(parent.clone(), cx)))
+        });
+        let refs = commit.refs.iter().map(|r| {
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .bg(theme.secondary)
+                .text_color(theme.secondary_foreground)
+                .child(r.replace("HEAD -> ", "➜ "))
+        });
+        v_flex()
+            .flex_none()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(commit.subject.clone()),
+            )
+            .when(!details.body.is_empty(), |el| {
+                el.child(
+                    div()
+                        .id("commit-body")
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(reflow(&details.body)),
+                )
+            })
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .when(commit.by_agent, |el| {
+                        el.child(div().text_color(theme.blue).child("✦ with Claude"))
+                    })
+                    .child(
+                        div()
+                            .text_color(theme.foreground)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(commit.author.clone()),
+                    )
+                    .child(commit.email.clone())
+                    .child({
+                        let ago = relative_time(commit.time);
+                        let ago = if ago == "now" {
+                            ago
+                        } else {
+                            format!("{ago} ago")
+                        };
+                        format!("{} · {ago}", details.date)
+                    })
+                    .when(details.committer != commit.author, |el| {
+                        el.child(format!("committed by {}", details.committer))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        div()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_color(theme.foreground)
+                            .child(commit.short_sha().to_string()),
+                    )
+                    .child(
+                        Button::new("copy-commit-sha")
+                            .label("Copy SHA")
+                            .xsmall()
+                            .ghost()
+                            .tooltip(format!("Copy {sha}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()));
+                                this.flash("Copied commit SHA", false, cx);
+                            })),
+                    )
+                    .when(!commit.parents.is_empty(), |el| {
+                        el.child(div().pl_2().child(if commit.parents.len() > 1 {
+                            "merge of"
+                        } else {
+                            "parent"
+                        }))
+                        .children(parents)
+                    })
+                    .children(refs)
+                    .child(div().flex_1())
+                    .child(format!("{files} file{}", if files == 1 { "" } else { "s" }))
+                    .child(
+                        div()
+                            .text_color(theme.success)
+                            .child(format!("+{additions}")),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.danger)
+                            .child(format!("−{deletions}")),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_commit_files(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let files: Vec<FileChange> = self
+            .commit_diff
+            .read(cx)
+            .files()
+            .iter()
+            .map(commit_file)
+            .collect();
+        let list_max = (width - 180.).clamp(140., 600.);
+        h_resizable("commit-files-layout")
+            .with_state(&self.commit_files_layout)
+            .on_resize(cx.listener(|this, state, _, cx| {
+                this.remember_layout(LayoutPanel::CommitFiles, state, cx)
+            }))
+            .child(
+                resizable_panel()
+                    .size(px(self.repository_view().commit_files_width.min(list_max)))
+                    .size_range(px(140.)..px(list_max))
+                    .child(self.render_file_list(FileList::Commit, &files, &theme, cx)),
+            )
+            .child(
+                resizable_panel().size_range(px(180.)..Pixels::MAX).child(
+                    div()
+                        .size_full()
+                        .min_w_0()
+                        .child(self.render_review_diff(&self.commit_diff, cx)),
+                ),
+            )
             .into_any_element()
     }
 
@@ -3867,14 +4233,9 @@ impl Render for SuperGitApp {
     }
 }
 
-/// `SUPERGIT_TAB=changes|history|claude|prs` picks the tab shown at startup.
+/// `SUPERGIT_TAB=history|changes|claude|prs` picks the tab shown at startup.
 fn initial_tab() -> MainTab {
-    match std::env::var("SUPERGIT_TAB").unwrap_or_default().as_str() {
-        "history" => MainTab::History,
-        "claude" | "sessions" => MainTab::Sessions,
-        "prs" | "pr" => MainTab::PullRequests,
-        _ => MainTab::Changes,
-    }
+    MainTab::from_name(&std::env::var("SUPERGIT_TAB").unwrap_or_default())
 }
 
 // ---- row builders (pure presentation) -------------------------------------
@@ -3952,6 +4313,146 @@ fn time_ago(t: SystemTime) -> String {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| relative_time(d.as_secs() as i64))
         .unwrap_or_default()
+}
+
+/// Commit messages are hard-wrapped at ~72 columns; rejoin each paragraph
+/// so it wraps to the pane instead. Blank lines, list items (`- `, `* `,
+/// `1. `) and trailers (`Key: value`) keep their own lines.
+fn reflow(body: &str) -> String {
+    fn list_item(line: &str) -> bool {
+        let line = line.trim_start();
+        ["- ", "* ", "• "].iter().any(|p| line.starts_with(p))
+            || line.split_once(['.', ')']).is_some_and(|(n, rest)| {
+                !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' ')
+            })
+    }
+    fn trailer(line: &str) -> bool {
+        line.split_once(": ").is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key.len() <= 30
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    }
+    let mut out = String::new();
+    let mut joinable = false;
+    for line in body.lines().map(str::trim_end) {
+        if joinable && !line.is_empty() && !list_item(line) && !trailer(line) {
+            out.push(' ');
+            out.push_str(line.trim_start());
+        } else {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+        joinable = !line.is_empty() && !trailer(line);
+    }
+    out
+}
+
+/// A file of a commit's diff as a list row: committed, so never "staged".
+fn commit_file(file: &DiffFile) -> FileChange {
+    let state = match file.status() {
+        DiffFileStatus::Added => FileState::Added,
+        DiffFileStatus::Deleted => FileState::Deleted,
+        DiffFileStatus::Renamed => FileState::Renamed,
+        DiffFileStatus::Copied => FileState::Copied,
+        DiffFileStatus::Conflicted => FileState::Conflicted,
+        _ => FileState::Modified,
+    };
+    FileChange {
+        path: file.path().to_string(),
+        orig_path: file
+            .original_path()
+            .filter(|orig| *orig != file.path())
+            .map(|orig| orig.to_string()),
+        staged: None,
+        unstaged: Some(state),
+    }
+}
+
+/// Indentation of a file-list tree row at `depth`.
+fn tree_indent(depth: usize) -> Pixels {
+    px(12. + depth as f32 * 14.)
+}
+
+/// A changed file in the Changes tab's list, labelled `label` (the path, or
+/// the file name inside the tree).
+fn change_row(
+    ix: usize,
+    file: &FileChange,
+    label: String,
+    indent: Pixels,
+    theme: &gpui_kit::component::Theme,
+) -> Stateful<Div> {
+    let state = file.state();
+    h_flex()
+        .id(("change", ix))
+        .pl(indent)
+        .pr_3()
+        .py_1()
+        .gap_2()
+        .text_sm()
+        .cursor_pointer()
+        .hover(|el| el.bg(theme.list_hover))
+        .child(
+            div()
+                .w(px(14.))
+                .flex_none()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(file_state_color(state, theme))
+                .child(state.letter()),
+        )
+        .child(div().min_w_0().truncate().child(label))
+        .when(file.staged.is_some(), |el| {
+            el.child(div().text_xs().text_color(theme.success).child("staged"))
+        })
+}
+
+/// A folder in the Changes tab's tree; collapsed ones show how many changed
+/// files they hold.
+fn tree_dir_row(
+    row: usize,
+    name: String,
+    depth: usize,
+    collapsed: bool,
+    files: usize,
+    theme: &gpui_kit::component::Theme,
+) -> Stateful<Div> {
+    let muted = theme.muted_foreground;
+    h_flex()
+        .id(("change-dir", row))
+        .pl(tree_indent(depth))
+        .pr_3()
+        .py_1()
+        .gap_2()
+        .text_sm()
+        .cursor_pointer()
+        .hover(|el| el.bg(theme.list_hover))
+        .child(
+            div().w(px(14.)).flex_none().child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .small()
+                .text_color(muted),
+            ),
+        )
+        .child(
+            Icon::new(if collapsed {
+                IconName::Folder
+            } else {
+                IconName::FolderOpen
+            })
+            .small()
+            .text_color(muted),
+        )
+        .child(div().min_w_0().truncate().child(name))
+        .when(collapsed, |el| {
+            el.child(div().text_xs().text_color(muted).child(files.to_string()))
+        })
 }
 
 fn commit_row(
@@ -4133,4 +4634,92 @@ fn pr_row(
                         }),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: GPUI's glob import brings its own `test` attribute.
+    use super::{DiffFile, FileState, commit_file, reflow};
+
+    #[test]
+    fn commit_bodies_reflow_paragraphs_but_keep_lists_and_trailers() {
+        let body = "\
+Selecting a commit now lays out like the
+Changes tab: commits | files | diff.
+
+- The file list is the same component
+  as in Changes.
+- Built from the parsed diff.
+1. First step
+Note: a trailer-like line
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Signed-off-by: Someone <a@b.c>";
+        assert_eq!(
+            reflow(body),
+            "\
+Selecting a commit now lays out like the Changes tab: commits | files | diff.
+
+- The file list is the same component as in Changes.
+- Built from the parsed diff.
+1. First step
+Note: a trailer-like line
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Signed-off-by: Someone <a@b.c>"
+        );
+        assert_eq!(reflow(""), "");
+    }
+
+    #[test]
+    fn commit_files_carry_their_change_kind() {
+        let patch = "\
+diff --git a/new.rs b/new.rs
+new file mode 100644
+--- /dev/null
++++ b/new.rs
+@@ -0,0 +1 @@
++fn main() {}
+diff --git a/gone.rs b/gone.rs
+deleted file mode 100644
+--- a/gone.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-fn old() {}
+diff --git a/src/old_name.rs b/src/new_name.rs
+similarity index 100%
+rename from src/old_name.rs
+rename to src/new_name.rs
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-pub fn a() {}
++pub fn b() {}
+";
+        let files: Vec<_> = DiffFile::parse(patch)
+            .unwrap()
+            .iter()
+            .map(commit_file)
+            .collect();
+        let summary: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.state(), f.orig_path.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("new.rs", FileState::Added, None),
+                ("gone.rs", FileState::Deleted, None),
+                (
+                    "src/new_name.rs",
+                    FileState::Renamed,
+                    Some("src/old_name.rs")
+                ),
+                ("src/lib.rs", FileState::Modified, None),
+            ]
+        );
+        // Committed files are never shown as "staged".
+        assert!(files.iter().all(|f| f.staged.is_none()));
+    }
 }
