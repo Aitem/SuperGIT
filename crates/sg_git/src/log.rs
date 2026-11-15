@@ -85,6 +85,67 @@ fn parse_log(out: &str) -> Vec<Commit> {
         .collect()
 }
 
+/// How far a worktree's branch has gone since it forked from the base branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fork {
+    /// What HEAD is compared with: `origin/main`, or a local `main` when
+    /// there is no remote.
+    pub base: String,
+    /// Commits on HEAD that the base does not have.
+    pub commits: usize,
+}
+
+/// The branch new work forks from: the remote's default (`origin/HEAD`), else
+/// the first of `origin/main`, `origin/master`, `main`, `master` that exists.
+pub fn base_branch(path: &Path) -> Option<String> {
+    if let Ok(out) = git(
+        path,
+        [
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    ) && !out.trim().is_empty()
+    {
+        return Some(out.trim().to_string());
+    }
+    [
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+        "refs/heads/main",
+        "refs/heads/master",
+    ]
+    .into_iter()
+    .find(|r| git(path, ["show-ref", "--verify", "--quiet", r]).is_ok())
+    .map(|r| {
+        r.trim_start_matches("refs/remotes/")
+            .trim_start_matches("refs/heads/")
+            .to_string()
+    })
+}
+
+/// Commits on HEAD since it forked from [`base_branch`]. `None` when there is
+/// no base branch, or HEAD is the base branch itself (the main checkout).
+pub fn fork(path: &Path) -> Result<Option<Fork>> {
+    let Some(base) = base_branch(path) else {
+        return Ok(None);
+    };
+    let head = git(path, ["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    let base_name = base.strip_prefix("origin/").unwrap_or(&base);
+    if head.as_deref().map(str::trim) == Some(base_name) {
+        return Ok(None);
+    }
+    let count = git(
+        path,
+        ["rev-list", "--count", &format!("{base}..HEAD"), "--"],
+    )?;
+    Ok(Some(Fork {
+        base,
+        commits: count.trim().parse()?,
+    }))
+}
+
 /// The patch introduced by a commit (against its first parent).
 pub fn commit_patch(path: &Path, sha: &str) -> Result<String> {
     git(

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use sg_agents::{AgentState, Session, SessionIndex};
-use sg_git::{Commit, Repo, Worktree, WorktreeStatus};
+use sg_git::{Commit, Fork, Repo, Worktree, WorktreeStatus};
 
 #[derive(Clone, Debug)]
 pub struct WorktreeInfo {
@@ -155,6 +155,9 @@ pub struct Details {
     pub status: LoadState<WorktreeStatus>,
     pub patch: LoadState<String>,
     pub commits: LoadState<Vec<Commit>>,
+    /// Commits since the branch forked from the base branch; `None` on the
+    /// base branch itself or when there is none.
+    pub fork: Option<Fork>,
 }
 
 impl Details {
@@ -169,6 +172,7 @@ impl Details {
         self.suggested_base = next.suggested_base;
         self.patch.update(next.patch);
         self.commits.update(next.commits);
+        self.fork = next.fork;
     }
 }
 
@@ -213,6 +217,7 @@ pub fn load_details(
         status: LoadState::from_result(status),
         patch: LoadState::from_result(patch),
         commits: LoadState::from_result(commits),
+        fork: sg_git::fork(path).ok().flatten(),
     }
 }
 

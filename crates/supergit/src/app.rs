@@ -1949,6 +1949,13 @@ impl SuperGitApp {
                 .unwrap_or_else(|_| "—".into())
         };
         let sessions = info.sessions.len();
+        // Commits since the branch forked from main; none on main itself.
+        let history = match &self.details.fork {
+            Some(fork) if self.details.path == info.wt.path => {
+                format!("History · {}", fork.commits)
+            }
+            _ => "History".to_string(),
+        };
         let open_prs = self
             .prs
             .iter()
@@ -1993,7 +2000,7 @@ impl SuperGitApp {
                         this.queue_persist(cx);
                         cx.notify();
                     }))
-                    .child(Tab::new().label("History"))
+                    .child(Tab::new().label(history))
                     .child(Tab::new().label(format!("Changes · {changes}")))
                     .child(Tab::new().label(format!("Claude · {sessions}")))
                     .child(Tab::new().label(format!("Pull requests · {open_prs}"))),
