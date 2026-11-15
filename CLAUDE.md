@@ -11,11 +11,36 @@ crates/
   sg_git/      git core: worktrees, status, log, diffs (git CLI, porcelain -z)
   sg_github/   pull requests through the `gh` CLI
   sg_agents/   Claude Code sessions from ~/.claude/projects transcripts
+  sg_claude/   native Claude chat: `claude` stream-json process + protocol
+               (process.rs), event → chat items fold (conversation.rs),
+               tool summaries/diffs (tools.rs)
   supergit/    the app (GPUI): main.rs, app.rs (view), model.rs (background
                loading), launch.rs (terminals/editor/browser), dump.rs,
                screenshot.rs (feature `screenshot`)
 docs/ROADMAP.md
 ```
+
+## Native Claude (sg_claude + supergit/src/chat.rs)
+
+Same protocol as the Agent SDKs and the VS Code extension:
+`claude -p --input-format stream-json --output-format stream-json --verbose
+--include-partial-messages --permission-prompt-tool stdio [--resume=<id>]`.
+- Host → CLI (stdin JSON lines): `control_request {subtype: initialize}` first,
+  user turns `{"type":"user","message":{"role":"user","content":…}}`,
+  `interrupt`, `set_permission_mode`, and `control_response` to permission
+  prompts: `{"behavior":"allow","updatedInput":…,"updatedPermissions"?}` /
+  `{"behavior":"deny","message":…}`.
+- CLI → host: `system/init` (session_id, model, cwd), `stream_event` partial
+  deltas, `assistant` (one content block per event), `user` (tool_result +
+  `tool_use_result` with `structuredPatch` for edits), `control_request
+  {subtype: can_use_tool, tool_name, display_name, description, input,
+  permission_suggestions, tool_use_id}`, `result` (turn end, cost).
+- Without `--permission-prompt-tool stdio` prompts are silently denied.
+- Unsupported control requests must get an error `control_response`.
+- `Conversation::from_transcript` replays a session jsonl for history.
+- Live test against the real CLI (costs cents): `cargo test -p sg_claude -- --ignored`.
+- UI checks: `SUPERGIT_DEBUG_CHAT=resume` or `SUPERGIT_DEBUG_CHAT='prompt:…'`
+  (screenshot builds only) opens/sends on startup, then screenshot it.
 
 Core crates are UI-agnostic and synchronous; the app runs them on GPUI's
 background executor and applies results on the main thread. Keep it that way:
@@ -52,7 +77,8 @@ SUPERGIT_TAB=claude SUPERGIT_SCREENSHOT=/tmp/ui.png SUPERGIT_SCREENSHOT_DELAY=6 
   ./target/debug/supergit $SUPERGIT_TEST_REPO
 ```
 
-Then read the PNG. Use this to verify every UI change. `$SUPERGIT_TEST_REPO` is a
+Then read the PNG. Use this to verify every UI change. Screenshot runs open a
+real (unfocused) window — keep them few, the user may be working. `$SUPERGIT_TEST_REPO` is a
 real repository with several worktrees, many sessions and PRs — good test data
 (read-only: never commit, push or create worktrees there without asking).
 

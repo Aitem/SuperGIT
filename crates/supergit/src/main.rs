@@ -1,5 +1,6 @@
 mod app;
 mod appearance;
+mod chat;
 mod dump;
 mod launch;
 mod model;
@@ -95,6 +96,8 @@ fn main() -> Result<()> {
             KeyBinding::new("cmd-r", app::Refresh, None),
             KeyBinding::new("cmd-o", app::OpenRepository, None),
             KeyBinding::new("cmd-shift-o", app::CloseRepository, None),
+            KeyBinding::new("cmd-l", app::ToggleClaude, None),
+            KeyBinding::new("cmd-n", app::NewClaudeChat, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         set_app_menus(cx);
@@ -106,9 +109,12 @@ fn main() -> Result<()> {
         .detach();
 
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        // Screenshot runs must not steal focus (or keystrokes) from the user.
+        let headless = std::env::var_os("SUPERGIT_SCREENSHOT").is_some();
         let options = WindowOptions {
+            focus: !headless,
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(900.), px(560.))),
+            window_min_size: Some(size(px(1100.), px(600.))),
             ..TitleBar::window_options()
         };
         let (_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
@@ -127,7 +133,9 @@ fn main() -> Result<()> {
             }
         })
         .detach();
-        cx.activate(true);
+        if !headless {
+            cx.activate(true);
+        }
     });
     Ok(())
 }
@@ -146,8 +154,11 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Refresh", app::Refresh),
         ]),
-        Menu::new("View").items([MenuItem::submenu(
-            Menu::new("Appearance").items(appearance::menu_items(cx)),
-        )]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Claude Panel", app::ToggleClaude),
+            MenuItem::action("New Claude Conversation", app::NewClaudeChat),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),
+        ]),
     ]);
 }

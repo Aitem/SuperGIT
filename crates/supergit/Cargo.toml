@@ -20,6 +20,7 @@ gpui-kit.workspace = true
 sg_git.workspace = true
 sg_github.workspace = true
 sg_agents.workspace = true
+sg_claude.workspace = true
 # Only for the `screenshot` feature: turns on GPUI's `render_to_image`.
 gpui_platform_test_support = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"], optional = true }
 

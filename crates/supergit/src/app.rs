@@ -1,7 +1,8 @@
 //! The main window: worktrees on the left, the selected worktree's changes,
 //! history, Claude sessions and pull requests on the right.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -15,6 +16,7 @@ use sg_agents::{AgentState, Session};
 use sg_git::{Commit, FileState, Repo, relative_time};
 use sg_github::{PrState, PullRequest};
 
+use crate::chat::ChatSession;
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, SharedSessionIndex, WorktreeInfo};
 use crate::settings::Appearance;
@@ -23,7 +25,16 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// PRs come from the network: refresh every Nth poll.
 const PR_POLL_EVERY: u64 = 20;
 
-actions!(supergit, [Refresh, OpenRepository, CloseRepository]);
+actions!(
+    supergit,
+    [
+        Refresh,
+        OpenRepository,
+        CloseRepository,
+        ToggleClaude,
+        NewClaudeChat
+    ]
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainTab {
@@ -63,6 +74,12 @@ pub struct SuperGitApp {
 
     branch_input: Entity<InputState>,
     confirm_remove: Option<PathBuf>,
+
+    /// Native Claude conversations per worktree (tabs in the right panel).
+    /// They keep running while other worktrees are selected.
+    chats: HashMap<PathBuf, Vec<Entity<ChatSession>>>,
+    active_chat: HashMap<PathBuf, usize>,
+    chat_open: bool,
     message: Option<(String, bool)>,
 
     poll_task: Option<Task<()>>,
@@ -116,6 +133,9 @@ impl SuperGitApp {
             commit_diff,
             branch_input,
             confirm_remove: None,
+            chats: HashMap::new(),
+            active_chat: HashMap::new(),
+            chat_open: true,
             message: None,
             poll_task: None,
             details_task: None,
@@ -202,7 +222,46 @@ impl SuperGitApp {
                 .map(|w| w.wt.path.clone());
         }
         self.reload_details(cx);
+        #[cfg(feature = "screenshot")]
+        self.debug_chat_once(cx);
         cx.notify();
+    }
+
+    /// Screenshot builds only: `SUPERGIT_DEBUG_CHAT=resume` opens the latest
+    /// session in the panel, `SUPERGIT_DEBUG_CHAT=prompt:<text>` sends a turn.
+    #[cfg(feature = "screenshot")]
+    fn debug_chat_once(&mut self, cx: &mut Context<Self>) {
+        let Ok(spec) = std::env::var("SUPERGIT_DEBUG_CHAT") else {
+            return;
+        };
+        if self.worktrees.is_empty() || std::env::var_os("SUPERGIT_DEBUG_CHAT_DONE").is_some() {
+            return;
+        }
+        // SAFETY: screenshot/debug builds only; set once on the main thread.
+        unsafe { std::env::set_var("SUPERGIT_DEBUG_CHAT_DONE", "1") };
+        let Some(window) = cx.windows().first().copied() else {
+            return;
+        };
+        let this = cx.entity();
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                this.update(cx, |app, cx| {
+                    if spec == "resume" {
+                        if let Some(s) = app
+                            .selected_info()
+                            .and_then(|i| i.sessions.first().cloned())
+                        {
+                            app.open_session_chat(s, window, cx);
+                        }
+                    } else if let Some(prompt) = spec.strip_prefix("prompt:") {
+                        app.new_chat(window, cx);
+                        if let Some(chat) = app.active_chat_entity() {
+                            chat.update(cx, |chat, cx| chat.send_text(prompt, cx));
+                        }
+                    }
+                })
+            });
+        });
     }
 
     fn apply_prs(&mut self, result: Result<Vec<PullRequest>, String>, cx: &mut Context<Self>) {
@@ -400,6 +459,134 @@ impl SuperGitApp {
         cx.notify();
     }
 
+    // ---- Claude panel ------------------------------------------------------
+
+    fn add_chat(
+        &mut self,
+        path: PathBuf,
+        chat: Entity<ChatSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Re-render (sidebar dots, title counts) whenever a conversation changes.
+        cx.observe(&chat, |_, _, cx| cx.notify()).detach();
+        let list = self.chats.entry(path.clone()).or_default();
+        list.push(chat.clone());
+        self.active_chat.insert(path, list.len() - 1);
+        self.chat_open = true;
+        let input = chat.read(cx).input();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// A new conversation for the selected worktree.
+    pub fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        // Reuse an untouched empty conversation instead of piling up tabs.
+        if let Some(ix) = self.chats.get(&path).and_then(|list| {
+            list.iter().position(|c| {
+                let c = c.read(cx);
+                c.is_empty() && c.session_id().is_none()
+            })
+        }) {
+            self.active_chat.insert(path.clone(), ix);
+            self.chat_open = true;
+            let input = self.chats[&path][ix].read(cx).input();
+            input.update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+            return;
+        }
+        let chat = cx.new(|cx| ChatSession::new(path.clone(), window, cx));
+        self.add_chat(path, chat, window, cx);
+    }
+
+    pub fn new_chat_action(
+        &mut self,
+        _: &NewClaudeChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_chat(window, cx);
+    }
+
+    /// Open an existing Claude Code session in the panel (history + resume).
+    fn open_session_chat(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        if let Some(ix) = self.chats.get(&path).and_then(|list| {
+            list.iter()
+                .position(|c| c.read(cx).session_id() == Some(session.id.as_str()))
+        }) {
+            self.active_chat.insert(path, ix);
+            self.chat_open = true;
+            cx.notify();
+            return;
+        }
+        let chat = cx.new(|cx| ChatSession::resume(path.clone(), &session, window, cx));
+        self.add_chat(path, chat, window, cx);
+    }
+
+    fn close_chat(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        if let Some(list) = self.chats.get_mut(&path)
+            && ix < list.len()
+        {
+            // Dropping the session kills its `claude` process.
+            list.remove(ix);
+            let active = self.active_chat.get(&path).copied().unwrap_or(0);
+            let next = if active > ix { active - 1 } else { active };
+            self.active_chat
+                .insert(path, next.min(list.len().saturating_sub(1)));
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_claude(&mut self, _: &ToggleClaude, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_open = !self.chat_open;
+        if self.chat_open
+            && let Some(chat) = self.active_chat_entity()
+        {
+            let input = chat.read(cx).input();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn active_chat_entity(&self) -> Option<Entity<ChatSession>> {
+        let path = self.selected.as_ref()?;
+        let list = self.chats.get(path)?;
+        let ix = self.active_chat.get(path).copied().unwrap_or(0);
+        list.get(ix).or(list.last()).cloned()
+    }
+
+    /// State of the native conversations in a worktree, if any is active.
+    fn live_agent_state(&self, path: &Path, cx: &App) -> Option<AgentState> {
+        self.chats
+            .get(path)?
+            .iter()
+            .filter_map(|c| match c.read(cx).status() {
+                sg_claude::Status::NeedsPermission => Some(AgentState::NeedsAttention),
+                sg_claude::Status::Working | sg_claude::Status::Starting => {
+                    Some(AgentState::Working)
+                }
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Transcript-based and live state combined (most urgent wins).
+    fn agent_state_for(&self, info: &WorktreeInfo, cx: &App) -> Option<AgentState> {
+        [info.agent_state(), self.live_agent_state(info.path(), cx)]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     pub fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
         self.flash("Refreshing…", false, cx);
         self.start_polling(cx);
@@ -556,22 +743,22 @@ impl SuperGitApp {
     // ---- rendering -------------------------------------------------------
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let working = self
             .worktrees
             .iter()
-            .filter(|w| w.agent_state() == Some(AgentState::Working))
+            .filter(|w| self.agent_state_for(w, cx) == Some(AgentState::Working))
             .count();
         let waiting = self
             .worktrees
             .iter()
             .filter(|w| {
                 matches!(
-                    w.agent_state(),
+                    self.agent_state_for(w, cx),
                     Some(AgentState::NeedsAttention | AgentState::Finished)
                 )
             })
             .count();
+        let theme = cx.theme();
         TitleBar::new().child(
             h_flex()
                 .w_full()
@@ -730,7 +917,7 @@ impl SuperGitApp {
         let path = info.wt.path.clone();
         let branch = info.wt.branch.clone();
         let pr = self.pr_for_branch(branch.as_deref());
-        let agent = info.agent_state();
+        let agent = self.agent_state_for(info, cx);
 
         let mut meta: Vec<AnyElement> = Vec::new();
         match &info.status {
@@ -909,15 +1096,9 @@ impl SuperGitApp {
         let dirty = info.changed_files() > 0;
         let terminal = self.terminal;
 
-        let p1 = path.clone();
         let p3 = path.clone();
         let p4 = path.clone();
-        let last_session = info.sessions.first().map(|s| {
-            (
-                s.id.clone(),
-                s.start_cwd.clone().unwrap_or_else(|| path.clone()),
-            )
-        });
+        let last_session = info.sessions.first().cloned();
 
         h_flex()
             .px_4()
@@ -951,24 +1132,23 @@ impl SuperGitApp {
                     .flex_none()
                     .child(
                         Button::new("claude-new")
-                            .label("New Claude")
+                            .label("✦ New Claude")
                             .small()
                             .primary()
-                            .tooltip(format!("Start `claude` here in {}", terminal.name()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let r = launch::claude_new(terminal, &p1);
-                                this.report(r, "Claude started in a new terminal", cx);
-                            })),
+                            .tooltip("New Claude conversation in this worktree (cmd-n)")
+                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
                     )
-                    .when_some(last_session, |el, (id, dir)| {
+                    .when_some(last_session, |el, session| {
                         el.child(
                             Button::new("claude-resume")
                                 .label("Resume last")
                                 .small()
-                                .tooltip("claude --resume <most recent session>")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let r = launch::claude_resume(terminal, &dir, &id);
-                                    this.report(r, "Resumed the last session", cx);
+                                .tooltip(format!(
+                                    "Continue “{}” in the Claude panel",
+                                    session.title
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_session_chat(session.clone(), window, cx)
                                 })),
                         )
                     })
@@ -1155,28 +1335,37 @@ impl SuperGitApp {
                 .child("No Claude sessions in this worktree yet")
                 .child(
                     Button::new("claude-new-empty")
-                        .label("Start Claude here")
+                        .label("✦ Start Claude here")
                         .primary()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let r = launch::claude_new(terminal, &path);
-                            this.report(r, "Claude started in a new terminal", cx);
-                        })),
+                        .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
                 )
                 .into_any_element();
         }
         let rows = info.sessions.iter().enumerate().map(|(ix, s)| {
             let id = s.id.clone();
-            let path = s.start_cwd.clone().unwrap_or_else(|| path.clone());
-            session_row(ix, s, theme).child(
-                Button::new(("resume", ix))
-                    .label("Resume")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let r = launch::claude_resume(terminal, &path, &id);
-                        this.report(r, "Session resumed in a new terminal", cx);
-                    })),
-            )
+            let dir = s.start_cwd.clone().unwrap_or_else(|| path.clone());
+            let session = s.clone();
+            session_row(ix, s, theme)
+                .child(
+                    Button::new(("open-session", ix))
+                        .label("Open")
+                        .small()
+                        .tooltip("Continue in the Claude panel")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_session_chat(session.clone(), window, cx)
+                        })),
+                )
+                .child(
+                    Button::new(("resume-terminal", ix))
+                        .label("Terminal")
+                        .small()
+                        .ghost()
+                        .tooltip(format!("claude --resume in {}", terminal.name()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let r = launch::claude_resume(terminal, &dir, &id);
+                            this.report(r, "Session resumed in a new terminal", cx);
+                        })),
+                )
         });
         v_flex()
             .id("sessions")
@@ -1258,6 +1447,126 @@ impl SuperGitApp {
                 )
             })
             .children(rows)
+            .into_any_element()
+    }
+
+    fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let path = self.selected.clone().unwrap_or_default();
+        // Every worktree gets a ready-to-type conversation; the `claude`
+        // process only starts with the first message.
+        if self.chats.get(&path).is_none_or(Vec::is_empty) {
+            let chat = cx.new(|cx| ChatSession::new(path.clone(), window, cx));
+            cx.observe(&chat, |_, _, cx| cx.notify()).detach();
+            self.chats.insert(path.clone(), vec![chat]);
+            self.active_chat.insert(path.clone(), 0);
+        }
+        let theme = cx.theme().clone();
+        let chats = self.chats.get(&path).cloned().unwrap_or_default();
+        let active = self
+            .active_chat
+            .get(&path)
+            .copied()
+            .unwrap_or(0)
+            .min(chats.len().saturating_sub(1));
+        let tabs = chats.iter().enumerate().map(|(ix, chat)| {
+            let c = chat.read(cx);
+            let title: String = c.title().chars().take(22).collect();
+            let dot = match c.status() {
+                sg_claude::Status::Working | sg_claude::Status::Starting => Some(theme.blue),
+                sg_claude::Status::NeedsPermission => Some(theme.warning),
+                _ => None,
+            };
+            let path = path.clone();
+            h_flex()
+                .id(("chat-tab", ix))
+                .flex_none()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .when(ix == active, |el| el.bg(theme.list_active))
+                .hover(|el| el.bg(theme.list_hover))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active_chat.insert(path.clone(), ix);
+                    cx.notify();
+                }))
+                .when_some(dot, |el, color| {
+                    el.child(div().size(px(6.)).rounded_full().bg(color))
+                })
+                .child(title)
+                .when(chats.len() > 1, |el| {
+                    el.child(
+                        div()
+                            .id(("chat-close", ix))
+                            .px_0p5()
+                            .text_color(theme.muted_foreground)
+                            .hover(|el| el.text_color(theme.foreground))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_chat(ix, cx)
+                            }))
+                            .child("×"),
+                    )
+                })
+        });
+
+        v_flex()
+            .w(px(480.))
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .child("✦ Claude"),
+                    )
+                    .child(
+                        h_flex()
+                            .id("chat-tabs")
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .overflow_x_scroll()
+                            .children(tabs),
+                    )
+                    .child(
+                        Button::new("chat-new")
+                            .label("+")
+                            .xsmall()
+                            .ghost()
+                            .tooltip("New conversation (cmd-n)")
+                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
+                    )
+                    .child(
+                        Button::new("chat-hide")
+                            .label("⇥")
+                            .xsmall()
+                            .ghost()
+                            .tooltip("Hide the Claude panel (cmd-l)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_claude(&ToggleClaude, window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .children(chats.get(active).cloned()),
+            )
             .into_any_element()
     }
 
@@ -1366,13 +1675,18 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::open_repository))
             .on_action(cx.listener(Self::close_repository))
+            .on_action(cx.listener(Self::toggle_claude))
+            .on_action(cx.listener(Self::new_chat_action))
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
+                let panel = (self.chat_open && self.selected.is_some())
+                    .then(|| self.render_claude_panel(window, cx));
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(cx))
                     .child(self.render_main(window, cx))
+                    .children(panel)
                     .into_any_element()
             } else {
                 self.render_welcome(cx).into_any_element()

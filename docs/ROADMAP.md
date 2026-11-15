@@ -7,12 +7,23 @@ new/resume Claude in an external terminal; offscreen screenshots.
 Ordered by how much each removes from the daily "terminal + VS Code +
 GitKraken" juggling.
 
-## 1. Embedded terminal
+## 1. Claude panel, round two
 
-Terminal tabs per worktree inside SuperGIT, running `claude` (and shells).
-`alacritty_terminal` for PTY + VT emulation, rendered with GPUI (the approach
-Zed's terminal uses). Sessions keep running when switching worktrees. Replaces
-the external-terminal launch in `launch.rs`.
+Done (v0.2): native chat via stream-json, permission cards, inline diffs,
+tabs per worktree, resume with history, modes, stop.
+
+Next: `@file` mentions and the current selection/diff as context, images and
+paste, slash commands from `initialize` (`commands`), model and effort picker,
+TodoWrite rendered as a checklist, subagent (Task) calls folded into a tree,
+plan-mode "accept plan" card, per-hunk accept/revert of edits, macOS
+notification when a conversation needs approval or finishes, queued messages
+while Claude works, copy buttons.
+
+## 1b. Embedded terminal
+
+For people who prefer the TUI and for plain shells: terminal tabs per
+worktree (`alacritty_terminal` + GPUI). Lower priority now that Claude is
+native.
 
 ## 2. Exact agent status + notifications
 

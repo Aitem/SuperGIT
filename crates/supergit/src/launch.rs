@@ -118,11 +118,6 @@ fn osascript(script: &str) -> Result<()> {
     Ok(())
 }
 
-/// New Claude Code session in `dir`.
-pub fn claude_new(app: TerminalApp, dir: &Path) -> Result<()> {
-    open_terminal(app, dir, Some("claude"))
-}
-
 /// Resume an existing Claude Code session (must run in the session's cwd).
 pub fn claude_resume(app: TerminalApp, dir: &Path, session_id: &str) -> Result<()> {
     open_terminal(

@@ -1,0 +1,13 @@
+[package]
+name = "sg_claude"
+description = "Claude Code as a native chat: stream-json process control and conversation model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures = { workspace = true, features = ["executor"] }
+serde_json.workspace = true

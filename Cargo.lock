@@ -6127,6 +6127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg_claude"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "serde_json",
+]
+
+[[package]]
 name = "sg_git"
 version = "0.1.0"
 dependencies = [
@@ -6435,6 +6444,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sg_agents",
+ "sg_claude",
  "sg_git",
  "sg_github",
 ]

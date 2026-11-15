@@ -15,10 +15,11 @@ use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AgentState {
+    /// A tool call is waiting for the user (permission prompt). Ordered first:
+    /// the most urgent state wins when several sessions are combined.
+    NeedsAttention,
     /// Claude is producing output or running a tool right now.
     Working,
-    /// A tool call has been pending for a while: most likely a permission prompt.
-    NeedsAttention,
     /// The turn ended; Claude is waiting for your next message.
     Finished,
     /// Nothing recent.
