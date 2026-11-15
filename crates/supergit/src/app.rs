@@ -1,6 +1,7 @@
 //! The main window: worktrees on the left, the selected worktree's changes,
 //! history, Claude sessions and pull requests on the right.
 
+mod base;
 mod worktrees;
 
 use std::collections::HashMap;
@@ -51,7 +52,8 @@ actions!(
         AskAgent,
         AskAgentNewConversation,
         ToggleKeepWorktree,
-        CleanUpWorktree
+        CleanUpWorktree,
+        UpdateBase
     ]
 );
 
@@ -122,6 +124,10 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    creation_base: LoadState<sg_git::BaseInfo>,
+    creation_base_task: Option<Task<()>>,
+    base_update_error: Option<String>,
+    base_update_paths: std::collections::HashSet<PathBuf>,
     cleanup_task: Option<Task<()>>,
     cleanup_paths: std::collections::HashSet<PathBuf>,
     cleanup_results: Vec<(String, bool)>,
@@ -248,6 +254,10 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            creation_base: LoadState::Loading,
+            creation_base_task: None,
+            base_update_error: None,
+            base_update_paths: Default::default(),
             cleanup_task: None,
             cleanup_paths: Default::default(),
             cleanup_results: Vec::new(),
@@ -775,8 +785,9 @@ impl SuperGitApp {
     }
 
     fn open_destination(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cleanup_paths.contains(&entry.path) {
-            self.flash("Cleanup is in progress for this worktree", true, cx);
+        if self.cleanup_paths.contains(&entry.path) || self.base_update_paths.contains(&entry.path)
+        {
+            self.flash("A Git operation is in progress for this worktree", true, cx);
             return;
         }
         self.cleanup_results_open = false;
@@ -986,6 +997,7 @@ impl SuperGitApp {
 
     /// (Re)start the refresh loop. Restarting refreshes immediately, PRs included.
     fn start_polling(&mut self, cx: &mut Context<Self>) {
+        self.start_base_polling(cx);
         if self.repo.is_none() {
             self.poll_task = None;
             self.prs_task = None;
@@ -1336,8 +1348,8 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.cleanup_paths.contains(&path) {
-            self.flash("Cleanup is in progress for this worktree", true, cx);
+        if self.cleanup_paths.contains(&path) || self.base_update_paths.contains(&path) {
+            self.flash("A Git operation is in progress for this worktree", true, cx);
             return;
         }
         if self
@@ -1464,6 +1476,8 @@ impl SuperGitApp {
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.creation_base = LoadState::Loading;
+        self.base_update_error = None;
         self.observed_open_prs.clear();
         self.cleanup_attempted.clear();
         self.cleanup_results.clear();
@@ -1703,6 +1717,9 @@ impl SuperGitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        chat.update(cx, |chat, cx| {
+            chat.set_git_busy(self.base_update_paths.contains(&path), cx)
+        });
         // Re-render (sidebar dots, title counts) whenever a conversation changes.
         self.watch_chat(path.clone(), &chat, cx);
         let list = self.chats.entry(path.clone()).or_default();
@@ -1720,7 +1737,7 @@ impl SuperGitApp {
         let Some(path) = self.selected.clone() else {
             return;
         };
-        if self.cleanup_paths.contains(&path) {
+        if self.cleanup_paths.contains(&path) || self.base_update_paths.contains(&path) {
             return;
         }
         // Reuse an untouched empty conversation instead of piling up tabs.
@@ -1938,6 +1955,14 @@ impl SuperGitApp {
         let path = model::default_worktree_path(&repo, &branch);
         let root = repo.root.clone();
         let target = path.clone();
+        let base = self
+            .creation_base
+            .value()
+            .filter(|_| self.creation_base.error().is_none())
+            .map(|info| info.creation_ref().map_err(|error| error.to_string()))
+            .unwrap_or_else(|| {
+                Err("Base is unavailable. Refresh or choose a local branch first".into())
+            });
         self.branch_input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.run_git_action(
@@ -1947,7 +1972,7 @@ impl SuperGitApp {
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                // Existing branch: check it out; otherwise create it from HEAD.
+                // Existing branches keep their own history; new ones use the visible base.
                 let exists = sg_git::git(
                     &root,
                     [
@@ -1961,7 +1986,8 @@ impl SuperGitApp {
                 if exists {
                     sg_git::add_worktree(&root, &target, None, Some(&branch))
                 } else {
-                    sg_git::add_worktree(&root, &target, Some(&branch), None)
+                    let base = base.map_err(anyhow::Error::msg)?;
+                    sg_git::add_worktree(&root, &target, Some(&branch), Some(&base))
                 }
             },
             cx,
@@ -2234,12 +2260,14 @@ impl SuperGitApp {
                     .gap_2()
                     .border_t_1()
                     .border_color(theme.sidebar_border)
+                    .child(self.render_creation_base(cx))
                     .child(Input::new(&self.branch_input).small())
                     .child(
                         Button::new("create-worktree")
                             .label("Create worktree")
                             .small()
                             .primary()
+                            .disabled(self.action_task.is_some() || self.cleanup_task.is_some())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.create_worktree(window, cx)),
                             ),
@@ -3499,6 +3527,12 @@ impl SuperGitApp {
             self.chats.insert(path.clone(), vec![chat]);
             self.active_chat.insert(path.clone(), 0);
         }
+        let busy = self.base_update_paths.contains(path);
+        for chat in self.chats.get(path).into_iter().flatten() {
+            if busy {
+                chat.update(cx, |chat, cx| chat.set_git_busy(true, cx));
+            }
+        }
     }
 
     fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -3753,6 +3787,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::close_repository))
             .on_action(cx.listener(Self::toggle_claude))
             .on_action(cx.listener(Self::new_chat_action))
+            .on_action(cx.listener(Self::update_creation_base))
             .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::ask_agent))
