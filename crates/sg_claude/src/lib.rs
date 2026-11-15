@@ -10,6 +10,7 @@
 //!
 //! This crate is UI-agnostic: [`process`] owns the child process and the wire
 //! protocol, [`conversation`] folds events into displayable [`Item`]s.
+#![forbid(unsafe_code)]
 
 pub mod conversation;
 pub mod process;

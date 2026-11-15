@@ -1,0 +1,4 @@
+# Unit tests (`#[cfg(test)]`) may use these freely; see [workspace.lints].
+allow-unwrap-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true

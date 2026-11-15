@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
+        std::io::Write::write_all(&mut std::io::stdout(), USAGE.as_bytes())?;
         return Ok(());
     }
     let dump = args.iter().any(|a| a == "--dump");

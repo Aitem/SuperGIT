@@ -1,3 +1,8 @@
+#![expect(
+    clippy::unwrap_used,
+    reason = "test helpers fail the test by panicking"
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -1,0 +1,3 @@
+[alias]
+# CI's clippy job, verbatim: `cargo lint`.
+lint = "clippy --workspace --all-targets --all-features --locked -- -D warnings"

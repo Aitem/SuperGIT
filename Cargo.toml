@@ -22,6 +22,23 @@ serde_json = "1"
 gpui-kit = "0.9.1"
 futures = "0.3"
 
+# Guardrails for agent-written code (warnings fail CI). Silence one only with
+# `#[expect(clippy::…, reason = "…")]` at the narrowest scope — never `#[allow]`.
+[workspace.lints.clippy]
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# A panic is an app crash: use `?`, or `expect("why this holds")` for invariants.
+# Tests may unwrap (clippy.toml; integration-test files opt in with `#![expect]`).
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# stdout belongs to `--dump`/`--help`; stray debug prints stay out of the app.
+print_stdout = "warn"
+undocumented_unsafe_blocks = "warn"
+# `foo.rs` + `foo/`, not `foo/mod.rs`.
+mod_module_files = "warn"
+
 [profile.dev]
 # Keep our crates debuggable but make dependencies (gpui, tree-sitter…) fast.
 opt-level = 0
