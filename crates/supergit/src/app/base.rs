@@ -2,6 +2,27 @@
 use super::*;
 use gpui_kit::component::menu::DropdownMenu as _;
 
+/// Choosing the branch to rebase a worktree onto, previewing it, confirming.
+pub(super) struct RebaseDialog {
+    path: PathBuf,
+    branch: String,
+    onto: String,
+    /// The PR's base and the sidebar's base, then every other local branch.
+    suggested: Vec<String>,
+    others: Vec<String>,
+    plan: LoadState<sg_git::RebasePlan>,
+    plan_task: Option<Task<()>>,
+    previous_focus: Option<FocusHandle>,
+}
+
+fn plural(count: u32, word: &str) -> String {
+    if count == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
 impl SuperGitApp {
     pub(super) fn start_base_polling(&mut self, cx: &mut Context<Self>) {
         self.creation_base_task = None;
@@ -147,15 +168,15 @@ impl SuperGitApp {
         }));
     }
 
-    /// The local branch worktrees rebase onto: the base new worktrees start from.
-    pub(super) fn rebase_base(&self) -> Option<String> {
+    /// The sidebar's base branch, when it has a commit.
+    fn creation_branch(&self) -> Option<String> {
         let info = self.creation_base.value()?;
         info.tip.as_ref()?;
         info.branch.clone()
     }
 
-    /// Why `info` cannot be rebased onto `base` right now.
-    fn rebase_blocker(&self, info: &WorktreeInfo, base: &str, cx: &App) -> Option<String> {
+    /// Why `info` cannot be rebased right now.
+    fn rebase_blocker(&self, info: &WorktreeInfo, cx: &App) -> Option<String> {
         let Ok(status) = &info.status else {
             return Some("its status is unavailable".into());
         };
@@ -176,60 +197,171 @@ impl SuperGitApp {
         if self.worktree_busy(info, cx) {
             return Some("Claude is working here; wait until it finishes".into());
         }
-        match info.behind_base {
-            Some(0) => Some(format!("already up to date with {base}")),
-            Some(_) => None,
-            None => Some("checking how far it is behind…".into()),
-        }
+        None
     }
 
-    /// Rebase a worktree's branch onto the sidebar's base. Conflicts abort the
-    /// rebase in `sg_git`, so the branch ends up rebased or untouched.
-    pub(super) fn rebase_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(base) = self.rebase_base() else {
+    /// Ask where to rebase a worktree's branch. Nothing changes until the
+    /// user picks a branch, reads the preview and confirms.
+    pub(super) fn open_rebase_dialog(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(info) = self.worktrees.iter().find(|info| info.path() == path) else {
+            return;
+        };
+        let Some(branch) = info.wt.branch.clone() else {
             self.flash(
-                "Base is unavailable. Refresh and choose a local branch",
+                "HEAD is detached; check out a branch before rebasing",
                 true,
                 cx,
             );
             return;
         };
-        let Some(info) = self.worktrees.iter().find(|info| info.path() == path) else {
-            return;
-        };
-        let branch = info
-            .wt
-            .branch
-            .clone()
-            .unwrap_or_else(|| info.wt.display_name());
-        if let Some(reason) = self.rebase_blocker(info, &base, cx) {
+        if let Some(reason) = self.rebase_blocker(info, cx) {
             self.flash(format!("Cannot rebase {branch}: {reason}"), true, cx);
             return;
         }
-        let Some(head) = info
-            .status
+        let branches = self
+            .creation_base
+            .value()
+            .map(|base| base.branches.clone())
+            .unwrap_or_default();
+        let mut suggested: Vec<String> = Vec::new();
+        let pr_base = self
+            .pr_for_branch(Some(&branch))
+            .map(|pr| pr.base_branch.clone());
+        for candidate in pr_base.into_iter().chain(self.creation_branch()) {
+            if candidate != branch
+                && branches.contains(&candidate)
+                && !suggested.contains(&candidate)
+            {
+                suggested.push(candidate);
+            }
+        }
+        let others: Vec<String> = branches
+            .into_iter()
+            .filter(|name| *name != branch && !suggested.contains(name))
+            .collect();
+        let Some(onto) = suggested.first().or(others.first()).cloned() else {
+            self.flash(
+                format!("No other local branch to rebase {branch} onto"),
+                true,
+                cx,
+            );
+            return;
+        };
+        if self.cleanup_preview.is_some() {
+            self.close_cleanup_preview(window, cx);
+        }
+        self.cleanup_results_open = false;
+        self.settings_open = false;
+        self.close_switcher(&CloseSwitcher, window, cx);
+        self.rebase_dialog = Some(RebaseDialog {
+            path,
+            branch,
+            onto,
+            suggested,
+            others,
+            plan: LoadState::Loading,
+            plan_task: None,
+            previous_focus: window.focused(cx),
+        });
+        self.load_rebase_plan(cx);
+        self.rebase_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn choose_rebase_target(&mut self, onto: String, cx: &mut Context<Self>) {
+        if let Some(dialog) = &mut self.rebase_dialog
+            && dialog.onto != onto
+        {
+            dialog.onto = onto;
+            self.load_rebase_plan(cx);
+        }
+    }
+
+    fn load_rebase_plan(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.rebase_dialog else {
+            return;
+        };
+        let (path, onto) = (dialog.path.clone(), dialog.onto.clone());
+        dialog.plan = LoadState::Loading;
+        dialog.plan_task = Some(cx.spawn(async move |this, cx| {
+            let request = (path.clone(), onto.clone());
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    sg_git::plan_rebase(&request.0, &request.1).map_err(model::git_error_message)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(dialog) = &mut this.rebase_dialog
+                    && dialog.path == path
+                    && dialog.onto == onto
+                {
+                    dialog.plan = LoadState::from_result(result);
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn close_rebase_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.rebase_dialog.take() {
+            dialog
+                .previous_focus
+                .unwrap_or_else(|| self.focus_handle.clone())
+                .focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Run the rebase the dialog previewed. `sg_git::rebase` refuses if the
+    /// branch or the target moved since, and aborts on conflicts.
+    fn confirm_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan) = self
+            .rebase_dialog
             .as_ref()
-            .ok()
-            .and_then(|status| status.head_oid.clone())
+            .and_then(|dialog| {
+                dialog
+                    .plan
+                    .value()
+                    .filter(|_| dialog.plan.error().is_none())
+            })
+            .filter(|plan| !plan.is_up_to_date())
+            .cloned()
         else {
             return;
         };
+        let Some(info) = self
+            .worktrees
+            .iter()
+            .find(|info| info.path() == plan.worktree)
+        else {
+            return;
+        };
+        if let Some(reason) = self.rebase_blocker(info, cx) {
+            self.flash(format!("Cannot rebase {}: {reason}", plan.branch), true, cx);
+            return;
+        }
         let Some(root) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
             return;
         };
+        self.close_rebase_dialog(window, cx);
+        let path = plan.worktree.clone();
+        let (branch, onto) = (plan.branch.clone(), plan.onto.clone());
         self.base_update_paths.insert(path.clone());
         for chat in self.chats.get(&path).into_iter().flatten() {
             chat.update(cx, |chat, cx| chat.set_git_busy(true, cx));
         }
-        self.flash(format!("Rebasing {branch} onto {base}…"), false, cx);
-        let request = (path.clone(), base.clone());
+        self.flash(format!("Rebasing {branch} onto {onto}…"), false, cx);
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    let (path, base) = request;
-                    sg_git::rebase_onto(&path, &base, &head).map_err(model::git_error_message)
-                })
+                .spawn(async move { sg_git::rebase(&plan).map_err(model::git_error_message) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.action_task = None;
@@ -240,15 +372,15 @@ impl SuperGitApp {
                 if this.repo.as_ref().is_some_and(|repo| repo.root == root) {
                     match result {
                         Ok(sg_git::RebaseOutcome::UpToDate) => {
-                            this.flash(format!("{branch} already contains {base}"), false, cx)
+                            this.flash(format!("{branch} already contains {onto}"), false, cx)
                         }
                         Ok(sg_git::RebaseOutcome::Rebased { commits: 0 }) => {
-                            this.flash(format!("{branch} fast-forwarded to {base}"), false, cx)
+                            this.flash(format!("{branch} moved to {onto}"), false, cx)
                         }
                         Ok(sg_git::RebaseOutcome::Rebased { commits }) => this.flash(
                             format!(
-                                "Rebased {branch} onto {base}: {commits} commit{} replayed",
-                                if commits == 1 { "" } else { "s" }
+                                "Rebased {branch} onto {onto}: {commits} {} replayed",
+                                plural(commits, "commit")
                             ),
                             false,
                             cx,
@@ -264,46 +396,286 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// The row's "Rebase" button: every worktree on a branch other than the
-    /// base gets one; the tooltip says what it would do or why it cannot.
+    /// Screenshot builds only: `SUPERGIT_DEBUG_REBASE=<branch>` opens the
+    /// Rebase dialog for that branch's worktree once the base is loaded.
+    #[cfg(feature = "screenshot")]
+    pub(super) fn debug_rebase_once(&mut self, cx: &mut Context<Self>) {
+        let Ok(branch) = std::env::var("SUPERGIT_DEBUG_REBASE") else {
+            return;
+        };
+        if self.creation_base.value().is_none()
+            || std::env::var_os("SUPERGIT_DEBUG_REBASE_DONE").is_some()
+        {
+            return;
+        }
+        let Some(path) = self
+            .worktrees
+            .iter()
+            .find(|info| info.wt.branch.as_deref() == Some(branch.as_str()))
+            .map(|info| info.wt.path.clone())
+        else {
+            return;
+        };
+        // SAFETY: isolated screenshot builds only, on the main thread.
+        unsafe { std::env::set_var("SUPERGIT_DEBUG_REBASE_DONE", "1") };
+        let Some(window) = cx.windows().first().copied() else {
+            return;
+        };
+        let this = cx.entity();
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| this.open_rebase_dialog(path, window, cx));
+            });
+        });
+    }
+
+    /// The row's "Rebase…" button: it only opens the dialog.
     pub(super) fn render_rebase_button(
         &self,
         ix: usize,
         info: &WorktreeInfo,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let base = self.rebase_base()?;
         let branch = info.wt.branch.clone()?;
-        if branch == base || info.status.is_err() {
+        if info.status.is_err() || self.creation_branch().as_ref() == Some(&branch) {
             return None;
         }
         let running = self.base_update_paths.contains(info.path());
-        let blocker = self.rebase_blocker(info, &base, cx);
-        let tooltip = match (&blocker, info.behind_base) {
-            _ if running => format!("Rebasing {branch} onto {base}…"),
-            (Some(reason), _) => format!("Rebase onto {base}: {reason}"),
-            (None, behind) => {
-                let behind = behind.unwrap_or_default();
-                format!(
-                    "Rebase {branch} onto {base} ({behind} new commit{} on {base}). Conflicts abort the rebase and leave the branch unchanged",
-                    if behind == 1 { "" } else { "s" }
-                )
-            }
+        let blocker = self.rebase_blocker(info, cx);
+        let tooltip = match &blocker {
+            _ if running => format!("Rebasing {branch}…"),
+            Some(reason) => format!("Rebase: {reason}"),
+            None => format!("Choose a branch to rebase {branch} onto"),
         };
         let path = info.wt.path.clone();
         Some(
             Button::new(("worktree-rebase", ix))
-                .label(if running { "Rebasing…" } else { "Rebase" })
+                .label(if running { "Rebasing…" } else { "Rebase…" })
                 .xsmall()
                 .ghost()
                 .tooltip(tooltip)
                 .disabled(running || blocker.is_some())
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.rebase_worktree(path.clone(), cx);
+                    this.open_rebase_dialog(path.clone(), window, cx);
                 }))
                 .into_any_element(),
         )
+    }
+
+    pub(super) fn render_rebase_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = &self.rebase_dialog else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let branch = dialog.branch.clone();
+        let onto = dialog.onto.clone();
+        let blocker = self
+            .worktrees
+            .iter()
+            .find(|info| info.path() == dialog.path)
+            .and_then(|info| self.rebase_blocker(info, cx));
+        let note = |text: String, color: Hsla| div().text_sm().text_color(color).child(text);
+        let mut lines: Vec<AnyElement> = Vec::new();
+        let mut ready = false;
+        match &dialog.plan {
+            LoadState::Loading => lines.push(
+                note(
+                    format!("Comparing {branch} with {onto}…"),
+                    theme.muted_foreground,
+                )
+                .into_any_element(),
+            ),
+            LoadState::Failed { error, .. } => {
+                lines.push(note(error.clone(), theme.danger).into_any_element())
+            }
+            LoadState::Ready(plan) if plan.is_up_to_date() => lines.push(
+                note(
+                    format!("{branch} already contains {onto}. Nothing to rebase."),
+                    theme.muted_foreground,
+                )
+                .into_any_element(),
+            ),
+            LoadState::Ready(plan) => {
+                ready = true;
+                let behind = format!("{} {}", plan.behind, plural(plan.behind, "commit"));
+                lines.push(if plan.replayed == 0 {
+                    note(
+                        format!(
+                            "{branch} has no commits of its own that {onto} lacks: it will simply move to {onto} (+{behind}). Its work is probably merged already."
+                        ),
+                        theme.warning,
+                    )
+                    .into_any_element()
+                } else {
+                    note(
+                        format!(
+                            "{} {} of {branch} will be replayed on top of {onto}, which has {behind} that {branch} lacks. Replayed commits get new SHAs.",
+                            plan.replayed,
+                            plural(plan.replayed, "commit")
+                        ),
+                        theme.foreground,
+                    )
+                    .into_any_element()
+                });
+                match (&plan.upstream, plan.upstream_gone) {
+                    (Some(upstream), true) => lines.push(
+                        note(
+                            format!("Its upstream {upstream} is gone (deleted on the remote)."),
+                            theme.muted_foreground,
+                        )
+                        .into_any_element(),
+                    ),
+                    (Some(upstream), false) => lines.push(
+                        note(
+                            format!("{branch} is pushed to {upstream}: publishing the rebased branch needs a force push."),
+                            theme.warning,
+                        )
+                        .into_any_element(),
+                    ),
+                    (None, _) => {}
+                }
+                lines.push(
+                    note(
+                        format!(
+                            "{}The current tip {} stays in the reflog.",
+                            if plan.replayed > 0 {
+                                "Conflicts abort the rebase and leave the branch unchanged. "
+                            } else {
+                                ""
+                            },
+                            &plan.head[..plan.head.len().min(8)]
+                        ),
+                        theme.muted_foreground,
+                    )
+                    .into_any_element(),
+                );
+            }
+        }
+        if let Some(reason) = &blocker {
+            lines.push(
+                note(format!("Cannot rebase now: {reason}."), theme.danger).into_any_element(),
+            );
+        }
+        let owner = cx.entity();
+        let suggested = dialog.suggested.clone();
+        let others = dialog.others.clone();
+        let current = onto.clone();
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(80.))
+            .bg(gpui_kit::black().opacity(0.35))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_rebase_dialog(window, cx)),
+            )
+            .child(
+                v_flex()
+                    .track_focus(&self.rebase_handle)
+                    .w(px(520.))
+                    .max_w_full()
+                    .p_4()
+                    .gap_3()
+                    .rounded_lg()
+                    .shadow_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            this.close_rebase_dialog(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .child(format!("Rebase {branch}")),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(dialog.path.display().to_string()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_sm().child("Onto"))
+                            .child(
+                                Button::new("rebase-onto")
+                                    .small()
+                                    .outline()
+                                    .label(format!("{onto} ▾"))
+                                    .tooltip("The local branch to replay this branch on top of")
+                                    .dropdown_menu(move |mut menu, _, _| {
+                                        menu = menu.scrollable(true).max_h(px(320.));
+                                        let item = |menu: PopupMenu, name: &String| {
+                                            let owner = owner.clone();
+                                            let name = name.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(name.clone())
+                                                    .checked(name == current)
+                                                    .on_click(move |_, _, cx| {
+                                                        owner.update(cx, |this, cx| {
+                                                            this.choose_rebase_target(
+                                                                name.clone(),
+                                                                cx,
+                                                            )
+                                                        });
+                                                    }),
+                                            )
+                                        };
+                                        if !suggested.is_empty() {
+                                            menu = menu.label("Suggested");
+                                            for name in &suggested {
+                                                menu = item(menu, name);
+                                            }
+                                            if !others.is_empty() {
+                                                menu = menu.separator().label("Local branches");
+                                            }
+                                        }
+                                        for name in &others {
+                                            menu = item(menu, name);
+                                        }
+                                        menu
+                                    }),
+                            ),
+                    )
+                    .child(v_flex().gap_1().children(lines))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("close-rebase-dialog")
+                                    .label("Cancel")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_rebase_dialog(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-rebase")
+                                    .label(format!("Rebase onto {onto}"))
+                                    .small()
+                                    .primary()
+                                    .disabled(!ready || blocker.is_some())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_rebase(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     pub(super) fn render_creation_base(&self, cx: &mut Context<Self>) -> AnyElement {
