@@ -41,6 +41,7 @@ pub struct ReviewPosition {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeView {
+    pub kept: bool,
     pub branch_changes: bool,
     pub base: String,
     pub tab: String,
@@ -66,6 +67,7 @@ pub struct SavedConversation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepositoryView {
+    pub completed_collapsed: bool,
     pub recent_targets: Vec<String>,
     pub selected: Option<PathBuf>,
     pub worktrees: BTreeMap<PathBuf, WorktreeView>,
@@ -81,6 +83,7 @@ pub struct RepositoryView {
 impl Default for RepositoryView {
     fn default() -> Self {
         Self {
+            completed_collapsed: true,
             recent_targets: Vec::new(),
             selected: None,
             worktrees: BTreeMap::new(),

@@ -5,6 +5,7 @@ mod attention;
 mod chat;
 mod dump;
 mod launch;
+mod lifecycle;
 mod model;
 mod notifications;
 mod recent;
@@ -227,6 +228,10 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::action("New Claude Conversation", app::NewClaudeChat),
             MenuItem::separator(),
             MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),
+        ]),
+        Menu::new("Worktree").items([
+            MenuItem::action("Toggle Keep Active", app::ToggleKeepWorktree),
+            MenuItem::action("Preview Cleanup…", app::PreviewCleanup),
         ]),
     ]);
 }
