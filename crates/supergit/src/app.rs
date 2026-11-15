@@ -17,6 +17,7 @@ use sg_github::{PrState, PullRequest};
 
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, SharedSessionIndex, WorktreeInfo};
+use crate::settings::Appearance;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// PRs come from the network: refresh every Nth poll.
@@ -89,6 +90,10 @@ impl SuperGitApp {
                 }
             },
         );
+        // In "System" mode the theme follows macOS light/dark live.
+        let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
+            crate::appearance::system_appearance_changed(window, cx);
+        });
         let changes_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
         let commit_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
 
@@ -116,7 +121,7 @@ impl SuperGitApp {
             details_task: None,
             commit_task: None,
             action_task: None,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, appearance_subscription],
         };
         this.start_polling(cx);
         this
@@ -623,6 +628,28 @@ impl SuperGitApp {
                                         this.close_repository(&CloseRepository, window, cx)
                                     })),
                             )
+                        })
+                        .child({
+                            let current = crate::appearance::current(cx);
+                            Button::new("appearance")
+                                .label(format!(
+                                    "{} {}",
+                                    match current {
+                                        Appearance::System => "◐",
+                                        Appearance::Light => "☀",
+                                        Appearance::Dark => "☾",
+                                    },
+                                    current.label()
+                                ))
+                                .ghost()
+                                .small()
+                                .tooltip(
+                                    "Appearance: System → Light → Dark (also View ▸ Appearance)",
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    crate::appearance::set(current.next(), cx);
+                                    cx.notify();
+                                }))
                         })
                         .child(
                             Button::new("refresh")

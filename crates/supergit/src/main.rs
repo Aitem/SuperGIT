@@ -1,17 +1,19 @@
 mod app;
+mod appearance;
 mod dump;
 mod launch;
 mod model;
 mod recent;
 #[cfg(feature = "screenshot")]
 mod screenshot;
+mod settings;
 mod shell_env;
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
-use gpui_kit::component::{Theme, ThemeMode, TitleBar};
+use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 actions!(supergit, [Quit]);
@@ -86,7 +88,7 @@ fn main() -> Result<()> {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
+        appearance::init(cx);
 
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
@@ -95,19 +97,7 @@ fn main() -> Result<()> {
             KeyBinding::new("cmd-shift-o", app::CloseRepository, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.set_menus([
-            Menu::new("SuperGIT").items([
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action("Quit SuperGIT", Quit),
-            ]),
-            Menu::new("File").items([
-                MenuItem::action("Open Repository…", app::OpenRepository),
-                MenuItem::action("Recent Repositories", app::CloseRepository),
-                MenuItem::separator(),
-                MenuItem::action("Refresh", app::Refresh),
-            ]),
-        ]);
+        set_app_menus(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -140,4 +130,24 @@ fn main() -> Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+/// The menu bar. Rebuilt when a checkmark changes (appearance).
+pub(crate) fn set_app_menus(cx: &mut App) {
+    cx.set_menus([
+        Menu::new("SuperGIT").items([
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("Quit SuperGIT", Quit),
+        ]),
+        Menu::new("File").items([
+            MenuItem::action("Open Repository…", app::OpenRepository),
+            MenuItem::action("Recent Repositories", app::CloseRepository),
+            MenuItem::separator(),
+            MenuItem::action("Refresh", app::Refresh),
+        ]),
+        Menu::new("View").items([MenuItem::submenu(
+            Menu::new("Appearance").items(appearance::menu_items(cx)),
+        )]),
+    ]);
 }

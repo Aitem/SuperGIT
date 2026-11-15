@@ -6,12 +6,7 @@ use std::path::{Path, PathBuf};
 const MAX: usize = 12;
 
 fn store() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join("Library/Application Support/SuperGIT")
-            .join("recent.json"),
-    )
+    Some(crate::settings::support_dir()?.join("recent.json"))
 }
 
 /// Recent repository roots that still exist, most recent first.

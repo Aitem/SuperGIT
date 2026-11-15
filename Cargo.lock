@@ -6432,6 +6432,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "gpui-pre-platform",
+ "serde",
  "serde_json",
  "sg_agents",
  "sg_git",
