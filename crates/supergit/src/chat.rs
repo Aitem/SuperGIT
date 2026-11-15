@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::agent_context::{Attachment, MAX_ATTACHMENTS};
 use crate::attention::{Attention, Kind};
 use futures::StreamExt as _;
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
@@ -32,6 +33,7 @@ const OUTPUT_LINES: usize = 40;
 const DEFAULT_MODE: PermissionMode = PermissionMode::Auto;
 
 pub struct ChatSession {
+    git_busy: bool,
     worktree: PathBuf,
     attachments: Vec<Attachment>,
     context_preview: Option<usize>,
@@ -175,6 +177,7 @@ impl ChatSession {
             .and_then(PermissionMode::from_wire)
             .unwrap_or(DEFAULT_MODE);
         Self {
+            git_busy: false,
             worktree,
             attachments: Vec::new(),
             context_preview: None,
@@ -205,6 +208,14 @@ impl ChatSession {
 
     pub fn status(&self) -> Status {
         self.convo.status
+    }
+
+    pub fn set_git_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
+        if self.git_busy == busy {
+            return;
+        }
+        self.git_busy = busy;
+        cx.notify();
     }
 
     pub fn take_idle_process(
@@ -480,6 +491,9 @@ impl ChatSession {
 
     /// Send a turn (also used by automation in screenshot builds).
     pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.git_busy {
+            return false;
+        }
         self.attention.set(Kind::Running, None);
         let text = text.to_string();
         let before = self.convo.items.len();
@@ -1032,7 +1046,12 @@ impl ChatSession {
                             .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                     } else {
                         Button::new("send")
-                            .label("Send")
+                            .label(if self.git_busy {
+                                "Updating base…"
+                            } else {
+                                "Send"
+                            })
+                            .disabled(self.git_busy)
                             .small()
                             .primary()
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
