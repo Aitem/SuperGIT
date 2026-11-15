@@ -28,6 +28,7 @@ use sg_github::{PrState, PullRequest};
 
 use crate::agent_context::{self, Attachment};
 use crate::attention::Kind;
+use crate::avatars;
 use crate::chat::ChatSession;
 use crate::file_tree::{self, TreeRow};
 use crate::graph;
@@ -221,6 +222,10 @@ pub struct SuperGitApp {
     details_task: Option<Task<()>>,
     commit_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
+    /// Commit authors' GitHub avatars, loaded once per repository.
+    avatars: avatars::Avatars,
+    avatars_root: Option<PathBuf>,
+    avatars_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -361,6 +366,9 @@ impl SuperGitApp {
             details_task: None,
             commit_task: None,
             action_task: None,
+            avatars: avatars::Avatars::new(),
+            avatars_root: None,
+            avatars_task: None,
             _subscriptions: vec![
                 subscription,
                 switcher_subscription,
@@ -1116,6 +1124,7 @@ impl SuperGitApp {
             self.prs_task = None;
             return;
         }
+        self.load_avatars(cx);
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 let Ok(Some((repo, index))) = this.read_with(cx, |this, _| {
@@ -1598,6 +1607,33 @@ impl SuperGitApp {
         self.message = None;
         self.start_polling(cx);
         cx.notify();
+    }
+
+    /// GitHub avatars for the commit list, once per repository.
+    fn load_avatars(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
+            return;
+        };
+        if self.avatars_root.as_ref() == Some(&root) {
+            return;
+        }
+        self.avatars_root = Some(root.clone());
+        self.avatars.clear();
+        self.avatars_task = Some(cx.spawn(async move |this, cx| {
+            let request = root.clone();
+            let avatars = cx
+                .background_executor()
+                .spawn(async move { avatars::load(&request) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.avatars_root.as_ref() == Some(&root) {
+                    this.avatars = avatars;
+                    this.avatars_task = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
@@ -3613,7 +3649,8 @@ impl SuperGitApp {
             .map(|(ix, (c, graph))| {
                 let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
                 let sha = c.sha.clone();
-                commit_row(ix, c, graph, lanes, selected, theme).on_click(
+                let avatar = self.avatars.get(&c.email.to_ascii_lowercase()).cloned();
+                commit_row(ix, c, graph, lanes, avatar, selected, theme).on_click(
                     cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)),
                 )
             });
@@ -4805,11 +4842,54 @@ fn commit_graph(
     .h_full()
 }
 
+/// The commit author's GitHub avatar, or their initials on a color picked
+/// from the email when GitHub does not know them; name and email on hover.
+fn author_avatar(
+    ix: usize,
+    c: &Commit,
+    avatar: Option<PathBuf>,
+    theme: &gpui_kit::component::Theme,
+) -> Stateful<Div> {
+    let tooltip = format!("{} <{}>", c.author, c.email);
+    let palette = [
+        theme.blue,
+        theme.magenta,
+        theme.green,
+        theme.yellow,
+        theme.red,
+    ];
+    let hash = c
+        .email
+        .to_ascii_lowercase()
+        .bytes()
+        .fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
+    div()
+        .id(("commit-author", ix))
+        .flex_none()
+        .size(px(18.))
+        .rounded_full()
+        .overflow_hidden()
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .map(|el| match avatar {
+            Some(path) => el.child(img(path).size_full().rounded_full()),
+            None => el
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(palette[hash % palette.len()])
+                .text_color(white())
+                .text_size(px(8.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(initials(&c.author)),
+        })
+}
+
 fn commit_row(
     ix: usize,
     c: &Commit,
     graph: graph::GraphRow,
     lanes: usize,
+    avatar: Option<PathBuf>,
     selected: bool,
     theme: &gpui_kit::component::Theme,
 ) -> Stateful<Div> {
@@ -4824,6 +4904,7 @@ fn commit_row(
         .when(selected, |el| el.bg(theme.list_active))
         .hover(|el| el.bg(theme.list_hover))
         .child(commit_graph(graph, lanes, c.is_merge(), theme))
+        .child(author_avatar(ix, c, avatar, theme))
         .when(c.by_agent, |el| {
             el.child(
                 div()
@@ -4844,15 +4925,6 @@ fn commit_row(
                 .text_color(theme.secondary_foreground)
                 .child(r.replace("HEAD -> ", "➜ "))
         }))
-        .child(
-            div()
-                .flex_none()
-                .w(px(90.))
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .truncate()
-                .child(c.author.clone()),
-        )
         .child(
             div()
                 .flex_none()
