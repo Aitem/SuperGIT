@@ -131,10 +131,47 @@ impl RepositoryView {
     }
 }
 
+/// The Projects panel: repositories open side by side in the window.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Projects {
+    /// Repository roots, in the order the user added them.
+    pub roots: Vec<PathBuf>,
+    /// Collapsed, the panel is a narrow rail of initials.
+    pub collapsed: bool,
+    pub width: f32,
+}
+
+impl Default for Projects {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            collapsed: false,
+            width: 220.,
+        }
+    }
+}
+
+impl Projects {
+    pub fn sanitize(&mut self) {
+        self.width = finite(self.width, 220.).clamp(160., 360.);
+        let mut seen = std::collections::HashSet::new();
+        self.roots.retain(|root| seen.insert(root.clone()));
+    }
+
+    /// Append `root` unless it is already listed.
+    pub fn add(&mut self, root: &Path) {
+        if !self.roots.iter().any(|known| known == root) {
+            self.roots.push(root.to_path_buf());
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Store {
     pub window: Option<WindowRect>,
+    pub projects: Projects,
     pub repositories: BTreeMap<PathBuf, RepositoryView>,
 }
 
@@ -147,6 +184,7 @@ pub fn load() -> Store {
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<Store>(&bytes).ok())
         .map(|mut store| {
+            store.projects.sanitize();
             for view in store.repositories.values_mut() {
                 view.sanitize();
                 for conversations in view.conversations.values_mut() {
@@ -163,20 +201,27 @@ pub fn load() -> Store {
 }
 
 /// Merge only the current repository, so other windows keep their own state.
-pub fn save_repository(root: &Path, view: &RepositoryView, window: Option<WindowRect>) {
+pub fn save_repository(root: &Path, view: &RepositoryView) {
     let Some(path) = file() else { return };
     let mut store = load();
     store.repositories.insert(root.to_path_buf(), view.clone());
-    if window.is_some() {
-        store.window = window;
-    }
     save_store(&path, &store);
 }
 
-pub fn save_window(window: WindowRect) {
+/// Merge the given repositories (the current one and those with live
+/// conversations in the background), the Projects panel and the window.
+pub fn save(views: &[(&Path, &RepositoryView)], projects: &Projects, window: Option<WindowRect>) {
     let Some(path) = file() else { return };
     let mut store = load();
-    store.window = Some(window);
+    for (root, view) in views {
+        store
+            .repositories
+            .insert(root.to_path_buf(), (*view).clone());
+    }
+    store.projects = projects.clone();
+    if window.is_some() {
+        store.window = window;
+    }
     save_store(&path, &store);
 }
 
@@ -210,6 +255,24 @@ mod tests {
                 .repositories
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn projects_load_with_defaults_and_without_duplicates() {
+        let store: Store = serde_json::from_str("{}").unwrap();
+        assert!(store.projects.roots.is_empty());
+        assert!(!store.projects.collapsed);
+        assert_eq!(store.projects.width, 220.);
+
+        let mut projects: Projects =
+            serde_json::from_str(r#"{"roots":["/a","/b","/a"],"width":9000}"#).unwrap();
+        projects.sanitize();
+        assert_eq!(projects.roots, [PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(projects.width, 360.);
+        projects.add(Path::new("/b"));
+        projects.add(Path::new("/c"));
+        assert_eq!(projects.roots.len(), 3);
+        assert_eq!(projects.roots[2], PathBuf::from("/c"));
     }
 
     #[test]
