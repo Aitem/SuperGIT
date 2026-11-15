@@ -220,23 +220,32 @@ pub fn worktree_patch(worktree: &Path, status: &WorktreeStatus) -> Result<String
 
 fn append_new_file_patch(patch: &mut String, worktree: &Path, rel: &str) {
     let full = worktree.join(rel);
-    let Ok(meta) = std::fs::metadata(&full) else {
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
         return;
     };
-    if !meta.is_file() {
+    let is_symlink = meta.file_type().is_symlink();
+    if !meta.is_file() && !is_symlink {
         return;
     }
     if !patch.is_empty() && !patch.ends_with('\n') {
         patch.push('\n');
     }
+    let mode = if is_symlink { "120000" } else { "100644" };
     patch.push_str(&format!(
-        "diff --git a/{rel} b/{rel}\nnew file mode 100644\n"
+        "diff --git a/{rel} b/{rel}\nnew file mode {mode}\n"
     ));
     if meta.len() > MAX_UNTRACKED_BYTES {
         patch.push_str(&format!("Binary files /dev/null and b/{rel} differ\n"));
         return;
     }
-    let Ok(bytes) = std::fs::read(&full) else {
+    // Git stores the link's target path, including for dangling/directory links.
+    // Never read the target's contents (which may be outside this worktree).
+    let bytes = if is_symlink {
+        std::fs::read_link(&full).map(|p| p.as_os_str().as_encoded_bytes().to_vec())
+    } else {
+        std::fs::read(&full)
+    };
+    let Ok(bytes) = bytes else {
         return;
     };
     if bytes.contains(&0) {

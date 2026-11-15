@@ -22,8 +22,8 @@ use crate::model::{self, Details, SharedSessionIndex, WorktreeInfo};
 use crate::settings::Appearance;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// PRs come from the network: refresh every Nth poll.
-const PR_POLL_EVERY: u64 = 20;
+/// Network requests run independently so they cannot delay local refreshes.
+const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 actions!(
     supergit,
@@ -83,6 +83,7 @@ pub struct SuperGitApp {
     message: Option<(String, bool)>,
 
     poll_task: Option<Task<()>>,
+    prs_task: Option<Task<()>>,
     details_task: Option<Task<()>>,
     commit_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
@@ -138,6 +139,7 @@ impl SuperGitApp {
             chat_open: true,
             message: None,
             poll_task: None,
+            prs_task: None,
             details_task: None,
             commit_task: None,
             action_task: None,
@@ -153,17 +155,16 @@ impl SuperGitApp {
     fn start_polling(&mut self, cx: &mut Context<Self>) {
         if self.repo.is_none() {
             self.poll_task = None;
+            self.prs_task = None;
             return;
         }
         self.poll_task = Some(cx.spawn(async move |this, cx| {
-            let mut tick: u64 = 0;
             loop {
                 let Ok(Some((repo, index))) = this.read_with(cx, |this, _| {
                     this.repo.clone().map(|r| (r, this.index.clone()))
                 }) else {
                     return;
                 };
-                let root = repo.root.clone();
                 let result = cx
                     .background_executor()
                     .spawn(async move { model::load_worktrees(&repo, &index) })
@@ -174,23 +175,30 @@ impl SuperGitApp {
                 {
                     return;
                 }
-                if tick.is_multiple_of(PR_POLL_EVERY) {
-                    let prs = cx
-                        .background_executor()
-                        .spawn(async move {
-                            if sg_github::gh_available() {
-                                sg_github::list_prs(&root, 100, 30).map_err(|e| e.to_string())
-                            } else {
-                                Err("gh CLI not found — install it for pull requests".into())
-                            }
-                        })
-                        .await;
-                    if this.update(cx, |this, cx| this.apply_prs(prs, cx)).is_err() {
-                        return;
-                    }
-                }
-                tick += 1;
                 cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+        }));
+        self.prs_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(Some(root)) =
+                    this.read_with(cx, |this, _| this.repo.as_ref().map(|r| r.root.clone()))
+                else {
+                    return;
+                };
+                let prs = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if sg_github::gh_available() {
+                            sg_github::list_prs(&root, 100, 30).map_err(|e| e.to_string())
+                        } else {
+                            Err("gh CLI not found — install it for pull requests".into())
+                        }
+                    })
+                    .await;
+                if this.update(cx, |this, cx| this.apply_prs(prs, cx)).is_err() {
+                    return;
+                }
+                cx.background_executor().timer(PR_POLL_INTERVAL).await;
             }
         }));
     }
@@ -454,6 +462,7 @@ impl SuperGitApp {
     ) {
         self.repo = None;
         self.poll_task = None;
+        self.prs_task = None;
         self.reset_view(cx);
         self.recent = crate::recent::load();
         cx.notify();
