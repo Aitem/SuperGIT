@@ -20,6 +20,15 @@ pub fn schedule(handle: AnyWindowHandle, cx: &mut App) {
         cx.background_executor()
             .timer(Duration::from_secs_f64(delay))
             .await;
+        // An unfocused window may not have drawn since the data arrived, and
+        // images (avatars) only start loading when first drawn: draw once,
+        // give them a moment, then capture.
+        let _ = cx.update_window(handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.background_executor()
+            .timer(Duration::from_millis(1500))
+            .await;
         let image = cx.update_window(handle, |_, window, cx| {
             // macOS can stop presenting an unfocused window. Capture fresh
             // entity state instead of the last frame presented on screen.
