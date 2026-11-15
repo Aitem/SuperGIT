@@ -84,6 +84,8 @@ pub struct RepositoryView {
     /// File list beside a commit's diff in the History tab.
     pub commit_files_width: f32,
     pub chat_open: bool,
+    /// The worktree list is expanded; collapsed it is a narrow rail.
+    pub sidebar_open: bool,
     /// File lists (Changes, and a commit's files in History) show a folder
     /// tree instead of flat paths.
     pub changes_tree: bool,
@@ -114,6 +116,7 @@ impl Default for RepositoryView {
             history_width: 300.,
             commit_files_width: 240.,
             chat_open: true,
+            sidebar_open: true,
             changes_tree: false,
         }
     }
