@@ -385,7 +385,7 @@ impl SuperGitApp {
                 .unwrap_or(saved.sidebar_width)
                 .clamp(220., sidebar_max)
         } else {
-            SIDEBAR_RAIL_WIDTH
+            RAIL_WIDTH
         };
         let chat_max = (total - sidebar - 360.).clamp(320., 960.);
         let chat = if show_chat {
@@ -396,6 +396,8 @@ impl SuperGitApp {
                 .map(|v| v.as_f32())
                 .unwrap_or(saved.chat_width)
                 .clamp(320., chat_max)
+        } else if self.selected.is_some() {
+            RAIL_WIDTH
         } else {
             0.
         };
@@ -2207,7 +2209,7 @@ impl SuperGitApp {
                 .child(agent_dot(agent, &theme))
         });
         v_flex()
-            .w(px(SIDEBAR_RAIL_WIDTH))
+            .w(px(RAIL_WIDTH))
             .flex_none()
             .h_full()
             .bg(theme.sidebar)
@@ -4009,6 +4011,102 @@ impl SuperGitApp {
         }
     }
 
+    /// Open the Claude panel on the selected worktree's conversation `ix`.
+    fn open_chat_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        self.active_chat.insert(path, ix);
+        self.chat_open = true;
+        if let Some(chat) = self.active_chat_entity() {
+            let input = chat.read(cx).input();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+        self.queue_persist(cx);
+        cx.notify();
+    }
+
+    /// The collapsed Claude panel: a button to expand it, one ✦ per
+    /// conversation of the selected worktree colored by its state (title in
+    /// the tooltip; clicking opens it), and a new-conversation button.
+    fn render_chat_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let path = self.selected.clone().unwrap_or_default();
+        self.ensure_chats(&path, window, cx);
+        let theme = cx.theme().clone();
+        let chats = self.chats.get(&path).cloned().unwrap_or_default();
+        let active = self.active_chat.get(&path).copied().unwrap_or(0);
+        let cells = chats.iter().enumerate().map(|(ix, chat)| {
+            let c = chat.read(cx);
+            let kind = c.attention().kind;
+            let tooltip = if kind == Kind::Idle {
+                c.title()
+            } else {
+                format!("{} · {}", c.title(), kind.label())
+            };
+            div()
+                .id(("rail-chat", ix))
+                .w_full()
+                .py_1p5()
+                .flex()
+                .justify_center()
+                .cursor_pointer()
+                .border_r_2()
+                .border_color(if ix == active {
+                    theme.primary
+                } else {
+                    transparent_black()
+                })
+                .hover(|el| el.bg(theme.list_hover))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| this.open_chat_at(ix, window, cx)))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(attention_color(kind, &theme))
+                        .child("✦"),
+                )
+        });
+        v_flex()
+            .w(px(RAIL_WIDTH))
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .child(
+                h_flex().justify_center().py_1().child(
+                    Button::new("expand-chat")
+                        .icon(IconName::PanelRightOpen)
+                        .xsmall()
+                        .ghost()
+                        .tooltip("Expand the Claude panel (cmd-l)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_claude(&ToggleClaude, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("chat-rail")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(cells)
+                    .child(
+                        h_flex().justify_center().py_1().child(
+                            Button::new("rail-chat-new")
+                                .label("+")
+                                .xsmall()
+                                .ghost()
+                                .tooltip("New conversation (cmd-n)")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
+                                ),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
@@ -4121,10 +4219,10 @@ impl SuperGitApp {
                     )
                     .child(
                         Button::new("chat-hide")
-                            .label("⇥")
+                            .icon(IconName::PanelRightClose)
                             .xsmall()
                             .ghost()
-                            .tooltip("Hide the Claude panel (cmd-l)")
+                            .tooltip("Collapse the Claude panel (cmd-l)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_claude(&ToggleClaude, window, cx)
                             })),
@@ -4293,6 +4391,13 @@ impl Render for SuperGitApp {
                                 .child(chat),
                         )
                         .into_any_element()
+                } else if self.selected.is_some() {
+                    let rail = self.render_chat_rail(window, cx);
+                    h_flex()
+                        .size_full()
+                        .child(div().flex_1().min_w_0().h_full().child(main))
+                        .child(rail)
+                        .into_any_element()
                 } else {
                     main
                 };
@@ -4375,8 +4480,8 @@ fn attention_color(kind: Kind, theme: &gpui_kit::component::Theme) -> Hsla {
     }
 }
 
-/// Width of the collapsed worktree list.
-const SIDEBAR_RAIL_WIDTH: f32 = 48.;
+/// Width of a collapsed side panel (worktree list, Claude panel).
+const RAIL_WIDTH: f32 = 48.;
 
 /// Two letters for a worktree in the collapsed list: the first letters of
 /// the first two words (`claude-auto-mode` → `CA`), else the name's first
