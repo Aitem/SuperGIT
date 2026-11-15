@@ -19,6 +19,9 @@ impl TempRepo {
         this.git(&["init", "-q", "-b", "main"]);
         this.git(&["config", "user.email", "t@example.com"]);
         this.git(&["config", "user.name", "Tester"]);
+        // Temporary test commits must not depend on the user's signing key or hooks.
+        this.git(&["config", "commit.gpgsign", "false"]);
+        this.git(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(this.root().join("a.txt"), "one\n").unwrap();
         this.git(&["add", "."]);
         this.git(&["commit", "-qm", "init"]);
@@ -148,4 +151,36 @@ fn existing_branch_checkout_and_unborn_repo() {
     let patch = sg_git::worktree_patch(&empty, &st).unwrap();
     assert!(patch.contains("+hi"));
     assert_eq!(FileState::Untracked, st.files[0].state());
+}
+
+#[cfg(unix)]
+#[test]
+fn untracked_symlinks_show_targets_without_reading_them() {
+    use std::os::unix::fs::symlink;
+
+    let t = TempRepo::new("symlink");
+    std::fs::write(t.dir.join("outside.txt"), "external file contents\n").unwrap();
+    symlink("../outside.txt", t.root().join("link")).unwrap();
+    symlink("../missing.txt", t.root().join("broken-link")).unwrap();
+    symlink("..", t.root().join("directory-link")).unwrap();
+
+    let st = sg_git::status(&t.root()).unwrap();
+    let patch = sg_git::worktree_patch(&t.root(), &st).unwrap();
+    assert!(!patch.contains("external file contents"), "{patch}");
+    for (name, target) in [
+        ("link", "../outside.txt"),
+        ("broken-link", "../missing.txt"),
+        ("directory-link", ".."),
+    ] {
+        assert!(
+            patch.contains(&format!(
+                "diff --git a/{name} b/{name}\nnew file mode 120000\n"
+            )),
+            "{patch}"
+        );
+        assert!(
+            patch.contains(&format!("+{target}\n\\ No newline at end of file\n")),
+            "{patch}"
+        );
+    }
 }
