@@ -1,6 +1,8 @@
 //! The main window: worktrees on the left, the selected worktree's changes,
 //! history, Claude sessions and pull requests on the right.
 
+mod worktrees;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -47,7 +49,9 @@ actions!(
         SwitcherPrevious,
         OpenSettings,
         AskAgent,
-        AskAgentNewConversation
+        AskAgentNewConversation,
+        ToggleKeepWorktree,
+        PreviewCleanup
     ]
 );
 
@@ -118,6 +122,9 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    cleanup_preview: Option<worktrees::CleanupPreview>,
+    cleanup_handle: FocusHandle,
+    prs_fetched_at: Option<std::time::Instant>,
     focus_handle: FocusHandle,
     settings_open: bool,
     settings_focus: Option<FocusHandle>,
@@ -236,6 +243,9 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            cleanup_preview: None,
+            cleanup_handle: cx.focus_handle(),
+            prs_fetched_at: None,
             focus_handle: cx.focus_handle(),
             settings_open: cfg!(feature = "screenshot")
                 && std::env::var_os("SUPERGIT_DEBUG_SETTINGS").is_some(),
@@ -582,7 +592,7 @@ impl SuperGitApp {
         for info in self
             .worktrees
             .iter()
-            .filter(|info| info.path().is_dir() && !info.wt.is_bare && info.wt.prunable.is_none())
+            .filter(|info| info.status.is_ok() && !info.wt.is_bare && info.wt.prunable.is_none())
         {
             let path = info.wt.path.clone();
             let branch = info.wt.branch.as_deref().unwrap_or("Detached HEAD");
@@ -673,6 +683,9 @@ impl SuperGitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.cleanup_preview.is_some() {
+            self.close_cleanup_preview(window, cx);
+        }
         if self.settings_open {
             self.close_settings(window, cx);
         }
@@ -752,6 +765,9 @@ impl SuperGitApp {
     }
 
     fn open_destination(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_preview.is_some() {
+            self.close_cleanup_preview(window, cx);
+        }
         // A worktree can disappear between the search and Return.
         if !entry.path.is_dir() || !self.worktrees.iter().any(|info| info.path() == entry.path) {
             self.flash(
@@ -888,6 +904,9 @@ impl SuperGitApp {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_preview.is_some() {
+            self.close_cleanup_preview(window, cx);
+        }
         self.settings_focus = window.focused(cx);
         self.settings_open = true;
         self.settings_handle.focus(window, cx);
@@ -1126,13 +1145,47 @@ impl SuperGitApp {
     }
 
     fn apply_prs(&mut self, result: Result<Vec<PullRequest>, String>, cx: &mut Context<Self>) {
+        let was_loaded = self.prs_loaded;
         self.prs_loaded = true;
         match result {
             Ok(prs) => {
+                self.prs_fetched_at = Some(std::time::Instant::now());
                 self.prs = prs;
                 self.prs_error = None;
             }
             Err(e) => self.prs_error = Some(e),
+        }
+        if !was_loaded
+            && self
+                .selected_info()
+                .is_some_and(|info| self.is_completed(info, cx))
+        {
+            self.set_completed_collapsed(false, cx);
+        }
+        #[cfg(feature = "screenshot")]
+        if std::env::var_os("SUPERGIT_DEBUG_CLEANUP").is_some()
+            && std::env::var_os("SUPERGIT_DEBUG_CLEANUP_DONE").is_none()
+        {
+            let paths: Vec<_> = self
+                .worktrees
+                .iter()
+                .filter(|info| self.is_completed(info, cx))
+                .map(|info| info.wt.path.clone())
+                .collect();
+            if !paths.is_empty() {
+                // SAFETY: isolated screenshot builds only, on the main thread.
+                unsafe { std::env::set_var("SUPERGIT_DEBUG_CLEANUP_DONE", "1") };
+                let owner = cx.entity();
+                if let Some(window) = cx.windows().first().copied() {
+                    cx.defer(move |cx| {
+                        let _ = window.update(cx, |_, window, cx| {
+                            owner.update(cx, |this, cx| {
+                                this.open_cleanup_preview(paths, window, cx)
+                            });
+                        });
+                    });
+                }
+            }
         }
         cx.notify();
     }
@@ -1252,6 +1305,14 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self
+            .worktrees
+            .iter()
+            .find(|info| info.path() == path)
+            .is_some_and(|info| self.is_completed(info, cx))
+        {
+            self.set_completed_collapsed(false, cx);
+        }
         self.remember_target(format!("worktree:{}", path.display()), cx);
         if self.selected.as_ref() == Some(&path) {
             return;
@@ -1369,6 +1430,8 @@ impl SuperGitApp {
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.cleanup_preview = None;
+        self.prs_fetched_at = None;
         self.worktrees.clear();
         self.load_error = None;
         self.prs.clear();
@@ -1440,6 +1503,7 @@ impl SuperGitApp {
                 && this.chat_open
                 && !this.settings_open
                 && this.switcher.is_none()
+                && this.cleanup_preview.is_none()
                 && this
                     .active_chat_entity()
                     .is_some_and(|active| active == chat)
@@ -1507,6 +1571,37 @@ impl SuperGitApp {
                 })
             })
             .collect()
+    }
+
+    fn attention_count(&self, kind: Kind, cx: &App) -> usize {
+        self.worktrees
+            .iter()
+            .map(|info| {
+                if let Some(chats) = self.chats.get(info.path()) {
+                    chats
+                        .iter()
+                        .filter(|chat| {
+                            let state = chat.read(cx).attention();
+                            state.kind == kind
+                                && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+                        })
+                        .count()
+                } else {
+                    self.repository_view()
+                        .conversations
+                        .get(info.path())
+                        .into_iter()
+                        .flatten()
+                        .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
+                        .filter(|chat| {
+                            chat.attention.kind == kind
+                                && (matches!(kind, Kind::Running | Kind::Approval)
+                                    || chat.attention.unread)
+                        })
+                        .count()
+                }
+            })
+            .sum()
     }
 
     fn open_attention(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
@@ -1698,6 +1793,7 @@ impl SuperGitApp {
                     .get(info.path())
                     .into_iter()
                     .flatten()
+                    .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
                     .filter_map(|chat| chat.session_id.clone()),
             )
             .collect();
@@ -1718,6 +1814,7 @@ impl SuperGitApp {
                 .get(path)
                 .into_iter()
                 .flatten()
+                .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
                 .map(|chat| &chat.attention)
                 .collect()
         };
@@ -1902,7 +1999,7 @@ impl SuperGitApp {
             [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
                 .into_iter()
                 .filter_map(|kind| {
-                    let count = self.attention_entries(kind, cx).len();
+                    let count = self.attention_count(kind, cx);
                     (count > 0).then(|| {
                         Button::new(match kind {
                             Kind::Approval => "attention-approval",
@@ -2020,12 +2117,22 @@ impl SuperGitApp {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let rows = self
-            .worktrees
-            .iter()
-            .enumerate()
-            .map(|(ix, info)| self.render_worktree_row(ix, info, &theme, cx))
-            .collect::<Vec<_>>();
+        let mut active = Vec::new();
+        let mut completed = Vec::new();
+        let mut completed_paths = Vec::new();
+        for (ix, info) in self.worktrees.iter().enumerate() {
+            if self.is_completed(info, cx) {
+                completed_paths.push(info.wt.path.clone());
+                if !self.repository_view().completed_collapsed {
+                    completed.push(self.render_worktree_row(ix, info, &theme, cx));
+                }
+            } else {
+                active.push(self.render_worktree_row(ix, info, &theme, cx));
+            }
+        }
+        let completed_count = completed_paths.len();
+        let active_count = active.len();
+        let collapsed = self.repository_view().completed_collapsed;
 
         v_flex()
             .w_full()
@@ -2052,7 +2159,52 @@ impl SuperGitApp {
                     .id("worktrees")
                     .flex_1()
                     .overflow_y_scroll()
-                    .children(rows),
+                    .when(completed_count > 0, |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("ACTIVE · {active_count}")),
+                        )
+                    })
+                    .children(active)
+                    .when(completed_count > 0, |list| {
+                        list.child(
+                            h_flex()
+                                .px_2()
+                                .py_1()
+                                .justify_between()
+                                .child(
+                                    Button::new("completed-group")
+                                        .label(format!(
+                                            "{} COMPLETED · {completed_count}",
+                                            if collapsed { "▸" } else { "▾" }
+                                        ))
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.set_completed_collapsed(!collapsed, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("preview-completed-cleanup")
+                                        .label("Preview…")
+                                        .tooltip("Preview cleanup of completed worktrees")
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_cleanup_preview(
+                                                completed_paths.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                ),
+                        )
+                        .children(completed)
+                    }),
             )
             .child(
                 v_flex()
@@ -2079,7 +2231,7 @@ impl SuperGitApp {
         info: &WorktreeInfo,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> AnyElement {
         let selected = self.selected.as_deref() == Some(info.path());
         let path = info.wt.path.clone();
         let branch = info.wt.branch.clone();
@@ -2087,6 +2239,9 @@ impl SuperGitApp {
         let agent = self.agent_state_for(info, cx);
         let native = self.native_attention_for(info.path(), cx);
         let external = self.external_agent_state(info, cx);
+        let owner = cx.entity().downgrade();
+        let context_path = path.clone();
+        let kept = self.kept_active(info.path());
 
         let mut meta: Vec<AnyElement> = Vec::new();
         match &info.status {
@@ -2151,6 +2306,14 @@ impl SuperGitApp {
                                 .child("main"),
                         )
                     })
+                    .when(kept, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("kept"),
+                        )
+                    })
                     .when_some(pr, |el, pr| el.child(pr_badge(pr, theme))),
             )
             .child(
@@ -2196,6 +2359,31 @@ impl SuperGitApp {
                     .truncate()
                     .child(info.wt.dir_name()),
             )
+            .context_menu(move |menu, _, _cx| {
+                let keep_owner = owner.clone();
+                let keep_path = context_path.clone();
+                let cleanup_owner = owner.clone();
+                let cleanup_path = context_path.clone();
+                menu.item(
+                    PopupMenuItem::new(if kept {
+                        "✓ Keep active"
+                    } else {
+                        "Keep active"
+                    })
+                    .on_click(move |_, _, cx| {
+                        let _ = keep_owner
+                            .update(cx, |this, cx| this.toggle_keep_path(keep_path.clone(), cx));
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Preview cleanup…").on_click(move |_, window, cx| {
+                        let _ = cleanup_owner.update(cx, |this, cx| {
+                            this.open_cleanup_preview(vec![cleanup_path.clone()], window, cx)
+                        });
+                    }),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -3309,6 +3497,7 @@ impl SuperGitApp {
         if window.is_window_active()
             && !self.settings_open
             && self.switcher.is_none()
+            && self.cleanup_preview.is_none()
             && let Some(chat) = chats.get(active)
             && chat.read(cx).follows_tail(cx)
         {
@@ -3536,6 +3725,8 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::ask_agent))
             .on_action(cx.listener(Self::ask_agent_new))
+            .on_action(cx.listener(Self::toggle_keep_worktree))
+            .on_action(cx.listener(Self::preview_cleanup))
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
                 let show_chat = self.chat_open && self.selected.is_some();
@@ -3595,6 +3786,9 @@ impl Render for SuperGitApp {
                 el.child(self.render_switcher(cx))
             })
             .when(self.settings_open, |el| el.child(self.render_settings(cx)))
+            .when(self.cleanup_preview.is_some(), |el| {
+                el.child(self.render_cleanup_preview(cx))
+            })
     }
 }
 

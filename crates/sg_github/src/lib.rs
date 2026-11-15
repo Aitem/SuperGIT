@@ -45,6 +45,8 @@ pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub head_branch: String,
+    pub head_oid: String,
+    pub head_repository: Option<String>,
     pub base_branch: String,
     pub state: PrState,
     pub url: String,
@@ -63,6 +65,9 @@ struct RawPr {
     number: u64,
     title: String,
     head_ref_name: String,
+    #[serde(default)]
+    head_ref_oid: String,
+    head_repository: Option<RawRepository>,
     base_ref_name: String,
     state: String,
     is_draft: bool,
@@ -81,6 +86,12 @@ struct RawAuthor {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRepository {
+    name_with_owner: String,
+}
+
+#[derive(Deserialize)]
 struct RawCheck {
     // CheckRun
     status: Option<String>,
@@ -89,7 +100,7 @@ struct RawCheck {
     state: Option<String>,
 }
 
-const FIELDS: &str = "number,title,headRefName,baseRefName,state,isDraft,url,author,reviewDecision,statusCheckRollup,additions,deletions,updatedAt";
+const FIELDS: &str = "number,title,headRefName,headRefOid,headRepository,baseRefName,state,isDraft,url,author,reviewDecision,statusCheckRollup,additions,deletions,updatedAt";
 
 /// Whether `gh` is installed and on PATH.
 pub fn gh_available() -> bool {
@@ -185,6 +196,8 @@ impl From<RawPr> for PullRequest {
             number: raw.number,
             title: raw.title,
             head_branch: raw.head_ref_name,
+            head_oid: raw.head_ref_oid,
+            head_repository: raw.head_repository.map(|repo| repo.name_with_owner),
             base_branch: raw.base_ref_name,
             state,
             url: raw.url,
@@ -205,7 +218,7 @@ mod tests {
     #[test]
     fn parses_gh_json() {
         let json = br#"[
-          {"number":7,"title":"Merged one","headRefName":"a","baseRefName":"main","state":"MERGED","isDraft":false,
+          {"number":7,"title":"Merged one","headRefName":"a","headRefOid":"abc123","headRepository":{"nameWithOwner":"owner/repo"},"baseRefName":"main","state":"MERGED","isDraft":false,
            "url":"u","author":{"login":"x"},"reviewDecision":"APPROVED","statusCheckRollup":[],"additions":1,"deletions":2,"updatedAt":"t"},
           {"number":8,"title":"Open one","headRefName":"b","baseRefName":"main","state":"OPEN","isDraft":true,
            "url":"u","author":{"login":"y"},"reviewDecision":"","statusCheckRollup":[
@@ -226,5 +239,8 @@ mod tests {
             }
         );
         assert_eq!(prs[1].state, PrState::Merged);
+        assert_eq!(prs[1].head_oid, "abc123");
+        assert_eq!(prs[1].head_repository.as_deref(), Some("owner/repo"));
+        assert!(prs[0].head_oid.is_empty());
     }
 }
