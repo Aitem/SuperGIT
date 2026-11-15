@@ -13,6 +13,9 @@ pub struct WorktreeInfo {
     pub status: Result<WorktreeStatus, String>,
     pub sessions: Vec<Session>,
     pub cleanup_identity: Option<sg_git::WorktreeIdentity>,
+    /// Commits on the repository's base branch this worktree's branch lacks;
+    /// `None` for the base itself, detached or unavailable worktrees.
+    pub behind_base: Option<u32>,
 }
 
 impl WorktreeInfo {
@@ -44,7 +47,12 @@ pub fn git_error_message(error: anyhow::Error) -> String {
 
 /// Every worktree with its status and Claude sessions. Status runs in
 /// parallel: with dozens of worktrees this is the hot path of each refresh.
-pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<WorktreeInfo>> {
+/// `base` is the local branch the sidebar creates worktrees from.
+pub fn load_worktrees(
+    repo: &Repo,
+    index: &SharedSessionIndex,
+    base: Option<&str>,
+) -> Result<Vec<WorktreeInfo>> {
     let worktrees = sg_git::list_worktrees(&repo.root)?;
     let statuses: Vec<_> = std::thread::scope(|scope| {
         let handles: Vec<_> = worktrees
@@ -59,7 +67,12 @@ pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<Wor
                         sg_git::status(&wt.path).map_err(git_error_message)
                     };
                     let identity = sg_git::worktree_identity(&repo.common_dir, wt).ok();
-                    (status, identity)
+                    let behind = base
+                        .filter(|base| {
+                            status.is_ok() && wt.branch.as_deref().is_some_and(|b| b != *base)
+                        })
+                        .and_then(|base| sg_git::behind_base(&wt.path, base).ok());
+                    (status, identity, behind)
                 })
             })
             .collect();
@@ -67,7 +80,7 @@ pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<Wor
             .into_iter()
             .map(|h| {
                 h.join()
-                    .unwrap_or_else(|_| (Err("status panicked".into()), None))
+                    .unwrap_or_else(|_| (Err("status panicked".into()), None, None))
             })
             .collect()
     });
@@ -82,11 +95,12 @@ pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<Wor
         .zip(statuses)
         .zip(sessions)
         .map(
-            |((wt, (status, cleanup_identity)), sessions)| WorktreeInfo {
+            |((wt, (status, cleanup_identity, behind_base)), sessions)| WorktreeInfo {
                 wt,
                 status,
                 sessions,
                 cleanup_identity,
+                behind_base,
             },
         )
         .collect())
