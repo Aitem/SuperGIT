@@ -24,6 +24,11 @@ use sg_claude::{
 /// Max lines of tool output shown when a tool row is expanded.
 const OUTPUT_LINES: usize = 40;
 
+/// Chats start in auto mode unless the user picks another. Where auto mode is
+/// unavailable (plan, model, settings) the CLI starts in `default` and says so
+/// in `system/init`, which the switcher follows.
+const DEFAULT_MODE: PermissionMode = PermissionMode::Auto;
+
 pub struct ChatSession {
     /// Where `claude` runs (a resumed session must run where it started).
     cwd: PathBuf,
@@ -31,12 +36,12 @@ pub struct ChatSession {
     transcript: Option<PathBuf>,
     convo: Conversation,
     process: Option<Arc<ClaudeProcess>>,
-    /// Picked by the user or last reported by the CLI. `None` until either
-    /// happens: the CLI then starts in its settings' default mode.
-    mode: Option<PermissionMode>,
+    /// Picked by the user or last reported by the CLI; always passed when
+    /// the process starts.
+    mode: PermissionMode,
     /// A `set_permission_mode` awaiting the CLI's answer, with the mode to
     /// show again if it refuses.
-    mode_request: Option<(String, Option<PermissionMode>)>,
+    mode_request: Option<(String, PermissionMode)>,
     input: Entity<TextareaState>,
     scroller: Entity<MessageScrollerState>,
     diffs: HashMap<String, (Entity<DiffState>, usize)>,
@@ -149,7 +154,8 @@ impl ChatSession {
         let mode = convo
             .permission_mode
             .as_deref()
-            .and_then(PermissionMode::from_wire);
+            .and_then(PermissionMode::from_wire)
+            .unwrap_or(DEFAULT_MODE);
         let _ = worktree;
         Self {
             cwd,
@@ -209,7 +215,7 @@ impl ChatSession {
         let opts = SpawnOptions {
             cwd: self.cwd.clone(),
             resume: self.convo.session_id.clone(),
-            permission_mode: self.mode,
+            permission_mode: Some(self.mode),
             ..Default::default()
         };
         let (process, mut events) = ClaudeProcess::spawn(&opts)?;
@@ -260,7 +266,7 @@ impl ChatSession {
                         .as_deref()
                         .and_then(PermissionMode::from_wire)
                 {
-                    self.mode = Some(mode);
+                    self.mode = mode;
                 }
             }
             ProcessEvent::Stderr(line) => {
@@ -287,14 +293,14 @@ impl ChatSession {
             return;
         }
         let Some(error) = error else { return };
-        let wanted = self.mode.map_or("this mode", |m| m.label());
+        let wanted = self.mode.label();
         // Show the mode the CLI is actually in.
         self.mode = self
             .convo
             .permission_mode
             .as_deref()
             .and_then(PermissionMode::from_wire)
-            .or(previous);
+            .unwrap_or(previous);
         self.convo.items.push(Item::Notice {
             text: format!("Can't switch to {wanted}: {error}"),
             is_error: true,
@@ -350,7 +356,7 @@ impl ChatSession {
     /// Applies at once to a running session (reverted with a notice if the
     /// CLI refuses), otherwise when the next turn starts the process.
     fn set_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
-        let previous = self.mode.replace(mode);
+        let previous = std::mem::replace(&mut self.mode, mode);
         if let Some(p) = &self.process
             && let Ok(request_id) = p.set_permission_mode(mode)
         {
@@ -377,7 +383,7 @@ impl ChatSession {
                     .iter()
                     .any(|s| s.get("mode").and_then(|m| m.as_str()) == Some("acceptEdits"))
                 {
-                    self.mode = Some(PermissionMode::AcceptEdits);
+                    self.mode = PermissionMode::AcceptEdits;
                 }
                 process.allow(
                     &request_id,
@@ -714,7 +720,7 @@ impl ChatSession {
             .into_iter()
             .enumerate()
             .map(|(i, mode)| {
-                let active = mode == self.mode.unwrap_or_default();
+                let active = mode == self.mode;
                 Button::new(("mode", i))
                     .label(mode.label())
                     .xsmall()
