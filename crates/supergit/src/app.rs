@@ -153,6 +153,8 @@ pub struct SuperGitApp {
     cleanup_attempted: std::collections::HashSet<String>,
     cleanup_preview: Option<worktrees::CleanupPreview>,
     cleanup_handle: FocusHandle,
+    rebase_dialog: Option<base::RebaseDialog>,
+    rebase_handle: FocusHandle,
     prs_fetched_at: Option<std::time::Instant>,
     focus_handle: FocusHandle,
     settings_open: bool,
@@ -302,6 +304,8 @@ impl SuperGitApp {
             cleanup_attempted: Default::default(),
             cleanup_preview: None,
             cleanup_handle: cx.focus_handle(),
+            rebase_dialog: None,
+            rebase_handle: cx.focus_handle(),
             prs_fetched_at: None,
             focus_handle: cx.focus_handle(),
             settings_open: cfg!(feature = "screenshot")
@@ -812,6 +816,7 @@ impl SuperGitApp {
         if self.cleanup_preview.is_some() {
             self.close_cleanup_preview(window, cx);
         }
+        self.close_rebase_dialog(window, cx);
         if self.settings_open {
             self.close_settings(window, cx);
         }
@@ -900,6 +905,7 @@ impl SuperGitApp {
         if self.cleanup_preview.is_some() {
             self.close_cleanup_preview(window, cx);
         }
+        self.close_rebase_dialog(window, cx);
         // A worktree can disappear between the search and Return.
         if !entry.path.is_dir() || !self.worktrees.iter().any(|info| info.path() == entry.path) {
             self.flash(
@@ -1040,6 +1046,7 @@ impl SuperGitApp {
         if self.cleanup_preview.is_some() {
             self.close_cleanup_preview(window, cx);
         }
+        self.close_rebase_dialog(window, cx);
         self.settings_focus = window.focused(cx);
         self.settings_open = true;
         self.settings_handle.focus(window, cx);
@@ -1111,15 +1118,14 @@ impl SuperGitApp {
         }
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                let Ok(Some((repo, index, base))) = this.read_with(cx, |this, _| {
-                    let base = this.rebase_base();
-                    this.repo.clone().map(|r| (r, this.index.clone(), base))
+                let Ok(Some((repo, index))) = this.read_with(cx, |this, _| {
+                    this.repo.clone().map(|r| (r, this.index.clone()))
                 }) else {
                     return;
                 };
                 let result = cx
                     .background_executor()
-                    .spawn(async move { model::load_worktrees(&repo, &index, base.as_deref()) })
+                    .spawn(async move { model::load_worktrees(&repo, &index) })
                     .await;
                 if this
                     .update(cx, |this, cx| this.apply_worktrees(result, cx))
@@ -1234,6 +1240,8 @@ impl SuperGitApp {
         }
         #[cfg(feature = "screenshot")]
         self.debug_chat_once(cx);
+        #[cfg(feature = "screenshot")]
+        self.debug_rebase_once(cx);
         cx.notify();
     }
 
@@ -1600,6 +1608,7 @@ impl SuperGitApp {
         self.cleanup_results.clear();
         self.cleanup_results_open = false;
         self.cleanup_preview = None;
+        self.rebase_dialog = None;
         self.prs_fetched_at = None;
         self.worktrees.clear();
         self.load_error = None;
@@ -1673,6 +1682,7 @@ impl SuperGitApp {
                 && !this.cleanup_results_open
                 && this.switcher.is_none()
                 && this.cleanup_preview.is_none()
+                && this.rebase_dialog.is_none()
                 && this
                     .active_chat_entity()
                     .is_some_and(|active| active == chat)
@@ -4139,6 +4149,7 @@ impl SuperGitApp {
             && !self.cleanup_results_open
             && self.switcher.is_none()
             && self.cleanup_preview.is_none()
+            && self.rebase_dialog.is_none()
             && let Some(chat) = chats.get(active)
             && chat.read(cx).follows_tail(cx)
         {
@@ -4463,6 +4474,9 @@ impl Render for SuperGitApp {
             .when(self.settings_open, |el| el.child(self.render_settings(cx)))
             .when(self.cleanup_preview.is_some(), |el| {
                 el.child(self.render_cleanup_preview(cx))
+            })
+            .when(self.rebase_dialog.is_some(), |el| {
+                el.child(self.render_rebase_dialog(cx))
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
