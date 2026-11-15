@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::agent_context::{Attachment, MAX_ATTACHMENTS};
 use crate::attention::{Attention, Kind};
 use futures::StreamExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -31,6 +32,9 @@ const OUTPUT_LINES: usize = 40;
 const DEFAULT_MODE: PermissionMode = PermissionMode::Auto;
 
 pub struct ChatSession {
+    worktree: PathBuf,
+    attachments: Vec<Attachment>,
+    context_preview: Option<usize>,
     attention: Attention,
     permission_focus: FocusHandle,
     /// Where `claude` runs (a resumed session must run where it started).
@@ -110,6 +114,14 @@ impl ChatSession {
         }
         chat.transcript = saved.transcript.clone().filter(|p| p.is_file());
         chat.attention = saved.attention.clone().restored();
+        chat.attachments = saved
+            .attachments
+            .iter()
+            .filter(|item| item.worktree == chat.worktree)
+            .take(MAX_ATTACHMENTS)
+            .cloned()
+            .map(Attachment::bounded)
+            .collect();
         chat.input.update(cx, |input, cx| {
             input.set_value(saved.draft.clone(), window, cx)
         });
@@ -118,6 +130,7 @@ impl ChatSession {
 
     pub fn snapshot(&self, cx: &App) -> crate::workspace::SavedConversation {
         crate::workspace::SavedConversation {
+            attachments: self.attachments.clone(),
             attention: self.attention.clone(),
             local_id: self.local_id.clone(),
             provider: "claude".into(),
@@ -161,8 +174,10 @@ impl ChatSession {
             .as_deref()
             .and_then(PermissionMode::from_wire)
             .unwrap_or(DEFAULT_MODE);
-        let _ = worktree;
         Self {
+            worktree,
+            attachments: Vec::new(),
+            context_preview: None,
             attention: Attention::default(),
             permission_focus: cx.focus_handle(),
             cwd,
@@ -250,7 +265,25 @@ impl ChatSession {
     }
 
     pub fn has_draft(&self, cx: &App) -> bool {
-        !self.input.read(cx).value().is_empty()
+        !self.input.read(cx).value().is_empty() || !self.attachments.is_empty()
+    }
+
+    pub fn attach(
+        &mut self,
+        attachment: Attachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        attachment.validate_destination(&self.worktree, &self.cwd)?;
+        anyhow::ensure!(
+            self.attachments.len() < MAX_ATTACHMENTS,
+            "Remove an attachment before adding more (maximum {MAX_ATTACHMENTS})"
+        );
+        self.attachments.push(attachment.bounded());
+        self.context_preview = Some(self.attachments.len() - 1);
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+        Ok(())
     }
 
     // ---- process ---------------------------------------------------------
@@ -397,18 +430,45 @@ impl ChatSession {
         if text.is_empty() {
             return;
         }
-        self.input
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.send_text(&text, cx);
+        if let Some(error) = self
+            .attachments
+            .iter()
+            .find_map(|item| item.validate_destination(&self.worktree, &self.cwd).err())
+        {
+            self.convo.items.push(Item::Notice {
+                text: error.to_string(),
+                is_error: true,
+            });
+            self.items_changed(self.convo.items.len().saturating_sub(1), cx);
+            return;
+        }
+        let contexts = self
+            .attachments
+            .iter()
+            .map(Attachment::prompt)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut prompt = text;
+        if !contexts.is_empty() {
+            prompt.push_str(crate::agent_context::CONTEXT_MARKER);
+            prompt.push_str(&contexts);
+        }
+        if self.send_text(&prompt, cx) {
+            self.input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.attachments.clear();
+            self.context_preview = None;
+        }
     }
 
     /// Send a turn (also used by automation in screenshot builds).
-    pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
+    pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         self.attention.set(Kind::Running, None);
         let text = text.to_string();
         let before = self.convo.items.len();
         self.convo.push_user(&text);
-        if let Err(e) = self.ensure_process(cx).and_then(|p| p.send_user(&text)) {
+        let result = self.ensure_process(cx).and_then(|p| p.send_user(&text));
+        if let Err(e) = &result {
             self.convo.items.push(Item::Notice {
                 text: format!("{e:#}"),
                 is_error: true,
@@ -417,6 +477,7 @@ impl ChatSession {
             self.attention.set(Kind::Failed, None);
         }
         self.items_changed(before, cx);
+        result.is_ok()
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -519,19 +580,45 @@ impl ChatSession {
         };
         let theme = cx.theme().clone();
         let body = match item {
-            Item::User { text } => h_flex()
-                .justify_end()
-                .child(
-                    div()
-                        .max_w(relative(0.88))
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(theme.secondary)
-                        .text_color(theme.secondary_foreground)
-                        .child(text),
-                )
-                .into_any_element(),
+            Item::User { text } => {
+                let attached = text.split_once(crate::agent_context::CONTEXT_MARKER);
+                let expanded = self.expanded.contains(&ix);
+                let display = if expanded {
+                    text.clone()
+                } else {
+                    attached
+                        .map(|(question, _)| question.to_string())
+                        .unwrap_or_else(|| text.clone())
+                };
+                h_flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .max_w(relative(0.88))
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(theme.secondary)
+                            .text_color(theme.secondary_foreground)
+                            .child(display)
+                            .when(attached.is_some(), |bubble| {
+                                bubble.child(
+                                    Button::new(("message-context", ix))
+                                        .label(if expanded {
+                                            "Hide diff context"
+                                        } else {
+                                            "Show diff context"
+                                        })
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_expanded(ix, cx)
+                                        })),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
             Item::Text { text, streaming } => div()
                 .text_sm()
                 .child(TextView::markdown(("md", ix), text))
@@ -824,6 +911,97 @@ impl ChatSession {
             .gap_2()
             .border_t_1()
             .border_color(theme.border)
+            .when(!self.attachments.is_empty(), |composer| {
+                composer.child(
+                    v_flex()
+                        .id("agent-contexts")
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .gap_1()
+                        .children(self.attachments.iter().enumerate().map(|(ix, item)| {
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Button::new(("inspect-context", ix))
+                                                .label(format!(
+                                                    "{} · {}{}{}",
+                                                    item.path,
+                                                    item.selection,
+                                                    if item.truncated {
+                                                        " · truncated"
+                                                    } else {
+                                                        ""
+                                                    },
+                                                    if item.unavailable {
+                                                        " · metadata only"
+                                                    } else {
+                                                        ""
+                                                    }
+                                                ))
+                                                .tooltip(format!(
+                                                    "Snapshot · {} · {}",
+                                                    item.worktree.display(),
+                                                    item.comparison
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.context_preview =
+                                                        if this.context_preview == Some(ix) {
+                                                            None
+                                                        } else {
+                                                            Some(ix)
+                                                        };
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(("remove-context", ix))
+                                                .label("×")
+                                                .xsmall()
+                                                .ghost()
+                                                .tooltip("Remove attachment")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.attachments.remove(ix);
+                                                    this.context_preview = None;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .when(self.context_preview == Some(ix), |row| {
+                                    row.child(
+                                        v_flex()
+                                            .gap_1()
+                                            .p_2()
+                                            .bg(theme.muted)
+                                            .rounded_md()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!(
+                                                        "Snapshot · {} · {}",
+                                                        item.worktree.display(),
+                                                        item.comparison
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("context-preview", ix))
+                                                    .max_h(px(140.))
+                                                    .overflow_y_scroll()
+                                                    .text_xs()
+                                                    .font_family(theme.mono_font_family.clone())
+                                                    .child(item.body.clone()),
+                                            ),
+                                    )
+                                })
+                        })),
+                )
+            })
             .child(Textarea::new(&self.input))
             .child(
                 h_flex()

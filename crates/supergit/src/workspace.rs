@@ -52,6 +52,7 @@ pub struct WorktreeView {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedConversation {
+    pub attachments: Vec<crate::agent_context::Attachment>,
     pub attention: crate::attention::Attention,
     pub local_id: String,
     pub provider: String,

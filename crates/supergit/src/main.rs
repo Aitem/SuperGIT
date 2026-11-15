@@ -1,3 +1,4 @@
+mod agent_context;
 mod app;
 mod appearance;
 mod attention;
@@ -105,6 +106,7 @@ fn main() -> Result<()> {
             KeyBinding::new("cmd-n", app::NewClaudeChat, None),
             KeyBinding::new("cmd-p", app::OpenSwitcher, None),
             KeyBinding::new("cmd-,", app::OpenSettings, None),
+            KeyBinding::new("cmd-shift-a", app::AskAgent, None),
             KeyBinding::new("up", app::SwitcherPrevious, Some("Switcher")),
             KeyBinding::new("down", app::SwitcherNext, Some("Switcher")),
             KeyBinding::new("escape", app::CloseSwitcher, Some("Switcher")),
@@ -213,6 +215,12 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::action("Refresh", app::Refresh),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Ask Agent About Diff Selection", app::AskAgent),
+            MenuItem::action(
+                "Ask Agent in New Conversation",
+                app::AskAgentNewConversation,
+            ),
+            MenuItem::separator(),
             MenuItem::action("Switch Worktree or Conversation…", app::OpenSwitcher),
             MenuItem::separator(),
             MenuItem::action("Toggle Claude Panel", app::ToggleClaude),
