@@ -13,7 +13,7 @@ mod status;
 mod worktree;
 
 pub use comparison::{BranchChanges, branch_changes, resolve_branch, suggested_base};
-pub use log::{Commit, commit_patch, log};
+pub use log::{Commit, CommitDetails, Fork, base_branch, commit_details, commit_patch, fork, log};
 pub use runner::{GitError, git, git_bytes};
 pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};
 pub use worktree::{Worktree, add_worktree, list_worktrees, remove_worktree};
