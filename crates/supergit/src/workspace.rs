@@ -74,6 +74,8 @@ pub struct RepositoryView {
     pub changes_width: f32,
     pub history_width: f32,
     pub chat_open: bool,
+    /// The Changes tab lists files as a folder tree instead of flat paths.
+    pub changes_tree: bool,
 }
 
 impl Default for RepositoryView {
@@ -89,6 +91,7 @@ impl Default for RepositoryView {
             changes_width: 300.,
             history_width: 300.,
             chat_open: true,
+            changes_tree: false,
         }
     }
 }

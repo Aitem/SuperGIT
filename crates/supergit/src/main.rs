@@ -2,6 +2,8 @@ mod app;
 mod appearance;
 mod chat;
 mod dump;
+mod file_tree;
+mod icons;
 mod launch;
 mod model;
 mod recent;
@@ -80,7 +82,7 @@ fn main() -> Result<()> {
         recent::remember(&repo.root);
     }
 
-    let app = gpui_kit::application();
+    let app = gpui_kit::application().with_assets(icons::AppAssets);
     // Folders dropped on the Dock icon or `open -a SuperGIT <dir>`.
     let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<PathBuf>();
     app.on_open_urls(move |urls| {

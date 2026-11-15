@@ -1,24 +1,26 @@
 //! The main window: worktrees on the left, the selected worktree's changes,
 //! history, Claude sessions and pull requests on the right.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use gpui_kit::assets::IconName;
 use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_agents::{AgentState, Session};
-use sg_git::{Commit, FileState, Repo, relative_time};
+use sg_git::{Commit, FileChange, FileState, Repo, relative_time};
 use sg_github::{PrState, PullRequest};
 
 use crate::chat::ChatSession;
+use crate::file_tree::{self, TreeRow};
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::settings::Appearance;
@@ -44,10 +46,12 @@ actions!(
     ]
 );
 
+type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainTab {
-    Changes,
     History,
+    Changes,
     Sessions,
     PullRequests,
 }
@@ -64,10 +68,10 @@ impl MainTab {
 
     fn from_name(name: &str) -> Self {
         match name {
-            "history" => Self::History,
+            "changes" => Self::Changes,
             "claude" | "sessions" => Self::Sessions,
             "prs" | "pr" => Self::PullRequests,
-            _ => Self::Changes,
+            _ => Self::History,
         }
     }
 }
@@ -97,8 +101,8 @@ struct Switcher {
 }
 
 const TABS: [MainTab; 4] = [
-    MainTab::Changes,
     MainTab::History,
+    MainTab::Changes,
     MainTab::Sessions,
     MainTab::PullRequests,
 ];
@@ -136,6 +140,10 @@ pub struct SuperGitApp {
     commit_generation: u64,
 
     branch_input: Entity<InputState>,
+    /// Filters the Changes tab's file list by path.
+    changes_filter: Entity<InputState>,
+    /// Folders collapsed in the Changes tab's tree view.
+    changes_collapsed: HashSet<String>,
     confirm_remove: Option<PathBuf>,
 
     /// Native Claude conversations per worktree (tabs in the right panel).
@@ -187,6 +195,12 @@ impl SuperGitApp {
                 }
             },
         );
+        let changes_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
+        let filter_subscription = cx.subscribe(&changes_filter, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         // In "System" mode the theme follows macOS light/dark live.
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
             crate::appearance::system_appearance_changed(window, cx);
@@ -244,6 +258,8 @@ impl SuperGitApp {
             details_generation: 0,
             commit_generation: 0,
             branch_input,
+            changes_filter,
+            changes_collapsed: HashSet::new(),
             confirm_remove: None,
             chats: HashMap::new(),
             active_chat: HashMap::new(),
@@ -261,6 +277,7 @@ impl SuperGitApp {
             _subscriptions: vec![
                 subscription,
                 switcher_subscription,
+                filter_subscription,
                 appearance_subscription,
                 quit_subscription,
                 release_subscription,
@@ -518,6 +535,42 @@ impl SuperGitApp {
                 )
             });
         }
+    }
+
+    /// Flat paths or a folder tree in the Changes tab (remembered per repository).
+    fn set_changes_tree(&mut self, tree: bool, cx: &mut Context<Self>) {
+        let Some(repo) = &self.repo else { return };
+        self.persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default()
+            .changes_tree = tree;
+        self.queue_persist(cx);
+        cx.notify();
+    }
+
+    /// Click handler for a changed file: scroll the diff to it.
+    fn open_change(path: String, cx: &mut Context<Self>) -> ClickHandler {
+        Box::new(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.remember_position(
+                ReviewPosition {
+                    path: path.clone(),
+                    line: 1,
+                    original: false,
+                },
+                false,
+                cx,
+            );
+            this.changes_diff
+                .update(cx, |state, cx| state.scroll_to_file(&path, cx));
+        }))
+    }
+
+    fn toggle_changes_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.changes_collapsed.remove(&path) {
+            self.changes_collapsed.insert(path);
+        }
+        cx.notify();
     }
 
     fn remember_layout(
@@ -1940,8 +1993,8 @@ impl SuperGitApp {
                         this.queue_persist(cx);
                         cx.notify();
                     }))
-                    .child(Tab::new().label(format!("Changes · {changes}")))
                     .child(Tab::new().label("History"))
+                    .child(Tab::new().label(format!("Changes · {changes}")))
                     .child(Tab::new().label(format!("Claude · {sessions}")))
                     .child(Tab::new().label(format!("Pull requests · {open_prs}"))),
             )
@@ -2334,43 +2387,98 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
-        let rows = files.into_iter().enumerate().map(|(ix, f)| {
-            let state = f.state();
-            let path = f.path.clone();
-            h_flex()
-                .id(("change", ix))
-                .px_3()
-                .py_1()
-                .gap_2()
-                .text_sm()
-                .cursor_pointer()
-                .hover(|el| el.bg(theme.list_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.remember_position(
-                        ReviewPosition {
-                            path: path.clone(),
-                            line: 1,
-                            original: false,
-                        },
-                        false,
-                        cx,
-                    );
-                    this.changes_diff
-                        .update(cx, |state, cx| state.scroll_to_file(&path, cx));
-                }))
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_none()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(file_state_color(state, theme))
-                        .child(state.letter()),
+        // Screenshot builds: `SUPERGIT_CHANGES_TREE=1` shows the tree.
+        let tree = self.repository_view().changes_tree
+            || (cfg!(feature = "screenshot")
+                && std::env::var_os("SUPERGIT_CHANGES_TREE").is_some());
+        let query = self.changes_filter.read(cx).value().to_string();
+        let visible: Vec<usize> = (0..files.len())
+            .filter(|&ix| file_tree::matches(&files[ix].path, &query))
+            .collect();
+        let rows: Vec<AnyElement> =
+            if tree {
+                // While filtering, every folder holding a match is open.
+                let no_collapsed = HashSet::new();
+                let collapsed = if query.trim().is_empty() {
+                    &self.changes_collapsed
+                } else {
+                    &no_collapsed
+                };
+                file_tree::rows(
+                    visible.iter().map(|&ix| (ix, files[ix].path.as_str())),
+                    collapsed,
                 )
-                .child(div().min_w_0().truncate().child(f.path.clone()))
-                .when(f.staged.is_some(), |el| {
-                    el.child(div().text_xs().text_color(theme.success).child("staged"))
+                .into_iter()
+                .enumerate()
+                .map(|(row, entry)| match entry {
+                    TreeRow::Dir {
+                        path,
+                        name,
+                        depth,
+                        collapsed,
+                        files,
+                    } => tree_dir_row(row, name, depth, collapsed, files, theme)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_changes_dir(path.clone(), cx)
+                        }))
+                        .into_any_element(),
+                    TreeRow::File { ix, name, depth } => {
+                        change_row(ix, &files[ix], name, tree_indent(depth), theme)
+                            .on_click(Self::open_change(files[ix].path.clone(), cx))
+                            .into_any_element()
+                    }
                 })
-        });
+                .collect()
+            } else {
+                visible
+                    .iter()
+                    .map(|&ix| {
+                        let file = &files[ix];
+                        change_row(ix, file, file.path.clone(), px(12.), theme)
+                            .on_click(Self::open_change(file.path.clone(), cx))
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+        let header = h_flex()
+            .flex_none()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.changes_filter)
+                        .small()
+                        .cleanable(true)
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .small()
+                                .text_color(theme.muted_foreground),
+                        ),
+                ),
+            )
+            .children(
+                [
+                    (false, IconName::List, "Flat list"),
+                    (true, IconName::ListTree, "Folder tree"),
+                ]
+                .map(|(as_tree, icon, tooltip)| {
+                    Button::new(if as_tree {
+                        "changes-tree"
+                    } else {
+                        "changes-flat"
+                    })
+                    .icon(icon)
+                    .small()
+                    .ghost()
+                    .selected(tree == as_tree)
+                    .toggled(tree == as_tree)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_changes_tree(as_tree, cx)))
+                }),
+            );
         let content = h_resizable("changes-layout")
             .with_state(&self.changes_layout)
             .on_resize(cx.listener(|this, state, _, cx| {
@@ -2385,14 +2493,28 @@ impl SuperGitApp {
                     .size_range(px(140.)..px((width - 180.).clamp(140., 600.)))
                     .child(
                         v_flex()
-                            .id("change-list")
-                            .w_full()
+                            .size_full()
                             .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
                             .border_r_1()
                             .border_color(theme.border)
-                            .children(rows),
+                            .child(header)
+                            .child(
+                                v_flex()
+                                    .id("change-list")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .when(rows.is_empty(), |el| {
+                                        el.child(
+                                            div()
+                                                .p_3()
+                                                .text_sm()
+                                                .text_color(theme.muted_foreground)
+                                                .child("No files match"),
+                                        )
+                                    })
+                                    .children(rows),
+                            ),
                     ),
             )
             .child(
@@ -2998,14 +3120,9 @@ impl Render for SuperGitApp {
     }
 }
 
-/// `SUPERGIT_TAB=changes|history|claude|prs` picks the tab shown at startup.
+/// `SUPERGIT_TAB=history|changes|claude|prs` picks the tab shown at startup.
 fn initial_tab() -> MainTab {
-    match std::env::var("SUPERGIT_TAB").unwrap_or_default().as_str() {
-        "history" => MainTab::History,
-        "claude" | "sessions" => MainTab::Sessions,
-        "prs" | "pr" => MainTab::PullRequests,
-        _ => MainTab::Changes,
-    }
+    MainTab::from_name(&std::env::var("SUPERGIT_TAB").unwrap_or_default())
 }
 
 // ---- row builders (pure presentation) -------------------------------------
@@ -3073,6 +3190,90 @@ fn time_ago(t: SystemTime) -> String {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| relative_time(d.as_secs() as i64))
         .unwrap_or_default()
+}
+
+/// Indentation of a Changes tree row at `depth`.
+fn tree_indent(depth: usize) -> Pixels {
+    px(12. + depth as f32 * 14.)
+}
+
+/// A changed file in the Changes tab's list, labelled `label` (the path, or
+/// the file name inside the tree).
+fn change_row(
+    ix: usize,
+    file: &FileChange,
+    label: String,
+    indent: Pixels,
+    theme: &gpui_kit::component::Theme,
+) -> Stateful<Div> {
+    let state = file.state();
+    h_flex()
+        .id(("change", ix))
+        .pl(indent)
+        .pr_3()
+        .py_1()
+        .gap_2()
+        .text_sm()
+        .cursor_pointer()
+        .hover(|el| el.bg(theme.list_hover))
+        .child(
+            div()
+                .w(px(14.))
+                .flex_none()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(file_state_color(state, theme))
+                .child(state.letter()),
+        )
+        .child(div().min_w_0().truncate().child(label))
+        .when(file.staged.is_some(), |el| {
+            el.child(div().text_xs().text_color(theme.success).child("staged"))
+        })
+}
+
+/// A folder in the Changes tab's tree; collapsed ones show how many changed
+/// files they hold.
+fn tree_dir_row(
+    row: usize,
+    name: String,
+    depth: usize,
+    collapsed: bool,
+    files: usize,
+    theme: &gpui_kit::component::Theme,
+) -> Stateful<Div> {
+    let muted = theme.muted_foreground;
+    h_flex()
+        .id(("change-dir", row))
+        .pl(tree_indent(depth))
+        .pr_3()
+        .py_1()
+        .gap_2()
+        .text_sm()
+        .cursor_pointer()
+        .hover(|el| el.bg(theme.list_hover))
+        .child(
+            div().w(px(14.)).flex_none().child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .small()
+                .text_color(muted),
+            ),
+        )
+        .child(
+            Icon::new(if collapsed {
+                IconName::Folder
+            } else {
+                IconName::FolderOpen
+            })
+            .small()
+            .text_color(muted),
+        )
+        .child(div().min_w_0().truncate().child(name))
+        .when(collapsed, |el| {
+            el.child(div().text_xs().text_color(muted).child(files.to_string()))
+        })
 }
 
 fn commit_row(
