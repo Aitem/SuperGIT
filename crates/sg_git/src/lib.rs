@@ -1,0 +1,77 @@
+//! Git core for SuperGIT.
+//!
+//! Reads go through the `git` CLI with porcelain formats: it honours the
+//! user's config and hooks, understands every repository layout git does, and
+//! `GIT_OPTIONAL_LOCKS=0` keeps our frequent status polling from fighting the
+//! agents that run git in the same worktrees. Hot paths can move to `gix`
+//! later without changing this API.
+
+mod log;
+mod runner;
+mod status;
+mod worktree;
+
+pub use log::{Commit, commit_patch, log};
+pub use runner::{GitError, git, git_bytes};
+pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};
+pub use worktree::{Worktree, add_worktree, list_worktrees, remove_worktree};
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, Result};
+
+/// A repository as SuperGIT sees it: the main worktree plus the shared git dir.
+#[derive(Clone, Debug)]
+pub struct Repo {
+    /// Top level of the main worktree (where `.git` lives).
+    pub root: PathBuf,
+    /// The shared `.git` directory common to all worktrees.
+    pub common_dir: PathBuf,
+}
+
+impl Repo {
+    /// Find the repository containing `path`. Works from any linked worktree:
+    /// the result always points at the main worktree.
+    pub fn discover(path: &Path) -> Result<Self> {
+        let out = git(
+            path,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .with_context(|| format!("{} is not inside a git repository", path.display()))?;
+        let common_dir = PathBuf::from(out.trim());
+        let root = if common_dir.file_name().is_some_and(|n| n == ".git") {
+            common_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| common_dir.clone())
+        } else {
+            // Bare repository: no main worktree, use the git dir itself.
+            common_dir.clone()
+        };
+        Ok(Self { root, common_dir })
+    }
+
+    pub fn name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string())
+    }
+}
+
+/// Human-friendly relative time ("5m", "3h", "2d") for a unix timestamp.
+pub fn relative_time(unix_secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(unix_secs);
+    let delta = (now - unix_secs).max(0);
+    match delta {
+        0..60 => "now".into(),
+        60..3_600 => format!("{}m", delta / 60),
+        3_600..86_400 => format!("{}h", delta / 3_600),
+        86_400..2_592_000 => format!("{}d", delta / 86_400),
+        2_592_000..31_536_000 => format!("{}mo", delta / 2_592_000),
+        _ => format!("{}y", delta / 31_536_000),
+    }
+}

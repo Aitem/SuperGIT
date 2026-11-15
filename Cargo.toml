@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/supergit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+sg_git = { path = "crates/sg_git" }
+sg_github = { path = "crates/sg_github" }
+sg_agents = { path = "crates/sg_agents" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gpui-kit = "0.9.1"
+
+[profile.dev]
+# Keep our crates debuggable but make dependencies (gpui, tree-sitter…) fast.
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 16

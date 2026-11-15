@@ -1,0 +1,26 @@
+[package]
+name = "supergit"
+description = "SuperGIT — Git GUI for agent-driven development (worktrees, Claude sessions, commits, PRs)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "supergit"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui-kit.workspace = true
+sg_git.workspace = true
+sg_github.workspace = true
+sg_agents.workspace = true
+# Only for the `screenshot` feature: turns on GPUI's `render_to_image`.
+gpui_platform_test_support = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"], optional = true }
+
+[features]
+# `SUPERGIT_SCREENSHOT=out.png supergit` renders the window to a PNG and quits.
+# Used to check the UI without screen-recording permission (agents, CI).
+screenshot = ["dep:gpui_platform_test_support"]
