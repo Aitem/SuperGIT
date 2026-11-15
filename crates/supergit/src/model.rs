@@ -12,6 +12,7 @@ pub struct WorktreeInfo {
     pub wt: Worktree,
     pub status: Result<WorktreeStatus, String>,
     pub sessions: Vec<Session>,
+    pub cleanup_identity: Option<sg_git::WorktreeIdentity>,
 }
 
 impl WorktreeInfo {
@@ -26,10 +27,6 @@ impl WorktreeInfo {
             .map(|s| s.state)
             .min()
             .filter(|s| s.is_active())
-    }
-
-    pub fn changed_files(&self) -> usize {
-        self.status.as_ref().map(|s| s.files.len()).unwrap_or(0)
     }
 }
 
@@ -49,24 +46,29 @@ pub fn git_error_message(error: anyhow::Error) -> String {
 /// parallel: with dozens of worktrees this is the hot path of each refresh.
 pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<WorktreeInfo>> {
     let worktrees = sg_git::list_worktrees(&repo.root)?;
-    let statuses: Vec<Result<WorktreeStatus, String>> = std::thread::scope(|scope| {
+    let statuses: Vec<_> = std::thread::scope(|scope| {
         let handles: Vec<_> = worktrees
             .iter()
             .map(|wt| {
                 scope.spawn(move || {
-                    if wt.is_bare {
+                    let status = if wt.is_bare {
                         Err("bare".to_string())
                     } else if let Some(reason) = &wt.prunable {
                         Err(format!("prunable: {reason}"))
                     } else {
                         sg_git::status(&wt.path).map_err(git_error_message)
-                    }
+                    };
+                    let identity = sg_git::worktree_identity(&repo.common_dir, wt).ok();
+                    (status, identity)
                 })
             })
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err("status panicked".into())))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| (Err("status panicked".into()), None))
+            })
             .collect()
     });
 
@@ -79,11 +81,14 @@ pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<Wor
         .into_iter()
         .zip(statuses)
         .zip(sessions)
-        .map(|((wt, status), sessions)| WorktreeInfo {
-            wt,
-            status,
-            sessions,
-        })
+        .map(
+            |((wt, (status, cleanup_identity)), sessions)| WorktreeInfo {
+                wt,
+                status,
+                sessions,
+                cleanup_identity,
+            },
+        )
         .collect())
 }
 

@@ -67,6 +67,10 @@ pub struct SavedConversation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepositoryView {
+    pub auto_cleanup: bool,
+    pub protected_branches: Vec<String>,
+    pub base_branch: Option<String>,
+    pub pending_branch_cleanup: Vec<PendingBranchCleanup>,
     pub completed_collapsed: bool,
     pub recent_targets: Vec<String>,
     pub selected: Option<PathBuf>,
@@ -85,9 +89,19 @@ pub struct RepositoryView {
     pub changes_tree: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingBranchCleanup {
+    pub deletion: sg_git::BranchDeletion,
+    pub error: String,
+}
+
 impl Default for RepositoryView {
     fn default() -> Self {
         Self {
+            auto_cleanup: false,
+            protected_branches: vec!["main".into(), "master".into()],
+            base_branch: None,
+            pending_branch_cleanup: Vec::new(),
             completed_collapsed: true,
             recent_targets: Vec::new(),
             selected: None,
@@ -185,6 +199,9 @@ mod tests {
         assert_eq!(state.sidebar_width, 320.);
         assert_eq!(state.chat_width, 960.);
         assert!(state.chat_open);
+        assert!(!state.auto_cleanup);
+        assert_eq!(state.protected_branches, ["main", "master"]);
+        assert!(state.pending_branch_cleanup.is_empty());
         assert!(
             serde_json::from_str::<Store>("{}")
                 .unwrap()

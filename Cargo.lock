@@ -6140,6 +6140,8 @@ name = "sg_git"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "serde",
  "tempfile",
 ]
 
@@ -6148,6 +6150,7 @@ name = "sg_github"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "serde",
  "serde_json",
 ]
