@@ -44,7 +44,6 @@ pub struct WorktreeView {
     pub kept: bool,
     pub branch_changes: bool,
     pub base: String,
-    pub tab: String,
     pub commit: Option<String>,
     pub changes_position: Option<ReviewPosition>,
     pub commit_position: Option<ReviewPosition>,

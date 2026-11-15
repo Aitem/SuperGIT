@@ -78,15 +78,6 @@ enum MainTab {
 }
 
 impl MainTab {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Changes => "changes",
-            Self::History => "history",
-            Self::Sessions => "claude",
-            Self::PullRequests => "prs",
-        }
-    }
-
     fn from_name(name: &str) -> Self {
         match name {
             "changes" => Self::Changes,
@@ -121,7 +112,6 @@ enum ContextScope {
 }
 
 struct ReviewView {
-    tab: MainTab,
     details: Details,
     selected_commit: Option<String>,
     commit_patch: LoadState<String>,
@@ -457,7 +447,6 @@ impl SuperGitApp {
             .worktrees
             .entry(path.clone())
             .or_default();
-        view.tab = self.tab.name().into();
         view.commit = self.selected_commit.clone();
         if changes.is_some() {
             view.changes_position = changes;
@@ -514,7 +503,6 @@ impl SuperGitApp {
             self.review_views.insert(
                 path.clone(),
                 ReviewView {
-                    tab: self.tab,
                     details: self.details.clone(),
                     selected_commit: self.selected_commit.clone(),
                     commit_patch: self.commit_patch.clone(),
@@ -529,8 +517,10 @@ impl SuperGitApp {
         let Some(path) = self.selected.clone() else {
             return;
         };
+        // Every worktree opens on History (or `SUPERGIT_TAB`); the other
+        // tabs are one click away and are not remembered per worktree.
+        self.tab = initial_tab();
         if let Some(cached) = self.review_views.remove(&path) {
-            self.tab = cached.tab;
             self.details = cached.details;
             self.selected_commit = cached.selected_commit;
             self.commit_patch = cached.commit_patch;
@@ -544,11 +534,6 @@ impl SuperGitApp {
             .get(&path)
             .cloned()
             .unwrap_or_default();
-        self.tab = if std::env::var_os("SUPERGIT_TAB").is_some() {
-            initial_tab()
-        } else {
-            MainTab::from_name(&saved.tab)
-        };
         self.selected_commit = saved.commit;
         for (commit, entity) in [
             (false, self.changes_diff.clone()),
