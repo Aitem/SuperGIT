@@ -23,7 +23,9 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_agents::{AgentState, Session};
-use sg_git::{Commit, CommitDetails, FileChange, FileState, Repo, relative_time};
+use sg_git::{
+    Commit, CommitDetails, FileChange, FileState, RefKind, RefLabel, Repo, relative_time,
+};
 use sg_github::{PrState, PullRequest};
 
 use crate::agent_context::{self, Attachment};
@@ -3642,6 +3644,14 @@ impl SuperGitApp {
                 .map(|c| (c.sha.as_str(), c.parents.as_slice())),
         );
         let lanes = lanes.clamp(1, GRAPH_MAX_LANES);
+        let base = self.history_base();
+        // Branch and tag badges get at most 40% of the commit list.
+        let badge_room = (commits_width * 0.4).max(60.);
+        let fork = self.selected_fork();
+        let fork_point = fork
+            .and_then(|fork| fork.parent.as_ref())
+            .map(|parent| parent.merge_base.clone());
+        let summary = fork.map(|fork| self.render_fork_summary(fork, theme, cx));
         let rows = commits
             .iter()
             .zip(graph)
@@ -3650,9 +3660,12 @@ impl SuperGitApp {
                 let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
                 let sha = c.sha.clone();
                 let avatar = self.avatars.get(&c.email.to_ascii_lowercase()).cloned();
-                commit_row(ix, c, graph, lanes, avatar, selected, theme).on_click(
-                    cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)),
+                let badges = ref_badges(("commit-refs", ix), &c.refs, base.as_deref(), 3, theme);
+                let fork_point = fork_point.as_deref() == Some(c.sha.as_str());
+                commit_row(
+                    ix, c, graph, lanes, avatar, badges, badge_room, fork_point, selected, theme,
                 )
+                .on_click(cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)))
             });
         let content = h_resizable("history-layout")
             .with_state(&self.history_layout)
@@ -3686,7 +3699,85 @@ impl SuperGitApp {
         v_flex()
             .size_full()
             .children(notice)
+            .children(summary)
             .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
+
+    /// The selected worktree's fork data, once it is loaded for it.
+    fn selected_fork(&self) -> Option<&sg_git::Fork> {
+        self.details
+            .fork
+            .as_ref()
+            .filter(|_| self.selected.as_ref() == Some(&self.details.path))
+    }
+
+    /// The branch new work forks from (`origin/main`), for ordering badges.
+    fn history_base(&self) -> Option<String> {
+        self.selected_fork()
+            .map(|fork| fork.base.clone())
+            .or_else(|| self.details.suggested_base.clone())
+    }
+
+    /// Above the graph: how far the branch is from the base, and where it
+    /// forked (click the sha to show that commit).
+    fn render_fork_summary(
+        &self,
+        fork: &sg_git::Fork,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let branch = self
+            .selected_info()
+            .and_then(|info| info.wt.branch.clone())
+            .unwrap_or_else(|| "HEAD".into());
+        let muted = theme.muted_foreground;
+        h_flex()
+            .flex_none()
+            .px_3()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .text_xs()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(theme.primary)
+                    .text_color(theme.primary_foreground)
+                    .child(format!("➜ {branch}")),
+            )
+            .child(div().child(format!("{} ahead", fork.commits)))
+            .child(div().text_color(muted).child("·"))
+            .child(
+                div()
+                    .when(fork.behind > 0, |el| el.text_color(theme.warning))
+                    .child(format!("{} behind {}", fork.behind, fork.base)),
+            )
+            .when_some(fork.parent.clone(), |el, parent| {
+                let sha = parent.merge_base.clone();
+                el.child(div().text_color(muted).child("·"))
+                    .child(
+                        div()
+                            .text_color(muted)
+                            .child(format!("forked from {} at", parent.name)),
+                    )
+                    .child(
+                        Button::new("fork-point")
+                            .label(sha[..sha.len().min(8)].to_string())
+                            .xsmall()
+                            .ghost()
+                            .tooltip(format!(
+                                "Where {branch} left {}: the nearest branch sharing its history. Click to show this commit",
+                                parent.name
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_commit(sha.clone(), cx)
+                            })),
+                    )
+            })
             .into_any_element()
     }
 
@@ -3756,15 +3847,13 @@ impl SuperGitApp {
                 .tooltip("Show this parent commit")
                 .on_click(cx.listener(move |this, _, _, cx| this.select_commit(parent.clone(), cx)))
         });
-        let refs = commit.refs.iter().map(|r| {
-            div()
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .bg(theme.secondary)
-                .text_color(theme.secondary_foreground)
-                .child(r.replace("HEAD -> ", "➜ "))
-        });
+        let refs = ref_badges(
+            ("commit-card-refs", 0),
+            &commit.refs,
+            self.history_base().as_deref(),
+            usize::MAX,
+            &theme,
+        );
         v_flex()
             .flex_none()
             .px_4()
@@ -4884,12 +4973,129 @@ fn author_avatar(
         })
 }
 
+/// A commit's branches and tags as badges: the checked-out branch first,
+/// then the base, tags, local and remote branches. A local branch and its
+/// remote copy on the same commit share one badge (`main · origin`). Past
+/// `max` badges the rest collapse into `+N`, listed on hover.
+fn ref_badges(
+    id: (&'static str, usize),
+    refs: &[RefLabel],
+    base: Option<&str>,
+    max: usize,
+    theme: &gpui_kit::component::Theme,
+) -> Vec<AnyElement> {
+    let base_name = base.map(|base| base.split_once('/').map_or(base, |(_, b)| b));
+    let mut merged = vec![false; refs.len()];
+    let mut groups: Vec<(&RefLabel, Vec<&str>)> = Vec::new();
+    for (ix, label) in refs.iter().enumerate() {
+        if merged[ix] {
+            continue;
+        }
+        let mut remotes = Vec::new();
+        if label.kind == RefKind::Branch {
+            for (other, remote) in refs.iter().enumerate() {
+                if !merged[other]
+                    && remote.kind == RefKind::Remote
+                    && remote.branch_name() == label.name
+                {
+                    merged[other] = true;
+                    remotes.push(remote.name.split_once('/').map_or("", |(r, _)| r));
+                }
+            }
+        }
+        groups.push((label, remotes));
+    }
+    // A remote copy listed before its local branch was merged afterwards.
+    groups.retain(|(label, _)| {
+        label.kind != RefKind::Remote
+            || !refs
+                .iter()
+                .any(|l| l.kind == RefKind::Branch && l.name == label.branch_name())
+    });
+    let rank = |label: &RefLabel| match label {
+        l if l.current => 0,
+        l if Some(l.branch_name()) == base_name && l.kind != RefKind::Tag => 1,
+        l if l.kind == RefKind::Tag => 2,
+        l if l.kind == RefKind::Branch => 3,
+        _ => 4,
+    };
+    groups.sort_by_key(|(label, _)| rank(label));
+    let overflow: Vec<String> = groups
+        .iter()
+        .skip(max)
+        .map(|(label, _)| label.name.clone())
+        .collect();
+    let mut badges: Vec<AnyElement> = groups
+        .into_iter()
+        .take(max)
+        .map(|(label, remotes)| {
+            let badge = h_flex()
+                .flex_none()
+                .gap_0p5()
+                .px_1()
+                .rounded_sm()
+                .text_xs()
+                .border_1();
+            let badge = match label.kind {
+                _ if label.current => badge
+                    .bg(theme.primary)
+                    .border_color(theme.primary)
+                    .text_color(theme.primary_foreground)
+                    .child(format!("➜ {}", label.name)),
+                RefKind::Tag => badge
+                    .bg(theme.yellow.opacity(0.15))
+                    .border_color(theme.yellow.opacity(0.5))
+                    .text_color(theme.foreground)
+                    .child(Icon::new(IconName::Tag).xsmall())
+                    .child(label.name.clone()),
+                RefKind::Remote => badge
+                    .border_color(theme.border)
+                    .text_color(theme.muted_foreground)
+                    .child(label.name.clone()),
+                RefKind::Branch | RefKind::Head => badge
+                    .bg(theme.blue.opacity(0.12))
+                    .border_color(theme.blue.opacity(0.5))
+                    .text_color(theme.foreground)
+                    .child(label.name.clone()),
+            };
+            badge
+                .when(!remotes.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .opacity(0.7)
+                            .child(format!("· {}", remotes.join(", "))),
+                    )
+                })
+                .into_any_element()
+        })
+        .collect();
+    if !overflow.is_empty() {
+        let tooltip = overflow.join("\n");
+        badges.push(
+            div()
+                .id(id)
+                .flex_none()
+                .px_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .child(format!("+{}", overflow.len()))
+                .into_any_element(),
+        );
+    }
+    badges
+}
+
+#[allow(clippy::too_many_arguments)]
 fn commit_row(
     ix: usize,
     c: &Commit,
     graph: graph::GraphRow,
     lanes: usize,
     avatar: Option<PathBuf>,
+    badges: Vec<AnyElement>,
+    badge_room: f32,
+    fork_point: bool,
     selected: bool,
     theme: &gpui_kit::component::Theme,
 ) -> Stateful<Div> {
@@ -4914,17 +5120,30 @@ fn commit_row(
                     .child("✦"),
             )
         })
+        // Badges take up to `badge_room` and clip at the right; the subject
+        // truncates in the rest.
         .child(div().flex_1().min_w_0().truncate().child(c.subject.clone()))
-        .children(c.refs.iter().take(3).map(|r| {
-            div()
+        .child(
+            h_flex()
                 .flex_none()
-                .px_1()
-                .rounded_sm()
-                .text_xs()
-                .bg(theme.secondary)
-                .text_color(theme.secondary_foreground)
-                .child(r.replace("HEAD -> ", "➜ "))
-        }))
+                .max_w(px(badge_room))
+                .overflow_hidden()
+                .gap_1()
+                .when(fork_point, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme.warning)
+                            .text_xs()
+                            .text_color(theme.warning)
+                            .child("fork point"),
+                    )
+                })
+                .children(badges),
+        )
         .child(
             div()
                 .flex_none()

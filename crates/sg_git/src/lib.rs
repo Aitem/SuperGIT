@@ -22,7 +22,10 @@ pub use cleanup::{
     worktree_identity,
 };
 pub use comparison::{BranchChanges, branch_changes, resolve_branch, suggested_base};
-pub use log::{Commit, CommitDetails, Fork, base_branch, commit_details, commit_patch, fork, log};
+pub use log::{
+    Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
+    commit_patch, fork, history, log,
+};
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
 pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};

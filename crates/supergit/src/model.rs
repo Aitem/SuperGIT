@@ -212,7 +212,7 @@ pub fn load_details(
         Ok(_) => Ok(String::new()),
         Err(error) => Err(error.clone()),
     };
-    let commits = sg_git::log(path, "HEAD", 400).map_err(git_error_message);
+    let commits = sg_git::history(path, 400).map_err(git_error_message);
     Details {
         path: path.to_path_buf(),
         base,
@@ -348,7 +348,7 @@ mod tests {
     fn unborn_repository_has_successful_empty_diff_and_history() {
         let temp = TempDir::new();
         temp.git(&["init", "-q", "-b", "main"]);
-        assert!(sg_git::log(&temp.0, "missing-branch", 10).is_err());
+        assert!(sg_git::log(&temp.0, &["missing-branch"], 10).is_err());
         let details = load_details(
             &temp.0,
             sg_git::status(&temp.0).map_err(|e| e.to_string()),
