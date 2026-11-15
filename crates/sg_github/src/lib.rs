@@ -42,6 +42,8 @@ impl Checks {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequest {
+    pub created_at: Option<std::time::SystemTime>,
+    pub merged_at: Option<std::time::SystemTime>,
     pub number: u64,
     pub title: String,
     pub head_branch: String,
@@ -62,6 +64,8 @@ pub struct PullRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawPr {
+    created_at: Option<String>,
+    merged_at: Option<String>,
     number: u64,
     title: String,
     head_ref_name: String,
@@ -100,7 +104,7 @@ struct RawCheck {
     state: Option<String>,
 }
 
-const FIELDS: &str = "number,title,headRefName,headRefOid,headRepository,baseRefName,state,isDraft,url,author,reviewDecision,statusCheckRollup,additions,deletions,updatedAt";
+const FIELDS: &str = "number,title,headRefName,headRefOid,headRepository,baseRefName,state,isDraft,url,author,reviewDecision,statusCheckRollup,additions,deletions,createdAt,mergedAt,updatedAt";
 
 /// Whether `gh` is installed and on PATH.
 pub fn gh_available() -> bool {
@@ -193,6 +197,8 @@ impl From<RawPr> for PullRequest {
             }
         }
         Self {
+            created_at: raw.created_at.as_deref().and_then(parse_timestamp),
+            merged_at: raw.merged_at.as_deref().and_then(parse_timestamp),
             number: raw.number,
             title: raw.title,
             head_branch: raw.head_ref_name,
@@ -211,9 +217,127 @@ impl From<RawPr> for PullRequest {
     }
 }
 
+fn parse_timestamp(value: &str) -> Option<std::time::SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(std::time::SystemTime::from)
+}
+
+/// Recognize canonical GitHub remotes without guessing a repository namespace.
+pub fn repository_identity(url: &str) -> Option<String> {
+    let path = url
+        .trim()
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.trim().strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.trim().strip_prefix("https://github.com/"))?;
+    let path = path
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path.trim_end_matches('/'));
+    let parts: Vec<_> = path.split('/').collect();
+    (parts.len() == 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        }))
+    .then(|| path.to_ascii_lowercase())
+}
+
+pub fn pull_request_repository(pr: &PullRequest) -> Option<String> {
+    let (repository, number) = pr.url.split_once("/pull/")?;
+    (number.parse::<u64>().ok()? == pr.number).then_some(())?;
+    repository_identity(repository)
+}
+
+/// A merged PR is proof only for this repository, branch lifetime and exact tip.
+pub fn merged_pr_matches(
+    pr: &PullRequest,
+    origin: &str,
+    branch: &str,
+    tip: &str,
+    now: std::time::SystemTime,
+) -> bool {
+    let Some(repository) = repository_identity(origin) else {
+        return false;
+    };
+    pr.state == PrState::Merged
+        && pr.head_branch == branch
+        && !tip.is_empty()
+        && pr.head_oid == tip
+        && pull_request_repository(pr).as_deref() == Some(repository.as_str())
+        && pr
+            .head_repository
+            .as_ref()
+            .is_some_and(|head| head.eq_ignore_ascii_case(&repository))
+        && pr
+            .created_at
+            .zip(pr.merged_at)
+            .is_some_and(|(created, merged)| created <= merged && merged <= now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_cleanup_requires_exact_repository_tip_and_merge_time() {
+        let mut pr = parse_prs(br#"[{"number":7,"title":"Task","headRefName":"task","headRefOid":"abc","headRepository":{"nameWithOwner":"Owner/Repo"},"baseRefName":"main","state":"MERGED","isDraft":false,"url":"https://github.com/owner/repo/pull/7","createdAt":"2025-01-01T00:00:00Z","mergedAt":"2025-01-02T00:00:00Z","updatedAt":"2025-01-02T00:00:00Z"}]"#).unwrap().remove(0);
+        let now = parse_timestamp("2025-01-03T00:00:00Z").unwrap();
+        assert!(merged_pr_matches(
+            &pr,
+            "git@github.com:owner/repo.git",
+            "task",
+            "abc",
+            now
+        ));
+        assert!(!merged_pr_matches(
+            &pr,
+            "git@github.com:other/repo.git",
+            "task",
+            "abc",
+            now
+        ));
+        assert!(!merged_pr_matches(
+            &pr,
+            "git@github.com:owner/repo.git",
+            "task",
+            "new",
+            now
+        ));
+        assert!(!merged_pr_matches(
+            &pr,
+            "git@github.com:owner/repo.git",
+            "reused",
+            "abc",
+            now
+        ));
+        assert!(!merged_pr_matches(
+            &pr,
+            "git@github.com:owner/repo.git",
+            "task",
+            "abc",
+            pr.created_at.unwrap()
+        ));
+        pr.head_repository = Some("fork/repo".into());
+        assert!(!merged_pr_matches(
+            &pr,
+            "git@github.com:owner/repo.git",
+            "task",
+            "abc",
+            now
+        ));
+        pr.head_repository = Some("owner/repo".into());
+        pr.merged_at = None;
+        assert!(!merged_pr_matches(
+            &pr,
+            "git@github.com:owner/repo.git",
+            "task",
+            "abc",
+            now
+        ));
+    }
 
     #[test]
     fn parses_gh_json() {

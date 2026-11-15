@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use gpui_kit::base::Selectable as _;
+use gpui_kit::base::{Disableable as _, Selectable as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -51,7 +51,7 @@ actions!(
         AskAgent,
         AskAgentNewConversation,
         ToggleKeepWorktree,
-        PreviewCleanup
+        CleanUpWorktree
     ]
 );
 
@@ -122,6 +122,12 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    cleanup_task: Option<Task<()>>,
+    cleanup_paths: std::collections::HashSet<PathBuf>,
+    cleanup_results: Vec<(String, bool)>,
+    cleanup_results_open: bool,
+    observed_open_prs: HashMap<u64, worktrees::ObservedPr>,
+    cleanup_attempted: std::collections::HashSet<String>,
     cleanup_preview: Option<worktrees::CleanupPreview>,
     cleanup_handle: FocusHandle,
     prs_fetched_at: Option<std::time::Instant>,
@@ -163,7 +169,6 @@ pub struct SuperGitApp {
     commit_generation: u64,
 
     branch_input: Entity<InputState>,
-    confirm_remove: Option<PathBuf>,
 
     /// Native Claude conversations per worktree (tabs in the right panel).
     /// They keep running while other worktrees are selected.
@@ -243,6 +248,12 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            cleanup_task: None,
+            cleanup_paths: Default::default(),
+            cleanup_results: Vec::new(),
+            cleanup_results_open: false,
+            observed_open_prs: HashMap::new(),
+            cleanup_attempted: Default::default(),
             cleanup_preview: None,
             cleanup_handle: cx.focus_handle(),
             prs_fetched_at: None,
@@ -281,7 +292,6 @@ impl SuperGitApp {
             details_generation: 0,
             commit_generation: 0,
             branch_input,
-            confirm_remove: None,
             chats: HashMap::new(),
             active_chat: HashMap::new(),
             chat_open,
@@ -765,6 +775,11 @@ impl SuperGitApp {
     }
 
     fn open_destination(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_paths.contains(&entry.path) {
+            self.flash("Cleanup is in progress for this worktree", true, cx);
+            return;
+        }
+        self.cleanup_results_open = false;
         if self.cleanup_preview.is_some() {
             self.close_cleanup_preview(window, cx);
         }
@@ -904,6 +919,7 @@ impl SuperGitApp {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.cleanup_results_open = false;
         if self.cleanup_preview.is_some() {
             self.close_cleanup_preview(window, cx);
         }
@@ -945,7 +961,7 @@ impl SuperGitApp {
         div().absolute().inset_0().flex().justify_center().items_start().pt(px(80.))
             .bg(gpui_kit::black().opacity(0.35))
             .on_mouse_down(MouseButton::Left,cx.listener(|this,_,window,cx| this.close_settings(window,cx)))
-            .child(v_flex().w(px(480.)).track_focus(&self.settings_handle).max_w_full().p_4().gap_3().rounded_lg().shadow_lg()
+            .child(v_flex().id("settings-content").max_h(px(650.)).overflow_y_scroll().w(px(560.)).track_focus(&self.settings_handle).max_w_full().p_4().gap_3().rounded_lg().shadow_lg()
                 .border_1().border_color(theme.border).bg(theme.background)
                 .on_mouse_down(MouseButton::Left,|_,_,cx| cx.stop_propagation())
                 .capture_key_down(cx.listener(|this,event: &KeyDownEvent,window,cx| {
@@ -961,7 +977,8 @@ impl SuperGitApp {
                             .label(if enabled {"On"} else {"Off"}).small().ghost()
                             .on_click(cx.listener(move |this,_,_,cx| this.toggle_notification(approval,cx))))))
                 .child(div().text_sm().text_color(theme.muted_foreground).child(
-                    "Only exact events from native conversations are notified. The visible conversation stays quiet. If macOS blocks alerts, enable SuperGIT in System Settings → Notifications.")))
+                    "Only exact events from native conversations are notified. The visible conversation stays quiet. If macOS blocks alerts, enable SuperGIT in System Settings → Notifications."))
+                .child(self.render_cleanup_settings(cx)))
             .into_any_element()
     }
 
@@ -1061,9 +1078,22 @@ impl SuperGitApp {
                 .or_else(|| {
                     self.worktrees
                         .iter()
+                        .filter(|w| {
+                            !w.wt.is_bare
+                                && w.wt.prunable.is_none()
+                                && w.status.is_ok()
+                                && !self.cleanup_paths.contains(w.path())
+                        })
                         .filter(|w| self.launch_dir.starts_with(&w.wt.path))
                         .max_by_key(|w| w.wt.path.as_os_str().len())
-                        .or(self.worktrees.first())
+                        .or_else(|| {
+                            self.worktrees.iter().find(|w| {
+                                !w.wt.is_bare
+                                    && w.wt.prunable.is_none()
+                                    && w.status.is_ok()
+                                    && !self.cleanup_paths.contains(w.path())
+                            })
+                        })
                         .map(|w| w.wt.path.clone())
                 });
         }
@@ -1152,6 +1182,7 @@ impl SuperGitApp {
                 self.prs_fetched_at = Some(std::time::Instant::now());
                 self.prs = prs;
                 self.prs_error = None;
+                self.observe_cleanup_prs(cx);
             }
             Err(e) => self.prs_error = Some(e),
         }
@@ -1305,6 +1336,10 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.cleanup_paths.contains(&path) {
+            self.flash("Cleanup is in progress for this worktree", true, cx);
+            return;
+        }
         if self
             .worktrees
             .iter()
@@ -1319,7 +1354,6 @@ impl SuperGitApp {
         }
         self.cache_review(cx);
         self.selected = Some(path);
-        self.confirm_remove = None;
         self.reset_details(cx);
         self.restore_review(cx);
         self.reload_details(cx);
@@ -1430,6 +1464,10 @@ impl SuperGitApp {
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.observed_open_prs.clear();
+        self.cleanup_attempted.clear();
+        self.cleanup_results.clear();
+        self.cleanup_results_open = false;
         self.cleanup_preview = None;
         self.prs_fetched_at = None;
         self.worktrees.clear();
@@ -1438,7 +1476,6 @@ impl SuperGitApp {
         self.prs_error = None;
         self.prs_loaded = false;
         self.selected = None;
-        self.confirm_remove = None;
         self.reset_details(cx);
     }
 
@@ -1502,6 +1539,7 @@ impl SuperGitApp {
                 && this.selected.as_ref() == Some(&path)
                 && this.chat_open
                 && !this.settings_open
+                && !this.cleanup_results_open
                 && this.switcher.is_none()
                 && this.cleanup_preview.is_none()
                 && this
@@ -1682,6 +1720,9 @@ impl SuperGitApp {
         let Some(path) = self.selected.clone() else {
             return;
         };
+        if self.cleanup_paths.contains(&path) {
+            return;
+        }
         // Reuse an untouched empty conversation instead of piling up tabs.
         if let Some(ix) = self.chats.get(&path).and_then(|list| {
             list.iter().position(|c| {
@@ -1854,15 +1895,23 @@ impl SuperGitApp {
         op: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        if self.action_task.is_some() || self.cleanup_task.is_some() {
+            self.flash("Another Git operation is in progress", true, cx);
+            return;
+        }
+        let root = self.repo.as_ref().map(|repo| repo.root.clone());
         self.flash(format!("{label}…"), false, cx);
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { op() }).await;
             this.update(cx, |this, cx| {
+                this.action_task = None;
                 match result {
                     Ok(()) => {
                         this.flash(format!("{label} — done"), false, cx);
-                        if let Some(path) = select_after {
-                            this.selected = Some(path);
+                        if let Some(path) = select_after
+                            && this.repo.as_ref().map(|repo| &repo.root) == root.as_ref()
+                        {
+                            this.select_worktree(path, cx);
                         }
                     }
                     Err(e) => this.flash(format!("{label} failed: {e:#}"), true, cx),
@@ -1959,35 +2008,6 @@ impl SuperGitApp {
                 }
                 sg_git::add_worktree(&root, &target, None, Some(&branch))
             },
-            cx,
-        );
-    }
-
-    fn remove_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(info) = self.selected_info() else {
-            return;
-        };
-        if info.wt.is_main {
-            self.flash("The main worktree cannot be removed", true, cx);
-            return;
-        }
-        let path = info.wt.path.clone();
-        if self.confirm_remove.as_ref() != Some(&path) {
-            self.confirm_remove = Some(path);
-            cx.notify();
-            return;
-        }
-        let force = info.changed_files() > 0;
-        let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) else {
-            return;
-        };
-        let name = info.wt.display_name();
-        self.confirm_remove = None;
-        self.selected = None;
-        self.run_git_action(
-            format!("Removing worktree {name}"),
-            None,
-            move || sg_git::remove_worktree(&root, &path, force),
             cx,
         );
     }
@@ -2190,8 +2210,10 @@ impl SuperGitApp {
                                 )
                                 .child(
                                     Button::new("preview-completed-cleanup")
-                                        .label("Preview…")
-                                        .tooltip("Preview cleanup of completed worktrees")
+                                        .label("Clean up…")
+                                        .tooltip(
+                                            "Clean up completed worktrees and their local branches",
+                                        )
                                         .xsmall()
                                         .ghost()
                                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -2376,7 +2398,7 @@ impl SuperGitApp {
                     }),
                 )
                 .item(
-                    PopupMenuItem::new("Preview cleanup…").on_click(move |_, window, cx| {
+                    PopupMenuItem::new("Clean up worktree…").on_click(move |_, window, cx| {
                         let _ = cleanup_owner.update(cx, |this, cx| {
                             this.open_cleanup_preview(vec![cleanup_path.clone()], window, cx)
                         });
@@ -2499,8 +2521,6 @@ impl SuperGitApp {
             }
             Err(e) => e.clone(),
         };
-        let confirming = self.confirm_remove.as_ref() == Some(&path);
-        let dirty = info.changed_files() > 0;
         let terminal = self.terminal;
 
         let p3 = path.clone();
@@ -2616,16 +2636,14 @@ impl SuperGitApp {
                     )
                     .when(!info.wt.is_main, |el| {
                         el.child(
-                            Button::new("remove")
-                                .label(match (confirming, dirty) {
-                                    (false, _) => "Remove",
-                                    (true, false) => "Confirm remove",
-                                    (true, true) => "Discard changes & remove",
-                                })
+                            Button::new("clean-up-worktree")
+                                .label("Clean up…")
                                 .small()
-                                .when(confirming, |b| b.danger())
-                                .when(!confirming, |b| b.ghost())
-                                .on_click(cx.listener(|this, _, _, cx| this.remove_selected(cx))),
+                                .ghost()
+                                .tooltip("Remove this worktree and safely delete its local branch")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.clean_up_worktree(&CleanUpWorktree, window, cx)
+                                })),
                         )
                     }),
             )
@@ -3496,6 +3514,7 @@ impl SuperGitApp {
             .min(chats.len().saturating_sub(1));
         if window.is_window_active()
             && !self.settings_open
+            && !self.cleanup_results_open
             && self.switcher.is_none()
             && self.cleanup_preview.is_none()
             && let Some(chat) = chats.get(active)
@@ -3692,6 +3711,19 @@ impl SuperGitApp {
                 el.child(repo.root.display().to_string())
             })
             .child(div().flex_1())
+            .when(!self.cleanup_results.is_empty(), |bar| {
+                bar.child(
+                    Button::new("cleanup-details")
+                        .label("Cleanup details")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cleanup_results_open = true;
+                            this.cleanup_handle.focus(window, cx);
+                            cx.notify();
+                        })),
+                )
+            })
             .when_some(self.message.clone(), |el, (msg, is_error)| {
                 el.child(
                     div()
@@ -3726,7 +3758,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::ask_agent))
             .on_action(cx.listener(Self::ask_agent_new))
             .on_action(cx.listener(Self::toggle_keep_worktree))
-            .on_action(cx.listener(Self::preview_cleanup))
+            .on_action(cx.listener(Self::clean_up_worktree))
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
                 let show_chat = self.chat_open && self.selected.is_some();
@@ -3788,6 +3820,9 @@ impl Render for SuperGitApp {
             .when(self.settings_open, |el| el.child(self.render_settings(cx)))
             .when(self.cleanup_preview.is_some(), |el| {
                 el.child(self.render_cleanup_preview(cx))
+            })
+            .when(self.cleanup_results_open, |el| {
+                el.child(self.render_cleanup_results(cx))
             })
     }
 }

@@ -6,12 +6,18 @@
 //! agents that run git in the same worktrees. Hot paths can move to `gix`
 //! later without changing this API.
 
+mod cleanup;
 mod comparison;
 mod log;
 mod runner;
 mod status;
 mod worktree;
 
+pub use cleanup::{
+    BranchDeletion, CleanupOutcome, CleanupPlan, CleanupPolicy, WorktreeIdentity,
+    cleanup_base_branch, cleanup_worktree, delete_cleanup_branch, fetch_cleanup_base,
+    worktree_identity,
+};
 pub use comparison::{BranchChanges, branch_changes, resolve_branch, suggested_base};
 pub use log::{Commit, commit_patch, log};
 pub use runner::{GitError, git, git_bytes};

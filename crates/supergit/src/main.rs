@@ -231,7 +231,7 @@ pub(crate) fn set_app_menus(cx: &mut App) {
         ]),
         Menu::new("Worktree").items([
             MenuItem::action("Toggle Keep Active", app::ToggleKeepWorktree),
-            MenuItem::action("Preview Cleanup…", app::PreviewCleanup),
+            MenuItem::action("Clean Up Worktree…", app::CleanUpWorktree),
         ]),
     ]);
 }

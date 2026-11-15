@@ -8,4 +8,6 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
 tempfile = "3"
+libc = "0.2"

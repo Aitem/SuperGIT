@@ -207,6 +207,23 @@ impl ChatSession {
         self.convo.status
     }
 
+    pub fn take_idle_process(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<Option<Arc<ClaudeProcess>>> {
+        anyhow::ensure!(
+            !self.convo.status.is_busy(),
+            "An agent is still running or waiting for approval"
+        );
+        self.reader = None;
+        let process = self.process.take();
+        if process.is_some() {
+            self.convo.status = Status::Exited;
+            cx.notify();
+        }
+        Ok(process)
+    }
+
     pub fn local_id(&self) -> &str {
         &self.local_id
     }
