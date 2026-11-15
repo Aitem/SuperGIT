@@ -150,21 +150,30 @@ pub fn open_url(url: &str) -> Result<()> {
 /// `file:///Users/me/My%20Repo/` → `/Users/me/My Repo/`.
 pub fn file_url_to_path(url: &str) -> Option<PathBuf> {
     let rest = url.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let rest = if rest.starts_with("localhost/") {
+        &rest["localhost".len()..]
+    } else {
+        rest
+    };
+    if !rest.starts_with('/') {
+        return None;
+    }
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16)
-        {
-            out.push(b);
+        if bytes[i] == b'%' {
+            let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
+            let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
             i += 3;
             continue;
         }
         out.push(bytes[i]);
         i += 1;
+    }
+    if out.contains(&0) {
+        return None;
     }
     let path = PathBuf::from(String::from_utf8(out).ok()?);
     path.is_absolute().then_some(path)
@@ -187,5 +196,25 @@ mod tests {
             Some(PathBuf::from("/tmp/репо"))
         );
         assert_eq!(file_url_to_path("https://example.com"), None);
+    }
+
+    #[test]
+    fn rejects_malformed_file_urls_without_panicking() {
+        for url in [
+            "file:///tmp/%💥",
+            "file:///tmp/%",
+            "file:///tmp/%2",
+            "file:///tmp/%GG",
+            "file:///tmp/%FF",
+            "file:///tmp/%00",
+            "file://localhost.evil/tmp/repo",
+            "file://server/tmp/repo",
+        ] {
+            assert_eq!(file_url_to_path(url), None, "{url}");
+        }
+        assert_eq!(
+            file_url_to_path("file:///tmp/репо%25"),
+            Some(PathBuf::from("/tmp/репо%"))
+        );
     }
 }
