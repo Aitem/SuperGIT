@@ -3,7 +3,63 @@
 
 use futures::StreamExt as _;
 use sg_claude::conversation::Reply;
-use sg_claude::{ClaudeProcess, Conversation, Decision, Item, ProcessEvent, SpawnOptions, Status};
+use sg_claude::{
+    ClaudeProcess, Conversation, Decision, Item, PermissionMode, ProcessEvent, SpawnOptions, Status,
+};
+
+/// Switches modes on a live session without sending a turn (no model call).
+#[test]
+#[ignore]
+fn auto_mode_switch_with_real_claude() {
+    let dir = std::env::temp_dir().join(format!("sg_claude_mode_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = SpawnOptions {
+        cwd: dir.clone(),
+        ..Default::default()
+    };
+    let (process, mut events) = ClaudeProcess::spawn(&opts).expect("spawn claude");
+    let mut convo = Conversation::new();
+    // Wait for the reply to `id`; the mode then is whatever the CLI echoed.
+    let mut answer = |id: String| {
+        futures::executor::block_on(async {
+            while let Some(ev) = events.next().await {
+                match ev {
+                    ProcessEvent::Message(v) => {
+                        if let Some(Reply::ControlResponse { request_id, error }) = convo.apply(&v)
+                            && request_id == id
+                        {
+                            return error;
+                        }
+                    }
+                    ProcessEvent::Stderr(_) => {}
+                    ProcessEvent::Exited => panic!("claude exited early"),
+                }
+            }
+            panic!("no reply to {id}")
+        })
+    };
+
+    let auto = answer(process.set_permission_mode(PermissionMode::Auto).unwrap());
+    assert_eq!(
+        auto, None,
+        "auto mode refused (unavailable for this account?)"
+    );
+    // Bypass can only be entered by a session launched for it.
+    let bypass = answer(
+        process
+            .set_permission_mode(PermissionMode::BypassPermissions)
+            .unwrap(),
+    );
+    assert!(bypass.is_some());
+    let edits = answer(
+        process
+            .set_permission_mode(PermissionMode::AcceptEdits)
+            .unwrap(),
+    );
+    assert_eq!(edits, None);
+    process.kill();
+    std::fs::remove_dir_all(&dir).ok();
+}
 
 #[test]
 #[ignore]

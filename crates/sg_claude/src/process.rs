@@ -20,15 +20,20 @@ pub enum PermissionMode {
     AcceptEdits,
     /// Read-only planning; Claude proposes a plan.
     Plan,
+    /// Claude decides on its own; a safety check (the auto-mode classifier)
+    /// reviews actions first, blocks risky ones (`system/permission_denied`)
+    /// and escalates the ones it cannot judge as ordinary prompts.
+    Auto,
     /// Never ask.
     BypassPermissions,
 }
 
 impl PermissionMode {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Default,
         Self::AcceptEdits,
         Self::Plan,
+        Self::Auto,
         Self::BypassPermissions,
     ];
 
@@ -37,11 +42,15 @@ impl PermissionMode {
             Self::Default => "default",
             Self::AcceptEdits => "acceptEdits",
             Self::Plan => "plan",
+            Self::Auto => "auto",
             Self::BypassPermissions => "bypassPermissions",
         }
     }
 
+    /// Parse a mode the CLI reports (`system/init`, `system/status`).
+    /// `manual` is the CLI's newer alias for `default`.
     pub fn from_wire(s: &str) -> Option<Self> {
+        let s = if s == "manual" { "default" } else { s };
         Self::ALL.into_iter().find(|m| m.as_str() == s)
     }
 
@@ -50,6 +59,7 @@ impl PermissionMode {
             Self::Default => "Ask",
             Self::AcceptEdits => "Edits",
             Self::Plan => "Plan",
+            Self::Auto => "Auto",
             Self::BypassPermissions => "Bypass",
         }
     }
@@ -61,7 +71,9 @@ pub struct SpawnOptions {
     pub cwd: PathBuf,
     /// Continue an existing session by id.
     pub resume: Option<String>,
-    pub permission_mode: PermissionMode,
+    /// `None` leaves the choice to the CLI (`permissions.defaultMode` in the
+    /// user's settings, else `default`).
+    pub permission_mode: Option<PermissionMode>,
     pub model: Option<String>,
     /// The CLI binary, `claude` from PATH by default.
     pub program: Option<PathBuf>,
@@ -104,8 +116,8 @@ impl ClaudeProcess {
             "--permission-prompt-tool",
             "stdio",
         ]);
-        if opts.permission_mode != PermissionMode::Default {
-            cmd.args(["--permission-mode", opts.permission_mode.as_str()]);
+        if let Some(mode) = opts.permission_mode {
+            cmd.args(["--permission-mode", mode.as_str()]);
         }
         if let Some(id) = &opts.resume {
             cmd.arg(format!("--resume={id}"));
@@ -209,9 +221,12 @@ impl ClaudeProcess {
             .map(drop)
     }
 
-    pub fn set_permission_mode(&self, mode: PermissionMode) -> Result<()> {
+    /// Switch the mode of the running session. Returns the request id: the
+    /// CLI answers with a `control_response` (an error when it refuses, e.g.
+    /// `auto_mode_unavailable` or `bypass_not_launched`) and, on success, a
+    /// `system/status` carrying the new `permissionMode`.
+    pub fn set_permission_mode(&self, mode: PermissionMode) -> Result<String> {
         self.control_request(json!({ "subtype": "set_permission_mode", "mode": mode.as_str() }))
-            .map(drop)
     }
 
     pub fn kill(&self) {
@@ -257,4 +272,25 @@ fn spawn_stderr_reader(stderr: std::process::ChildStderr, tx: UnboundedSender<Pr
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PermissionMode;
+
+    #[test]
+    fn permission_modes_round_trip_the_wire_names() {
+        for mode in PermissionMode::ALL {
+            assert_eq!(PermissionMode::from_wire(mode.as_str()), Some(mode));
+        }
+        assert_eq!(
+            PermissionMode::from_wire("auto"),
+            Some(PermissionMode::Auto)
+        );
+        assert_eq!(
+            PermissionMode::from_wire("manual"),
+            Some(PermissionMode::Default)
+        );
+        assert_eq!(PermissionMode::from_wire("dontAsk"), None);
+    }
 }

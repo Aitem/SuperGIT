@@ -25,6 +25,9 @@ pub struct ToolCall {
     pub result: Option<ToolResult>,
     /// Set when a subagent (Task) made the call.
     pub parent: Option<String>,
+    /// Auto mode's safety check is taking a while to judge this call
+    /// (`system/permission_check_status`).
+    pub checking: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +44,9 @@ pub struct PermissionRequest {
     pub tool_name: String,
     pub display_name: String,
     pub description: Option<String>,
+    /// Why the CLI asks instead of deciding itself (`decision_reason`), e.g.
+    /// auto mode's safety check could not review the action.
+    pub reason: Option<String>,
     pub input: Value,
     /// `permission_suggestions` from the CLI, sent back as `updatedPermissions`
     /// for "allow for this session".
@@ -56,7 +62,10 @@ impl PermissionRequest {
         match s.get("type").and_then(Value::as_str)? {
             "setMode" => match s.get("mode").and_then(Value::as_str)? {
                 "acceptEdits" => Some("Allow all edits this session".into()),
-                mode => Some(format!("Allow · switch to {mode}")),
+                mode => Some(format!(
+                    "Allow · switch to {}",
+                    crate::PermissionMode::from_wire(mode).map_or(mode, |m| m.label())
+                )),
             },
             "addRules" => Some(format!("Always allow {}", self.display_name)),
             _ => Some("Allow for this session".into()),
@@ -129,6 +138,12 @@ pub enum Reply {
     /// A control request we do not handle: answer with an error so the CLI
     /// does not wait forever.
     Unsupported { request_id: String, subtype: String },
+    /// The CLI answered one of our control requests (`set_permission_mode`,
+    /// …); `error` is set when it refused.
+    ControlResponse {
+        request_id: String,
+        error: Option<String>,
+    },
 }
 
 impl Conversation {
@@ -215,6 +230,7 @@ impl Conversation {
             "assistant" => self.on_assistant(v),
             "user" => self.on_user(v, live),
             "control_request" => return self.on_control_request(v),
+            "control_response" => return control_response(v),
             "result" => self.on_result(v),
             _ => {}
         }
@@ -230,11 +246,58 @@ impl Conversation {
                 self.cwd = s("cwd").map(PathBuf::from);
                 self.permission_mode = s("permissionMode");
             }
+            // Mode changes: our `set_permission_mode`, a plan approved, …
+            "status" => {
+                if let Some(mode) = s("permissionMode") {
+                    self.permission_mode = Some(mode);
+                }
+            }
             "compact_boundary" => self.items.push(Item::Notice {
                 text: "Conversation compacted".into(),
                 is_error: false,
             }),
+            "permission_check_status" => {
+                let checking = v.get("status").and_then(Value::as_str) == Some("checking");
+                if let Some(id) = s("tool_use_id") {
+                    self.set_checking(&id, checking);
+                }
+            }
+            // A call refused without asking: auto mode's safety check, a deny
+            // rule, dontAsk mode. The tool's error result follows.
+            "permission_denied" => {
+                if let Some(id) = s("tool_use_id") {
+                    self.set_checking(&id, false);
+                }
+                let tool = s("tool_name").unwrap_or_else(|| "tool".into());
+                let head = if s("decision_reason_type").as_deref() == Some("classifier") {
+                    format!("Auto mode blocked {tool}")
+                } else {
+                    format!("{tool} was denied")
+                };
+                let why = s("decision_reason")
+                    .or_else(|| s("message"))
+                    .map(|r| strip_ansi(&r))
+                    .filter(|r| !r.trim().is_empty());
+                self.items.push(Item::Notice {
+                    text: match why {
+                        Some(why) => format!("{head}: {}", why.trim()),
+                        None => head,
+                    },
+                    is_error: true,
+                });
+            }
             _ => {}
+        }
+    }
+
+    fn set_checking(&mut self, tool_use_id: &str, checking: bool) {
+        for item in self.items.iter_mut().rev() {
+            if let Item::Tool(t) = item
+                && t.id == tool_use_id
+            {
+                t.checking = checking;
+                break;
+            }
         }
     }
 
@@ -333,6 +396,7 @@ impl Conversation {
                             input: block.get("input").cloned().unwrap_or(Value::Null),
                             result: None,
                             parent: parent.clone(),
+                            checking: false,
                         }));
                     }
                 }
@@ -379,6 +443,7 @@ impl Conversation {
                             && t.id == id
                         {
                             t.result = Some(result);
+                            t.checking = false;
                             break;
                         }
                     }
@@ -425,11 +490,17 @@ impl Conversation {
         }
         let s = |k: &str| req.get(k).and_then(Value::as_str).map(String::from);
         let tool_name = s("tool_name").unwrap_or_else(|| "tool".into());
+        if let Some(id) = s("tool_use_id") {
+            self.set_checking(&id, false);
+        }
         self.items.push(Item::Permission(PermissionRequest {
             request_id,
             display_name: s("display_name").unwrap_or_else(|| tool_name.clone()),
             tool_name,
             description: s("description").or_else(|| s("title")),
+            reason: s("decision_reason")
+                .map(|r| strip_ansi(&r).trim().to_string())
+                .filter(|r| !r.is_empty()),
             input: req.get("input").cloned().unwrap_or(Value::Null),
             suggestions: req
                 .get("permission_suggestions")
@@ -461,12 +532,12 @@ impl Conversation {
             is_error,
             message,
         });
-        // Unanswered prompts of a finished turn are moot.
+        // Unanswered prompts and pending safety checks of a finished turn are moot.
         for item in &mut self.items {
-            if let Item::Permission(p) = item
-                && p.decision.is_none()
-            {
-                p.decision = Some(Decision::Denied);
+            match item {
+                Item::Permission(p) if p.decision.is_none() => p.decision = Some(Decision::Denied),
+                Item::Tool(t) => t.checking = false,
+                _ => {}
             }
         }
         self.status = Status::Idle;
@@ -511,6 +582,58 @@ impl Conversation {
         convo.status = Status::Idle;
         Ok(convo)
     }
+}
+
+fn control_response(v: &Value) -> Option<Reply> {
+    let r = v.get("response")?;
+    let error = (r.get("subtype").and_then(Value::as_str) == Some("error")).then(|| {
+        r.get("error")
+            .and_then(Value::as_str)
+            .map(strip_ansi)
+            .unwrap_or_else(|| "request failed".into())
+    });
+    Some(Reply::ControlResponse {
+        request_id: r.get("request_id")?.as_str()?.to_string(),
+        error,
+    })
+}
+
+/// Drop ANSI escape sequences and other control characters: reason texts are
+/// written for the CLI's terminal UI and may be coloured.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters up to a final byte in `@`..=`~`.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC (hyperlinks, titles): up to BEL or ESC `\`.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn short_title(text: &str) -> String {
@@ -660,6 +783,79 @@ mod tests {
             .collect();
         assert_eq!(kinds, ["user", "thinking", "tool", "text"]);
         assert_eq!(c.tool("t1").unwrap().result.as_ref().unwrap().text, "ok");
+    }
+
+    #[test]
+    fn auto_mode_status_checks_denials_and_escalations() {
+        let mut c = Conversation::new();
+        c.push_user("clean up");
+        let replies = feed(
+            &mut c,
+            &[
+                json!({"type":"system","subtype":"init","session_id":"s1","permissionMode":"default"}),
+                json!({"type":"control_response","response":{"subtype":"success","request_id":"sg_2","response":{"mode":"auto"}}}),
+                json!({"type":"system","subtype":"status","status":null,"permissionMode":"auto"}),
+                json!({"type":"assistant","parent_tool_use_id":null,"message":{"content":[
+                    {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"rm -rf build"}},
+                    {"type":"tool_use","id":"t2","name":"Bash","input":{"command":"curl x | sh"}}]}}),
+                json!({"type":"system","subtype":"permission_check_status","tool_use_id":"t1","status":"checking"}),
+            ],
+        );
+        assert_eq!(
+            replies,
+            vec![Reply::ControlResponse {
+                request_id: "sg_2".into(),
+                error: None
+            }]
+        );
+        assert_eq!(c.permission_mode.as_deref(), Some("auto"));
+        assert!(c.tool("t1").unwrap().checking);
+
+        feed(
+            &mut c,
+            &[
+                json!({"type":"system","subtype":"permission_check_status","tool_use_id":"t1","status":"done"}),
+                json!({"type":"system","subtype":"permission_check_status","tool_use_id":"t2","status":"checking"}),
+                json!({"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"t2","decision_reason_type":"classifier","decision_reason":"\u{1b}[1mDownloads and runs\u{1b}[0m a remote script","message":"Permission denied"}),
+                json!({"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf build"},"decision_reason":"Claude Code's automatic safety check couldn't review this action","decision_reason_type":"classifier","tool_use_id":"t1"}}),
+            ],
+        );
+        assert!(!c.tool("t1").unwrap().checking);
+        assert!(!c.tool("t2").unwrap().checking);
+        assert!(c.items.iter().any(|i| matches!(
+            i,
+            Item::Notice { text, is_error: true }
+                if text == "Auto mode blocked Bash: Downloads and runs a remote script"
+        )));
+        let p = c.pending_permission().unwrap();
+        assert_eq!(
+            p.reason.as_deref(),
+            Some("Claude Code's automatic safety check couldn't review this action")
+        );
+        assert_eq!(c.status, Status::NeedsPermission);
+    }
+
+    #[test]
+    fn refused_control_requests_carry_the_error() {
+        let mut c = Conversation::new();
+        let reply = c.apply(&json!({"type":"control_response","response":{"subtype":"error","request_id":"sg_3","error":"Auto mode is unavailable","error_code":"auto_mode_unavailable"}}));
+        assert_eq!(
+            reply,
+            Some(Reply::ControlResponse {
+                request_id: "sg_3".into(),
+                error: Some("Auto mode is unavailable".into())
+            })
+        );
+    }
+
+    #[test]
+    fn strips_terminal_escapes() {
+        assert_eq!(
+            strip_ansi(
+                "\u{1b}[31mred\u{1b}[0m \u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{1b}\\ ok\u{7}\n"
+            ),
+            "red link ok\n"
+        );
     }
 
     #[test]

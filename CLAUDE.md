@@ -37,6 +37,15 @@ Same protocol as the Agent SDKs and the VS Code extension:
   permission_suggestions, tool_use_id}`, `result` (turn end, cost).
 - Without `--permission-prompt-tool stdio` prompts are silently denied.
 - Unsupported control requests must get an error `control_response`.
+- Permission modes: `default` (alias `manual`), `acceptEdits`, `plan`,
+  `auto`, `bypassPermissions`, `dontAsk`. `set_permission_mode` gets a
+  `control_response` (error when refused: `auto_mode_unavailable`,
+  `bypass_not_launched` — bypass needs a session launched for it) and, on
+  success, `system/status {permissionMode}`; the chat follows that echo.
+- Auto mode: the classifier's refusals arrive as `system/permission_denied`
+  (`decision_reason_type: "classifier"`), slow checks as
+  `system/permission_check_status` (`checking`/`done`), escalations as
+  ordinary `can_use_tool` with `decision_reason` (may carry ANSI escapes).
 - `Conversation::from_transcript` replays a session jsonl for history.
 - Live test against the real CLI (costs cents): `cargo test -p sg_claude -- --ignored`.
 - UI checks: `SUPERGIT_DEBUG_CHAT=resume` or `SUPERGIT_DEBUG_CHAT='prompt:…'`
