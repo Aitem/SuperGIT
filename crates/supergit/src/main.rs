@@ -153,6 +153,18 @@ fn main() -> Result<()> {
         #[cfg(feature = "screenshot")]
         screenshot::schedule(_handle, cx);
 
+        // Global navigation must also work when no child control owns focus.
+        let switcher_view = view.downgrade();
+        cx.on_action(move |_: &app::OpenSwitcher, cx| {
+            let _ = _handle.update(cx, |_, window, cx| {
+                switcher_view
+                    .update(cx, |app, cx| {
+                        app.open_switcher(&app::OpenSwitcher, window, cx)
+                    })
+                    .ok();
+            });
+        });
+
         let view = view.downgrade();
         cx.spawn(async move |cx| {
             while let Some(path) = open_rx.next().await {

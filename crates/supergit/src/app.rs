@@ -104,6 +104,7 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    focus_handle: FocusHandle,
     base_inputs: HashMap<PathBuf, Entity<InputState>>,
     switcher_input: Entity<InputState>,
     switcher: Option<Switcher>,
@@ -215,6 +216,7 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            focus_handle: cx.focus_handle(),
             base_inputs: HashMap::new(),
             switcher_input,
             switcher: None,
@@ -265,6 +267,7 @@ impl SuperGitApp {
                 bounds_subscription,
             ],
         };
+        this.focus_handle.focus(window, cx);
         this.start_polling(cx);
         this
     }
@@ -637,7 +640,12 @@ impl SuperGitApp {
         }
     }
 
-    fn open_switcher(&mut self, _: &OpenSwitcher, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_switcher(
+        &mut self,
+        _: &OpenSwitcher,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.switcher.is_some() {
             return;
         }
@@ -672,6 +680,8 @@ impl SuperGitApp {
         if let Some(switcher) = self.switcher.take() {
             if let Some(focus) = switcher.previous_focus {
                 focus.focus(window, cx);
+            } else {
+                self.focus_handle.focus(window, cx);
             }
             cx.notify();
         }
@@ -2917,6 +2927,7 @@ impl Render for SuperGitApp {
         let theme = cx.theme().clone();
         v_flex()
             .size_full()
+            .track_focus(&self.focus_handle)
             .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
