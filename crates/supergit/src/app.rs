@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState};
+use gpui_kit::component::diff::{
+    Diff, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffSide, DiffState,
+};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -82,6 +84,14 @@ enum LayoutPanel {
     Chat,
     Changes,
     History,
+    CommitFiles,
+}
+
+/// A file list beside a diff: the Changes tab's, or the selected commit's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileList {
+    Changes,
+    Commit,
 }
 
 struct ReviewView {
@@ -144,6 +154,10 @@ pub struct SuperGitApp {
     changes_filter: Entity<InputState>,
     /// Folders collapsed in the Changes tab's tree view.
     changes_collapsed: HashSet<String>,
+    /// Filters the selected commit's file list in the History tab.
+    commit_filter: Entity<InputState>,
+    commit_collapsed: HashSet<String>,
+    commit_files_layout: Entity<ResizableState>,
     confirm_remove: Option<PathBuf>,
 
     /// Native Claude conversations per worktree (tabs in the right panel).
@@ -196,10 +210,13 @@ impl SuperGitApp {
             },
         );
         let changes_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
-        let filter_subscription = cx.subscribe(&changes_filter, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
+        let commit_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
+        let filter_subscriptions = [&changes_filter, &commit_filter].map(|input| {
+            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
         });
         // In "System" mode the theme follows macOS light/dark live.
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
@@ -260,6 +277,9 @@ impl SuperGitApp {
             branch_input,
             changes_filter,
             changes_collapsed: HashSet::new(),
+            commit_filter,
+            commit_collapsed: HashSet::new(),
+            commit_files_layout: cx.new(|_| ResizableState::default()),
             confirm_remove: None,
             chats: HashMap::new(),
             active_chat: HashMap::new(),
@@ -277,13 +297,13 @@ impl SuperGitApp {
             _subscriptions: vec![
                 subscription,
                 switcher_subscription,
-                filter_subscription,
                 appearance_subscription,
                 quit_subscription,
                 release_subscription,
                 bounds_subscription,
             ],
         };
+        this._subscriptions.extend(filter_subscriptions);
         this.focus_handle.focus(window, cx);
         this.start_polling(cx);
         this
@@ -549,26 +569,35 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// Click handler for a changed file: scroll the diff to it.
-    fn open_change(path: String, cx: &mut Context<Self>) -> ClickHandler {
+    /// Click handler for a file in `list`: scroll its diff to the file.
+    fn open_file(list: FileList, path: String, cx: &mut Context<Self>) -> ClickHandler {
         Box::new(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            let commit = list == FileList::Commit;
             this.remember_position(
                 ReviewPosition {
                     path: path.clone(),
                     line: 1,
                     original: false,
                 },
-                false,
+                commit,
                 cx,
             );
-            this.changes_diff
-                .update(cx, |state, cx| state.scroll_to_file(&path, cx));
+            let diff = if commit {
+                &this.commit_diff
+            } else {
+                &this.changes_diff
+            };
+            diff.update(cx, |state, cx| state.scroll_to_file(&path, cx));
         }))
     }
 
-    fn toggle_changes_dir(&mut self, path: String, cx: &mut Context<Self>) {
-        if !self.changes_collapsed.remove(&path) {
-            self.changes_collapsed.insert(path);
+    fn toggle_dir(&mut self, list: FileList, path: String, cx: &mut Context<Self>) {
+        let collapsed = match list {
+            FileList::Changes => &mut self.changes_collapsed,
+            FileList::Commit => &mut self.commit_collapsed,
+        };
+        if !collapsed.remove(&path) {
+            collapsed.insert(path);
         }
         cx.notify();
     }
@@ -598,6 +627,7 @@ impl SuperGitApp {
             LayoutPanel::Chat => view.chat_width = width,
             LayoutPanel::Changes => view.changes_width = width,
             LayoutPanel::History => view.history_width = width,
+            LayoutPanel::CommitFiles => view.commit_files_width = width,
         }
         view.sanitize();
         self.queue_persist(cx);
@@ -1293,6 +1323,7 @@ impl SuperGitApp {
             self.chat_layout = cx.new(|_| ResizableState::default());
             self.changes_layout = cx.new(|_| ResizableState::default());
             self.history_layout = cx.new(|_| ResizableState::default());
+            self.commit_files_layout = cx.new(|_| ResizableState::default());
             self.chat_open = self.repository_view().chat_open;
         } else {
             self.selected = None; // re-pick the worktree containing `path`
@@ -2394,98 +2425,6 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
-        // Screenshot builds: `SUPERGIT_CHANGES_TREE=1` shows the tree.
-        let tree = self.repository_view().changes_tree
-            || (cfg!(feature = "screenshot")
-                && std::env::var_os("SUPERGIT_CHANGES_TREE").is_some());
-        let query = self.changes_filter.read(cx).value().to_string();
-        let visible: Vec<usize> = (0..files.len())
-            .filter(|&ix| file_tree::matches(&files[ix].path, &query))
-            .collect();
-        let rows: Vec<AnyElement> =
-            if tree {
-                // While filtering, every folder holding a match is open.
-                let no_collapsed = HashSet::new();
-                let collapsed = if query.trim().is_empty() {
-                    &self.changes_collapsed
-                } else {
-                    &no_collapsed
-                };
-                file_tree::rows(
-                    visible.iter().map(|&ix| (ix, files[ix].path.as_str())),
-                    collapsed,
-                )
-                .into_iter()
-                .enumerate()
-                .map(|(row, entry)| match entry {
-                    TreeRow::Dir {
-                        path,
-                        name,
-                        depth,
-                        collapsed,
-                        files,
-                    } => tree_dir_row(row, name, depth, collapsed, files, theme)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_changes_dir(path.clone(), cx)
-                        }))
-                        .into_any_element(),
-                    TreeRow::File { ix, name, depth } => {
-                        change_row(ix, &files[ix], name, tree_indent(depth), theme)
-                            .on_click(Self::open_change(files[ix].path.clone(), cx))
-                            .into_any_element()
-                    }
-                })
-                .collect()
-            } else {
-                visible
-                    .iter()
-                    .map(|&ix| {
-                        let file = &files[ix];
-                        change_row(ix, file, file.path.clone(), px(12.), theme)
-                            .on_click(Self::open_change(file.path.clone(), cx))
-                            .into_any_element()
-                    })
-                    .collect()
-            };
-        let header = h_flex()
-            .flex_none()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div().flex_1().min_w_0().child(
-                    Input::new(&self.changes_filter)
-                        .small()
-                        .cleanable(true)
-                        .prefix(
-                            Icon::new(IconName::Search)
-                                .small()
-                                .text_color(theme.muted_foreground),
-                        ),
-                ),
-            )
-            .children(
-                [
-                    (false, IconName::List, "Flat list"),
-                    (true, IconName::ListTree, "Folder tree"),
-                ]
-                .map(|(as_tree, icon, tooltip)| {
-                    Button::new(if as_tree {
-                        "changes-tree"
-                    } else {
-                        "changes-flat"
-                    })
-                    .icon(icon)
-                    .small()
-                    .ghost()
-                    .selected(tree == as_tree)
-                    .toggled(tree == as_tree)
-                    .tooltip(tooltip)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_changes_tree(as_tree, cx)))
-                }),
-            );
         let content = h_resizable("changes-layout")
             .with_state(&self.changes_layout)
             .on_resize(cx.listener(|this, state, _, cx| {
@@ -2498,31 +2437,7 @@ impl SuperGitApp {
                         .changes_width
                         .min((width - 180.).clamp(140., 600.))))
                     .size_range(px(140.)..px((width - 180.).clamp(140., 600.)))
-                    .child(
-                        v_flex()
-                            .size_full()
-                            .min_w_0()
-                            .border_r_1()
-                            .border_color(theme.border)
-                            .child(header)
-                            .child(
-                                v_flex()
-                                    .id("change-list")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .when(rows.is_empty(), |el| {
-                                        el.child(
-                                            div()
-                                                .p_3()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child("No files match"),
-                                        )
-                                    })
-                                    .children(rows),
-                            ),
-                    ),
+                    .child(self.render_file_list(FileList::Changes, &files, theme, cx)),
             )
             .child(
                 resizable_panel().size_range(px(180.)..Pixels::MAX).child(
@@ -2539,6 +2454,133 @@ impl SuperGitApp {
             .relative()
             .children(notice)
             .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
+
+    /// The file list beside a diff: a filter, the flat/tree toggle, and rows
+    /// that scroll the diff to their file. Shared by Changes and History.
+    fn render_file_list(
+        &self,
+        list: FileList,
+        files: &[FileChange],
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (id, filter, collapsed) = match list {
+            FileList::Changes => ("change-list", &self.changes_filter, &self.changes_collapsed),
+            FileList::Commit => ("commit-files", &self.commit_filter, &self.commit_collapsed),
+        };
+        let filter = filter.clone();
+        // Screenshot builds: `SUPERGIT_CHANGES_TREE=1` shows the tree.
+        let tree = self.repository_view().changes_tree
+            || (cfg!(feature = "screenshot")
+                && std::env::var_os("SUPERGIT_CHANGES_TREE").is_some());
+        let query = filter.read(cx).value().to_string();
+        let visible: Vec<usize> = (0..files.len())
+            .filter(|&ix| file_tree::matches(&files[ix].path, &query))
+            .collect();
+        let rows: Vec<AnyElement> = if tree {
+            // While filtering, every folder holding a match is open.
+            let no_collapsed = HashSet::new();
+            let collapsed = if query.trim().is_empty() {
+                collapsed
+            } else {
+                &no_collapsed
+            };
+            file_tree::rows(
+                visible.iter().map(|&ix| (ix, files[ix].path.as_str())),
+                collapsed,
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(row, entry)| match entry {
+                TreeRow::Dir {
+                    path,
+                    name,
+                    depth,
+                    collapsed,
+                    files,
+                } => tree_dir_row(row, name, depth, collapsed, files, theme)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_dir(list, path.clone(), cx)),
+                    )
+                    .into_any_element(),
+                TreeRow::File { ix, name, depth } => {
+                    change_row(ix, &files[ix], name, tree_indent(depth), theme)
+                        .on_click(Self::open_file(list, files[ix].path.clone(), cx))
+                        .into_any_element()
+                }
+            })
+            .collect()
+        } else {
+            visible
+                .iter()
+                .map(|&ix| {
+                    let file = &files[ix];
+                    change_row(ix, file, file.path.clone(), px(12.), theme)
+                        .on_click(Self::open_file(list, file.path.clone(), cx))
+                        .into_any_element()
+                })
+                .collect()
+        };
+        let header = h_flex()
+            .flex_none()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&filter).small().cleanable(true).prefix(
+                        Icon::new(IconName::Search)
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    ),
+                ),
+            )
+            .children(
+                [
+                    (false, IconName::List, "Flat list"),
+                    (true, IconName::ListTree, "Folder tree"),
+                ]
+                .map(|(as_tree, icon, tooltip)| {
+                    Button::new(SharedString::from(format!(
+                        "{id}-{}",
+                        if as_tree { "tree" } else { "flat" }
+                    )))
+                    .icon(icon)
+                    .small()
+                    .ghost()
+                    .selected(tree == as_tree)
+                    .toggled(tree == as_tree)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_changes_tree(as_tree, cx)))
+                }),
+            );
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(header)
+            .child(
+                v_flex()
+                    .id(id)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(rows.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("No files match"),
+                        )
+                    })
+                    .children(rows),
+            )
             .into_any_element()
     }
 
@@ -2586,6 +2628,15 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
+        let commits_max = (width - 180.).clamp(160., 800.);
+        let commits_width = self
+            .history_layout
+            .read(cx)
+            .sizes()
+            .first()
+            .map(|w| w.as_f32())
+            .unwrap_or(self.repository_view().history_width)
+            .min(commits_max);
         let rows = commits.iter().enumerate().map(|(ix, c)| {
             let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
             let sha = c.sha.clone();
@@ -2619,7 +2670,7 @@ impl SuperGitApp {
             .child(
                 resizable_panel()
                     .size_range(px(180.)..Pixels::MAX)
-                    .child(self.render_commit_patch(cx)),
+                    .child(self.render_commit_patch(width - commits_width, cx)),
             );
         v_flex()
             .size_full()
@@ -2628,7 +2679,10 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    fn render_commit_patch(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The selected commit: its files (filter, flat or tree) beside its diff,
+    /// laid out like the Changes tab. `width` is the room right of the
+    /// commit list.
+    fn render_commit_patch(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         if self.selected_commit.is_none() {
             return self.render_data_notice("Select a commit", None, false, cx);
         }
@@ -2654,12 +2708,41 @@ impl SuperGitApp {
                 el.child(div().flex_1().min_h_0().child(if patch.is_empty() {
                     self.render_data_notice("No changes in this commit", None, false, cx)
                 } else {
-                    div()
-                        .size_full()
-                        .child(Diff::new(&self.commit_diff).line_number(true))
-                        .into_any_element()
+                    self.render_commit_files(width, cx)
                 }))
             })
+            .into_any_element()
+    }
+
+    fn render_commit_files(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let files: Vec<FileChange> = self
+            .commit_diff
+            .read(cx)
+            .files()
+            .iter()
+            .map(commit_file)
+            .collect();
+        let list_max = (width - 180.).clamp(140., 600.);
+        h_resizable("commit-files-layout")
+            .with_state(&self.commit_files_layout)
+            .on_resize(cx.listener(|this, state, _, cx| {
+                this.remember_layout(LayoutPanel::CommitFiles, state, cx)
+            }))
+            .child(
+                resizable_panel()
+                    .size(px(self.repository_view().commit_files_width.min(list_max)))
+                    .size_range(px(140.)..px(list_max))
+                    .child(self.render_file_list(FileList::Commit, &files, &theme, cx)),
+            )
+            .child(
+                resizable_panel().size_range(px(180.)..Pixels::MAX).child(
+                    div()
+                        .size_full()
+                        .min_w_0()
+                        .child(Diff::new(&self.commit_diff).line_number(true)),
+                ),
+            )
             .into_any_element()
     }
 
@@ -3199,7 +3282,28 @@ fn time_ago(t: SystemTime) -> String {
         .unwrap_or_default()
 }
 
-/// Indentation of a Changes tree row at `depth`.
+/// A file of a commit's diff as a list row: committed, so never "staged".
+fn commit_file(file: &DiffFile) -> FileChange {
+    let state = match file.status() {
+        DiffFileStatus::Added => FileState::Added,
+        DiffFileStatus::Deleted => FileState::Deleted,
+        DiffFileStatus::Renamed => FileState::Renamed,
+        DiffFileStatus::Copied => FileState::Copied,
+        DiffFileStatus::Conflicted => FileState::Conflicted,
+        _ => FileState::Modified,
+    };
+    FileChange {
+        path: file.path().to_string(),
+        orig_path: file
+            .original_path()
+            .filter(|orig| *orig != file.path())
+            .map(|orig| orig.to_string()),
+        staged: None,
+        unstaged: Some(state),
+    }
+}
+
+/// Indentation of a file-list tree row at `depth`.
 fn tree_indent(depth: usize) -> Pixels {
     px(12. + depth as f32 * 14.)
 }
@@ -3462,4 +3566,62 @@ fn pr_row(
                         }),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: GPUI's glob import brings its own `test` attribute.
+    use super::{DiffFile, FileState, commit_file};
+
+    #[test]
+    fn commit_files_carry_their_change_kind() {
+        let patch = "\
+diff --git a/new.rs b/new.rs
+new file mode 100644
+--- /dev/null
++++ b/new.rs
+@@ -0,0 +1 @@
++fn main() {}
+diff --git a/gone.rs b/gone.rs
+deleted file mode 100644
+--- a/gone.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-fn old() {}
+diff --git a/src/old_name.rs b/src/new_name.rs
+similarity index 100%
+rename from src/old_name.rs
+rename to src/new_name.rs
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-pub fn a() {}
++pub fn b() {}
+";
+        let files: Vec<_> = DiffFile::parse(patch)
+            .unwrap()
+            .iter()
+            .map(commit_file)
+            .collect();
+        let summary: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.state(), f.orig_path.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("new.rs", FileState::Added, None),
+                ("gone.rs", FileState::Deleted, None),
+                (
+                    "src/new_name.rs",
+                    FileState::Renamed,
+                    Some("src/old_name.rs")
+                ),
+                ("src/lib.rs", FileState::Modified, None),
+            ]
+        );
+        // Committed files are never shown as "staged".
+        assert!(files.iter().all(|f| f.staged.is_none()));
+    }
 }
