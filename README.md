@@ -45,6 +45,8 @@ scripts/bundle-macos.sh --install   # rebuild + reinstall after every pull/chang
 ```
 
 It is a local, ad-hoc signed build — no Apple developer account needed.
+The script quits a running SuperGIT, moves the new bundle into place (the
+staging folder is `.noindex`, so Spotlight never shows a second copy).
 Launched from the Dock it reopens the last repository; `cmd-o` opens another,
 **Recent** (`cmd-shift-o`) lists the previous ones. You can also drop a repo
 folder on the Dock icon or run `open -a SuperGIT ~/Work/myrepo`. The app takes

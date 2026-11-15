@@ -1,8 +1,11 @@
 #!/bin/bash
 # Build SuperGIT.app from the current checkout.
 #
-#   scripts/bundle-macos.sh             → target/release/bundle/SuperGIT.app
-#   scripts/bundle-macos.sh --install   → also copy it to /Applications
+#   scripts/bundle-macos.sh             → target/release/bundle.noindex/SuperGIT.app
+#   scripts/bundle-macos.sh --install   → moves it to /Applications (one copy only)
+#
+# The staging folder ends in `.noindex` so Spotlight/Launchpad never list the
+# build copy as a second SuperGIT.
 #
 # Local builds only: the bundle is ad-hoc signed (no Developer ID/notarization),
 # which macOS accepts for apps built on this machine.
@@ -18,7 +21,14 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 build=$(git rev-list --count HEAD 2>/dev/null || echo 1)
 sha=$(git rev-parse --short HEAD 2>/dev/null || echo dev)
 
-app=target/release/bundle/SuperGIT.app
+lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+# Older scripts staged into an indexed folder: forget that copy.
+if [[ -d target/release/bundle/SuperGIT.app ]]; then
+  "$lsregister" -u target/release/bundle/SuperGIT.app 2>/dev/null || true
+  rm -rf target/release/bundle
+fi
+
+app=target/release/bundle.noindex/SuperGIT.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/supergit "$app/Contents/MacOS/supergit"
@@ -36,9 +46,9 @@ if (( install )); then
     for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -qf "$dest/Contents/MacOS/supergit" || break; sleep 0.5; done
   fi
   rm -rf "$dest"
-  cp -R "$app" "$dest"
+  mv "$app" "$dest"
   # Refresh Launchpad/Spotlight/Dock metadata (icon, document types).
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dest" || true
+  "$lsregister" -f "$dest" || true
   touch "$dest"
   echo "installed $dest"
 fi
