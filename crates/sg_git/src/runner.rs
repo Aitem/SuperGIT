@@ -53,7 +53,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    git_bytes_in_index(cwd, args, None)
+}
+
+pub(crate) fn git_bytes_in_index<I, S>(cwd: &Path, args: I, index: Option<&Path>) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let (mut cmd, printable) = command(cwd, args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
     let out = cmd.output()?;
     if !out.status.success() {
         return Err(GitError {

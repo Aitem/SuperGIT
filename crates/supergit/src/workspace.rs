@@ -41,6 +41,8 @@ pub struct ReviewPosition {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeView {
+    pub branch_changes: bool,
+    pub base: String,
     pub tab: String,
     pub commit: Option<String>,
     pub changes_position: Option<ReviewPosition>,
