@@ -58,6 +58,13 @@ scripts/bundle-macos.sh --install   # SuperGIT.app → /Applications (ad-hoc sig
 scripts/make-icon.sh                # regenerate assets/AppIcon.icns (Swift/AppKit)
 ```
 
+CI (`.github/workflows/ci.yml`, on PRs and pushes to `main`, `macos-latest`):
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` (warnings fail CI), build + `cargo test
+--workspace`, and `scripts/bundle-macos.sh` (release `.app`, no upload yet).
+All builds use `--locked`: commit `Cargo.lock` changes. The `CI ok` job
+aggregates the rest — the one check to require for merges.
+
 App-launch specifics (`main.rs`, `shell_env.rs`, `recent.rs`): a Dock launch
 has cwd `/` and launchd's minimal PATH, so `shell_env` imports the login
 shell's environment (only when `TERM` is unset) before any thread starts, and

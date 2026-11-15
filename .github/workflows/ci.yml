@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a branch/PR cancels its previous run; every commit on main
+# keeps its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+# The toolchain (version + components) comes from rust-toolchain.toml.
+# GPUI is built with `runtime_shaders`, so no Xcode/Metal toolchain is needed.
+# Caches are written only from main; PR runs restore main's cache.
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustc --version
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --all-features also covers the `screenshot` feature.
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: build & test
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+      # Live tests against the real `claude` CLI are #[ignore]d and stay off.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  bundle:
+    name: release bundle
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build SuperGIT.app
+        run: scripts/bundle-macos.sh
+      - name: Verify bundle
+        run: |
+          app=target/release/bundle.noindex/SuperGIT.app
+          codesign --verify --strict --verbose=2 "$app"
+          plutil -lint "$app/Contents/Info.plist"
+          file "$app/Contents/MacOS/supergit"
+
+  # Single status for branch protection / merge rules: require only this check.
+  ci-ok:
+    name: CI ok
+    if: always()
+    needs: [fmt, clippy, test, bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do [[ "$r" == success ]] || exit 1; done
