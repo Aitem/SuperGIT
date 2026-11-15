@@ -2,6 +2,7 @@
 //! history, Claude sessions and pull requests on the right.
 
 mod base;
+mod projects;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -53,6 +54,7 @@ actions!(
         CloseRepository,
         ToggleClaude,
         ToggleSidebar,
+        ToggleProjects,
         NewClaudeChat,
         OpenSwitcher,
         CloseSwitcher,
@@ -197,11 +199,17 @@ pub struct SuperGitApp {
     commit_filter: Entity<InputState>,
     commit_collapsed: HashSet<String>,
     commit_files_layout: Entity<ResizableState>,
+    /// The Projects panel's width (window-wide, not per repository).
+    projects_layout: Entity<ResizableState>,
+    /// Inactive projects' last worktrees and PRs, for instant switching.
+    project_cache: HashMap<PathBuf, projects::ProjectSnapshot>,
 
     /// Native Claude conversations per worktree (tabs in the right panel).
-    /// They keep running while other worktrees are selected.
+    /// They keep running while other worktrees, or projects, are selected.
     chats: HashMap<PathBuf, Vec<Entity<ChatSession>>>,
     active_chat: HashMap<PathBuf, usize>,
+    /// The repository root each conversation's worktree belongs to.
+    chat_projects: HashMap<PathBuf, PathBuf>,
     chat_open: bool,
     message: Option<(String, bool)>,
 
@@ -231,7 +239,7 @@ impl SuperGitApp {
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("new branch → worktree"));
         let switcher_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Branch, PR number or conversation…")
+            InputState::new(window, cx).placeholder("Branch, PR number, conversation or project…")
         });
         let switcher_subscription = cx.subscribe_in(
             &switcher_input,
@@ -267,7 +275,10 @@ impl SuperGitApp {
         let changes_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
         let commit_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
 
-        let persisted = workspace::load();
+        let mut persisted = workspace::load();
+        if let Some(repo) = &repo {
+            persisted.projects.add(&repo.root);
+        }
         let chat_open = repo
             .as_ref()
             .and_then(|repo| persisted.repositories.get(&repo.root))
@@ -345,8 +356,11 @@ impl SuperGitApp {
             commit_filter,
             commit_collapsed: HashSet::new(),
             commit_files_layout: cx.new(|_| ResizableState::default()),
+            projects_layout: cx.new(|_| ResizableState::default()),
+            project_cache: HashMap::new(),
             chats: HashMap::new(),
             active_chat: HashMap::new(),
+            chat_projects: HashMap::new(),
             chat_open,
             message: None,
             persisted,
@@ -377,7 +391,7 @@ impl SuperGitApp {
     }
 
     fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32, f32) {
-        let total = window.viewport_size().width.as_f32();
+        let total = window.viewport_size().width.as_f32() - self.projects_width(cx);
         let show_chat = self.chat_open && self.selected.is_some();
         let sidebar_max = (total - if show_chat { 680. } else { 360. }).clamp(220., 520.);
         let saved = self.repository_view();
@@ -458,43 +472,55 @@ impl SuperGitApp {
 
     fn persist_workspace(&mut self, cx: &App) {
         self.capture_saved_review(cx);
-        let Some(root) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
-            if let Some(window) = self.window_rect {
-                workspace::save_window(window);
-            }
-            return;
-        };
-        let view = self.persisted.repositories.entry(root.clone()).or_default();
-        if !self.worktrees.is_empty() {
+        let current = self.repo.as_ref().map(|repo| repo.root.clone());
+        if let Some(root) = &current
+            && !self.worktrees.is_empty()
+        {
+            let view = self.persisted.repositories.entry(root.clone()).or_default();
             view.selected = self.selected.clone();
             view.chat_open = self.chat_open;
         }
-        for worktree in &self.worktrees {
-            let path = worktree.path();
-            if let Some(chats) = self.chats.get(path) {
-                let mut snapshots: Vec<_> = chats
-                    .iter()
-                    .map(|chat| chat.read(cx).snapshot(cx))
-                    .collect();
-                if let Some(saved) = view.conversations.get(path) {
-                    snapshots.extend(
-                        saved
-                            .iter()
-                            .filter(|conversation| {
-                                !conversation.provider.is_empty()
-                                    && conversation.provider != "claude"
-                            })
-                            .cloned(),
-                    );
-                }
-                view.conversations.insert(path.to_path_buf(), snapshots);
-                view.active_conversations.insert(
-                    path.to_path_buf(),
-                    self.active_chat.get(path).copied().unwrap_or(0),
+        // Conversations of every project, including those running in the
+        // background while another project is shown.
+        let mut touched: Vec<PathBuf> = current.into_iter().collect();
+        for (path, chats) in &self.chats {
+            let Some(root) = self.chat_projects.get(path) else {
+                continue;
+            };
+            let view = self.persisted.repositories.entry(root.clone()).or_default();
+            let mut snapshots: Vec<_> = chats
+                .iter()
+                .map(|chat| chat.read(cx).snapshot(cx))
+                .collect();
+            if let Some(saved) = view.conversations.get(path) {
+                snapshots.extend(
+                    saved
+                        .iter()
+                        .filter(|conversation| {
+                            !conversation.provider.is_empty() && conversation.provider != "claude"
+                        })
+                        .cloned(),
                 );
             }
+            view.conversations.insert(path.clone(), snapshots);
+            view.active_conversations.insert(
+                path.clone(),
+                self.active_chat.get(path).copied().unwrap_or(0),
+            );
+            if !touched.contains(root) {
+                touched.push(root.clone());
+            }
         }
-        workspace::save_repository(&root, view, self.window_rect);
+        let views: Vec<_> = touched
+            .iter()
+            .filter_map(|root| {
+                self.persisted
+                    .repositories
+                    .get(root)
+                    .map(|view| (root.as_path(), view))
+            })
+            .collect();
+        workspace::save(&views, &self.persisted.projects, self.window_rect);
     }
 
     fn cache_review(&mut self, cx: &App) {
@@ -784,6 +810,26 @@ impl SuperGitApp {
                 });
             }
         }
+        for root in self
+            .persisted
+            .projects
+            .roots
+            .iter()
+            .filter(|root| self.active_root() != Some(root.as_path()))
+        {
+            let name = root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            entries.push(Entry {
+                key: format!("project:{}", root.display()),
+                path: root.clone(),
+                title: name.clone(),
+                detail: format!("Project · {}", root.display()),
+                search: format!("{name} {} project", root.display()),
+                destination: Destination::Project,
+            });
+        }
         entries
     }
 
@@ -891,6 +937,11 @@ impl SuperGitApp {
     }
 
     fn open_destination(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(entry.destination, Destination::Project) {
+            self.remember_target(entry.key, cx);
+            self.switch_project(entry.path, cx);
+            return;
+        }
         if self.cleanup_paths.contains(&entry.path) || self.base_update_paths.contains(&entry.path)
         {
             self.flash("A Git operation is in progress for this worktree", true, cx);
@@ -912,7 +963,7 @@ impl SuperGitApp {
         }
         self.select_worktree(entry.path.clone(), cx);
         match entry.destination {
-            Destination::Worktree => {}
+            Destination::Worktree | Destination::Project => {}
             Destination::Conversation(id) => {
                 self.ensure_chats(&entry.path, window, cx);
                 if let Some(ix) = self
@@ -1564,22 +1615,34 @@ impl SuperGitApp {
     }
 
     /// Open the repository containing `path` (from the dialog, a recent entry,
-    /// a folder dropped on the Dock icon or `open -a SuperGIT <dir>`).
-    pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// the Projects panel, a folder dropped on the Dock icon or `open -a
+    /// SuperGIT <dir>`) and add it to the Projects panel. The previous
+    /// project keeps its conversations running. Returns whether it opened.
+    pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
         let repo = match Repo::discover(&path) {
             Ok(repo) => repo,
             Err(e) => {
                 self.flash(format!("{e:#}"), true, cx);
-                return;
+                return false;
             }
         };
+        let same = self.repo.as_ref().is_some_and(|r| r.root == repo.root);
+        if !same && self.git_operation_running() {
+            self.flash(
+                "Wait for the running Git operation before switching projects",
+                true,
+                cx,
+            );
+            return false;
+        }
         self.persist_workspace(cx);
         self.cache_review(cx);
         crate::recent::remember(&repo.root);
         self.recent = crate::recent::load();
-        let same = self.repo.as_ref().is_some_and(|r| r.root == repo.root);
+        self.persisted.projects.add(&repo.root);
         self.launch_dir = path;
         if !same {
+            self.stash_project();
             self.repo = Some(repo);
             self.reset_view(cx);
             self.sidebar_layout = cx.new(|_| ResizableState::default());
@@ -1588,12 +1651,15 @@ impl SuperGitApp {
             self.history_layout = cx.new(|_| ResizableState::default());
             self.commit_files_layout = cx.new(|_| ResizableState::default());
             self.chat_open = self.repository_view().chat_open;
+            self.restore_project(cx);
         } else {
             self.selected = None; // re-pick the worktree containing `path`
         }
         self.message = None;
         self.start_polling(cx);
+        self.queue_persist(cx);
         cx.notify();
+        true
     }
 
     /// GitHub avatars for the commit list, once per repository.
@@ -1666,8 +1732,17 @@ impl SuperGitApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.leave_project(cx);
+    }
+
+    fn leave_project(&mut self, cx: &mut Context<Self>) {
+        if self.git_operation_running() {
+            self.flash("Wait for the running Git operation first", true, cx);
+            return;
+        }
         self.persist_workspace(cx);
         self.cache_review(cx);
+        self.stash_project();
         self.repo = None;
         self.poll_task = None;
         self.prs_task = None;
@@ -1682,6 +1757,7 @@ impl SuperGitApp {
         let Some(repository) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
             return;
         };
+        self.chat_projects.insert(path.clone(), repository.clone());
         let key = format!(
             "{}:{}:{}",
             repository.display(),
@@ -1836,8 +1912,13 @@ impl SuperGitApp {
             .as_ref()
             .is_none_or(|repo| repo.root != target.repository)
         {
-            self.open_path(target.repository.clone(), cx);
+            // A cached project restores its worktrees at once and takes the
+            // pending destination right away; otherwise the first poll does.
+            let repository = target.repository.clone();
             self.pending_notification = Some(target);
+            if !self.open_path(repository, cx) {
+                self.pending_notification = None;
+            }
             return;
         }
         if self.worktrees.is_empty() {
@@ -2330,7 +2411,7 @@ impl SuperGitApp {
                                 .label("Switch…")
                                 .small()
                                 .ghost()
-                                .tooltip("Switch worktree or conversation (cmd-p)")
+                                .tooltip("Switch worktree, conversation or project (cmd-p)")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_switcher(&OpenSwitcher, window, cx)
                                 })),
@@ -2341,7 +2422,7 @@ impl SuperGitApp {
                                 .label("Open…")
                                 .ghost()
                                 .small()
-                                .tooltip("Open another repository (cmd-o)")
+                                .tooltip("Open a repository as a project (cmd-o)")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_repository(&OpenRepository, window, cx)
                                 })),
@@ -4375,6 +4456,131 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    /// Everything between the title bar and the status bar: the Projects
+    /// panel, then the active project (worktrees, review, Claude).
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let project = self.render_project(window, cx);
+        if !self.projects_visible() {
+            return project;
+        }
+        if self.persisted.projects.collapsed {
+            return h_flex()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_projects_rail(cx))
+                .child(div().flex_1().min_w_0().h_full().flex().child(project))
+                .into_any_element();
+        }
+        // What the active project needs at its narrowest.
+        let saved = self.repository_view();
+        let rest = if self.repo.is_none() {
+            480.
+        } else {
+            (if saved.sidebar_open { 220. } else { RAIL_WIDTH })
+                + if self.chat_open && self.selected.is_some() {
+                    680.
+                } else {
+                    360.
+                }
+        };
+        let max = (window.viewport_size().width.as_f32() - rest).clamp(160., 360.);
+        div()
+            .flex_1()
+            .min_h_0()
+            .child(
+                h_resizable("projects-layout")
+                    .with_state(&self.projects_layout)
+                    .on_resize(
+                        cx.listener(|this, state, _, cx| this.remember_projects_width(state, cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(self.persisted.projects.width.min(max)))
+                            .size_range(px(160.)..px(max))
+                            .child(self.render_projects(cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(px(rest)..Pixels::MAX)
+                            .child(project),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The active project, or the welcome screen without one.
+    fn render_project(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.repo.is_some() {
+            let show_chat = self.chat_open && self.selected.is_some();
+            let (sidebar_max, chat_max, _) = self.pane_widths(window, cx);
+            let main = self.render_main(window, cx);
+            let workspace = if show_chat {
+                let chat = self.render_claude_panel(window, cx);
+                h_resizable("chat-layout")
+                    .with_state(&self.chat_layout)
+                    .on_resize(cx.listener(|this, state, _, cx| {
+                        this.remember_layout(LayoutPanel::Chat, state, cx)
+                    }))
+                    .child(
+                        resizable_panel()
+                            .size_range(px(360.)..Pixels::MAX)
+                            .child(main),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(self.repository_view().chat_width.min(chat_max)))
+                            .size_range(px(320.)..px(chat_max))
+                            .child(chat),
+                    )
+                    .into_any_element()
+            } else if self.selected.is_some() {
+                let rail = self.render_chat_rail(window, cx);
+                h_flex()
+                    .size_full()
+                    .child(div().flex_1().min_w_0().h_full().child(main))
+                    .child(rail)
+                    .into_any_element()
+            } else {
+                main
+            };
+            if !self.repository_view().sidebar_open {
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_sidebar_rail(cx))
+                    .child(div().flex_1().min_w_0().h_full().child(workspace))
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        h_resizable("sidebar-layout")
+                            .with_state(&self.sidebar_layout)
+                            .on_resize(cx.listener(|this, state, _, cx| {
+                                this.remember_layout(LayoutPanel::Sidebar, state, cx)
+                            }))
+                            .child(
+                                resizable_panel()
+                                    .size(px(self.repository_view().sidebar_width.min(sidebar_max)))
+                                    .size_range(px(220.)..px(sidebar_max))
+                                    .child(self.render_sidebar(cx)),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(
+                                        px(if show_chat { 680. } else { 360. })..Pixels::MAX,
+                                    )
+                                    .child(workspace),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        } else {
+            self.render_welcome(cx).into_any_element()
+        }
+    }
+
     fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let rows = self.recent.iter().enumerate().map(|(ix, root)| {
@@ -4390,7 +4596,9 @@ impl SuperGitApp {
                 .rounded_md()
                 .cursor_pointer()
                 .hover(|el| el.bg(theme.list_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.open_path(path.clone(), cx)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_path(path.clone(), cx);
+                }))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
                 .child(
                     div()
@@ -4497,6 +4705,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::close_repository))
             .on_action(cx.listener(Self::toggle_claude))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_projects))
             .on_action(cx.listener(Self::new_chat_action))
             .on_action(cx.listener(Self::update_creation_base))
             .on_action(cx.listener(Self::open_switcher))
@@ -4506,78 +4715,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::toggle_keep_worktree))
             .on_action(cx.listener(Self::clean_up_worktree))
             .child(self.render_title_bar(cx))
-            .child(if self.repo.is_some() {
-                let show_chat = self.chat_open && self.selected.is_some();
-                let (sidebar_max, chat_max, _) = self.pane_widths(window, cx);
-                let main = self.render_main(window, cx);
-                let workspace = if show_chat {
-                    let chat = self.render_claude_panel(window, cx);
-                    h_resizable("chat-layout")
-                        .with_state(&self.chat_layout)
-                        .on_resize(cx.listener(|this, state, _, cx| {
-                            this.remember_layout(LayoutPanel::Chat, state, cx)
-                        }))
-                        .child(
-                            resizable_panel()
-                                .size_range(px(360.)..Pixels::MAX)
-                                .child(main),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size(px(self.repository_view().chat_width.min(chat_max)))
-                                .size_range(px(320.)..px(chat_max))
-                                .child(chat),
-                        )
-                        .into_any_element()
-                } else if self.selected.is_some() {
-                    let rail = self.render_chat_rail(window, cx);
-                    h_flex()
-                        .size_full()
-                        .child(div().flex_1().min_w_0().h_full().child(main))
-                        .child(rail)
-                        .into_any_element()
-                } else {
-                    main
-                };
-                if !self.repository_view().sidebar_open {
-                    h_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .child(self.render_sidebar_rail(cx))
-                        .child(div().flex_1().min_w_0().h_full().child(workspace))
-                        .into_any_element()
-                } else {
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(
-                            h_resizable("sidebar-layout")
-                                .with_state(&self.sidebar_layout)
-                                .on_resize(cx.listener(|this, state, _, cx| {
-                                    this.remember_layout(LayoutPanel::Sidebar, state, cx)
-                                }))
-                                .child(
-                                    resizable_panel()
-                                        .size(px(self
-                                            .repository_view()
-                                            .sidebar_width
-                                            .min(sidebar_max)))
-                                        .size_range(px(220.)..px(sidebar_max))
-                                        .child(self.render_sidebar(cx)),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .size_range(
-                                            px(if show_chat { 680. } else { 360. })..Pixels::MAX,
-                                        )
-                                        .child(workspace),
-                                ),
-                        )
-                        .into_any_element()
-                }
-            } else {
-                self.render_welcome(cx).into_any_element()
-            })
+            .child(self.render_body(window, cx))
             .child(self.render_status_bar(cx))
             .when(self.switcher.is_some(), |el| {
                 el.child(self.render_switcher(cx))

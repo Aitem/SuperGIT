@@ -395,10 +395,10 @@ impl SuperGitApp {
                         Err(error)=>rows.push((format!("{}: cleanup stopped. {error}",plan.path.display()),true)),
                     }
                 }
-                workspace::save_repository(&root,view,None);
+                workspace::save_repository(&root,view);
                 let same_repository=this.repo.as_ref().is_some_and(|repo| repo.root == root);
                 if same_repository {
-                    for path in &removed {this.chats.remove(path);this.active_chat.remove(path);this.review_views.remove(path);}
+                    for path in &removed {this.chats.remove(path);this.active_chat.remove(path);this.chat_projects.remove(path);this.review_views.remove(path);}
                     this.worktrees.retain(|info| !removed.contains(info.path()));
                 }
                 let errors=rows.iter().filter(|(_,error)| *error).count();
@@ -456,7 +456,7 @@ impl SuperGitApp {
                     view.pending_branch_cleanup
                         .retain(|item| item.deletion != pending);
                 }
-                workspace::save_repository(&pending.root, view, None);
+                workspace::save_repository(&pending.root, view);
                 let message = match error {
                     Some(error) => {
                         format!("Local branch '{}' was preserved: {error}", pending.branch)
@@ -484,7 +484,7 @@ impl SuperGitApp {
         if let Some(view) = self.persisted.repositories.get_mut(&pending.root) {
             view.pending_branch_cleanup
                 .retain(|item| item.deletion != pending);
-            workspace::save_repository(&pending.root, view, None);
+            workspace::save_repository(&pending.root, view);
             cx.notify();
         }
     }

@@ -7,6 +7,8 @@ pub enum Destination {
     Worktree,
     Conversation(String),
     Transcript(sg_agents::Session),
+    /// Another repository in the Projects panel (`Entry::path` is its root).
+    Project,
 }
 
 #[derive(Clone)]
