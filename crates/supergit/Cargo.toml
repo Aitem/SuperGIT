@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
+serde_json.workspace = true
 gpui-kit.workspace = true
 sg_git.workspace = true
 sg_github.workspace = true

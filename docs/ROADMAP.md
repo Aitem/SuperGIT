@@ -51,6 +51,9 @@ and the commits from a session.
 
 ## 8. App polish
 
-Open-repository dialog and recent repos, multiple repositories, `.app` bundle
-with icon, settings UI (terminal, editor, theme), FSEvents watcher instead of
-polling, command palette.
+Done in v0.1.1: open-repository dialog, recent repos, `.app` bundle with icon,
+login-shell environment for Dock launches.
+
+Next: several repositories at once (tabs or windows), settings UI (terminal,
+editor, theme), FSEvents watcher instead of polling, command palette, `~` in
+displayed paths.

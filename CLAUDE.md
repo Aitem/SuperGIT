@@ -29,7 +29,17 @@ cargo test --workspace              # unit + integration tests (temp git repos)
 cargo clippy --workspace --all-targets && cargo fmt --all
 cargo run -- --dump $SUPERGIT_TEST_REPO  # data layer as text, no window
 cargo run -- $SUPERGIT_TEST_REPO         # the app
+scripts/bundle-macos.sh --install   # SuperGIT.app → /Applications (ad-hoc signed)
+scripts/make-icon.sh                # regenerate assets/AppIcon.icns (Swift/AppKit)
 ```
+
+App-launch specifics (`main.rs`, `shell_env.rs`, `recent.rs`): a Dock launch
+has cwd `/` and launchd's minimal PATH, so `shell_env` imports the login
+shell's environment (only when `TERM` is unset) before any thread starts, and
+the last repository from `~/Library/Application Support/SuperGIT/recent.json`
+is reopened. Folders arrive via `on_open_urls` (Dock drop, `open -a`).
+To simulate a Dock launch: `cd / && env -i HOME=$HOME SHELL=$SHELL
+PATH=/usr/bin:/bin target/debug/supergit --dump`.
 
 ### Seeing the UI without screen access
 

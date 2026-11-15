@@ -6429,8 +6429,10 @@ name = "supergit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui-kit",
  "gpui-pre-platform",
+ "serde_json",
  "sg_agents",
  "sg_git",
  "sg_github",

@@ -29,6 +29,20 @@ Written in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates
 Requires macOS, [rustup](https://rustup.rs), `git`, and the
 [`gh` CLI](https://cli.github.com) (logged in) for pull requests.
 
+As a Mac app in `/Applications` (Dock, Spotlight, Launchpad):
+
+```sh
+scripts/bundle-macos.sh --install   # rebuild + reinstall after every pull/change
+```
+
+It is a local, ad-hoc signed build — no Apple developer account needed.
+Launched from the Dock it reopens the last repository; `cmd-o` opens another,
+**Recent** (`cmd-shift-o`) lists the previous ones. You can also drop a repo
+folder on the Dock icon or run `open -a SuperGIT ~/Work/myrepo`. The app takes
+`PATH` from your login shell, so `gh`/`claude` resolve as in a terminal.
+
+As a terminal command:
+
 ```sh
 cargo install --path crates/supergit
 ```

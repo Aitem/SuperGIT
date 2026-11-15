@@ -22,7 +22,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// PRs come from the network: refresh every Nth poll.
 const PR_POLL_EVERY: u64 = 20;
 
-actions!(supergit, [Refresh]);
+actions!(supergit, [Refresh, OpenRepository, CloseRepository]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainTab {
@@ -40,7 +40,9 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
-    repo: Repo,
+    /// `None` shows the welcome screen (e.g. first launch from the Dock).
+    repo: Option<Repo>,
+    recent: Vec<PathBuf>,
     launch_dir: PathBuf,
     terminal: TerminalApp,
     index: SharedSessionIndex,
@@ -71,7 +73,7 @@ pub struct SuperGitApp {
 
 impl SuperGitApp {
     pub fn new(
-        repo: Repo,
+        repo: Option<Repo>,
         launch_dir: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -92,6 +94,7 @@ impl SuperGitApp {
 
         let mut this = Self {
             repo,
+            recent: crate::recent::load(),
             launch_dir,
             terminal: TerminalApp::detect(),
             index: Default::default(),
@@ -123,12 +126,16 @@ impl SuperGitApp {
 
     /// (Re)start the refresh loop. Restarting refreshes immediately, PRs included.
     fn start_polling(&mut self, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            self.poll_task = None;
+            return;
+        }
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             let mut tick: u64 = 0;
             loop {
-                let Ok((repo, index)) =
-                    this.read_with(cx, |this, _| (this.repo.clone(), this.index.clone()))
-                else {
+                let Ok(Some((repo, index))) = this.read_with(cx, |this, _| {
+                    this.repo.clone().map(|r| (r, this.index.clone()))
+                }) else {
                     return;
                 };
                 let root = repo.root.clone();
@@ -314,6 +321,80 @@ impl SuperGitApp {
         }
     }
 
+    /// Open the repository containing `path` (from the dialog, a recent entry,
+    /// a folder dropped on the Dock icon or `open -a SuperGIT <dir>`).
+    pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let repo = match Repo::discover(&path) {
+            Ok(repo) => repo,
+            Err(e) => {
+                self.flash(format!("{e:#}"), true, cx);
+                return;
+            }
+        };
+        crate::recent::remember(&repo.root);
+        self.recent = crate::recent::load();
+        let same = self.repo.as_ref().is_some_and(|r| r.root == repo.root);
+        self.launch_dir = path;
+        if !same {
+            self.repo = Some(repo);
+            self.reset_view(cx);
+        } else {
+            self.selected = None; // re-pick the worktree containing `path`
+        }
+        self.message = None;
+        self.start_polling(cx);
+        cx.notify();
+    }
+
+    fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.worktrees.clear();
+        self.load_error = None;
+        self.prs.clear();
+        self.prs_error = None;
+        self.prs_loaded = false;
+        self.selected = None;
+        self.details = Details::default();
+        self.selected_commit = None;
+        self.confirm_remove = None;
+        self.details_task = None;
+        self.commit_task = None;
+        self.changes_diff
+            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        self.commit_diff
+            .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+    }
+
+    pub fn open_repository(&mut self, _: &OpenRepository, _: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Repository".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |this, cx| this.open_path(path, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Back to the welcome screen with the recent repositories.
+    pub fn close_repository(
+        &mut self,
+        _: &CloseRepository,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.repo = None;
+        self.poll_task = None;
+        self.reset_view(cx);
+        self.recent = crate::recent::load();
+        cx.notify();
+    }
+
     pub fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
         self.flash("Refreshing…", false, cx);
         self.start_polling(cx);
@@ -358,8 +439,11 @@ impl SuperGitApp {
             self.flash("Branch names cannot contain spaces", true, cx);
             return;
         }
-        let path = model::default_worktree_path(&self.repo, &branch);
-        let root = self.repo.root.clone();
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let path = model::default_worktree_path(&repo, &branch);
+        let root = repo.root.clone();
         let target = path.clone();
         self.branch_input
             .update(cx, |state, cx| state.set_value("", window, cx));
@@ -401,9 +485,12 @@ impl SuperGitApp {
             self.select_worktree(path, cx);
             return;
         }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
         let branch = pr.head_branch.clone();
-        let path = model::default_worktree_path(&self.repo, &branch);
-        let root = self.repo.root.clone();
+        let path = model::default_worktree_path(&repo, &branch);
+        let root = repo.root.clone();
         let target = path.clone();
         self.run_git_action(
             format!("Checking out #{} into a worktree", pr.number),
@@ -447,7 +534,9 @@ impl SuperGitApp {
             return;
         }
         let force = info.changed_files() > 0;
-        let root = self.repo.root.clone();
+        let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) else {
+            return;
+        };
         let name = info.wt.display_name();
         self.confirm_remove = None;
         self.selected = None;
@@ -487,11 +576,13 @@ impl SuperGitApp {
                     h_flex()
                         .gap_2()
                         .child(div().font_weight(FontWeight::BOLD).child("SuperGIT"))
-                        .child(
-                            div()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("· {}", self.repo.name())),
-                        ),
+                        .when_some(self.repo.as_ref().map(Repo::name), |el, name| {
+                            el.child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("· {name}")),
+                            )
+                        }),
                 )
                 .child(
                     h_flex()
@@ -509,6 +600,28 @@ impl SuperGitApp {
                                 div()
                                     .text_color(theme.warning)
                                     .child(format!("● {waiting} waiting for you")),
+                            )
+                        })
+                        .child(
+                            Button::new("open-repo")
+                                .label("Open…")
+                                .ghost()
+                                .small()
+                                .tooltip("Open another repository (cmd-o)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_repository(&OpenRepository, window, cx)
+                                })),
+                        )
+                        .when(self.repo.is_some(), |el| {
+                            el.child(
+                                Button::new("close-repo")
+                                    .label("Recent")
+                                    .ghost()
+                                    .small()
+                                    .tooltip("Switch to a recent repository (cmd-shift-o)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_repository(&CloseRepository, window, cx)
+                                    })),
                             )
                         })
                         .child(
@@ -1121,6 +1234,71 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let rows = self.recent.iter().enumerate().map(|(ix, root)| {
+            let path = root.clone();
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            v_flex()
+                .id(("recent", ix))
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|el| el.bg(theme.list_hover))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_path(path.clone(), cx)))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(root.display().to_string()),
+                )
+        });
+        div().flex_1().min_h_0().flex().justify_center().child(
+            v_flex()
+                .id("welcome")
+                .w(px(520.))
+                .pt(px(96.))
+                .gap_4()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_weight(FontWeight::BOLD)
+                        .child("SuperGIT"),
+                )
+                .child(
+                    div().text_color(theme.muted_foreground).child(
+                        "Worktrees, Claude sessions, commits and pull requests in one place.",
+                    ),
+                )
+                .child(
+                    h_flex().child(
+                        Button::new("welcome-open")
+                            .label("Open Repository…")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_repository(&OpenRepository, window, cx)
+                            })),
+                    ),
+                )
+                .when(!self.recent.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .pt_4()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("RECENT"),
+                    )
+                    .children(rows)
+                }),
+        )
+    }
+
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         h_flex()
@@ -1132,7 +1310,9 @@ impl SuperGitApp {
             .border_color(theme.border)
             .bg(theme.status_bar)
             .text_color(theme.muted_foreground)
-            .child(format!("{}", self.repo.root.display()))
+            .when_some(self.repo.as_ref(), |el, repo| {
+                el.child(repo.root.display().to_string())
+            })
             .child(div().flex_1())
             .when_some(self.message.clone(), |el, (msg, is_error)| {
                 el.child(
@@ -1157,14 +1337,19 @@ impl Render for SuperGitApp {
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::refresh))
+            .on_action(cx.listener(Self::open_repository))
+            .on_action(cx.listener(Self::close_repository))
             .child(self.render_title_bar(cx))
-            .child(
+            .child(if self.repo.is_some() {
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_main(window, cx)),
-            )
+                    .child(self.render_main(window, cx))
+                    .into_any_element()
+            } else {
+                self.render_welcome(cx).into_any_element()
+            })
             .child(self.render_status_bar(cx))
     }
 }

@@ -2,7 +2,7 @@
 //! the browser. Until the embedded terminal lands, Claude sessions run in the
 //! user's terminal app, started in the right worktree.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
@@ -150,4 +150,47 @@ pub fn reveal_in_finder(dir: &Path) -> Result<()> {
 
 pub fn open_url(url: &str) -> Result<()> {
     spawn(Command::new("open").arg(url))
+}
+
+/// `file:///Users/me/My%20Repo/` → `/Users/me/My Repo/`.
+pub fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let path = PathBuf::from(String::from_utf8(out).ok()?);
+    path.is_absolute().then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn decodes_file_urls() {
+        assert_eq!(
+            file_url_to_path("file:///Users/me/My%20Repo/"),
+            Some(PathBuf::from("/Users/me/My Repo/"))
+        );
+        assert_eq!(
+            file_url_to_path("file://localhost/tmp/%D1%80%D0%B5%D0%BF%D0%BE"),
+            Some(PathBuf::from("/tmp/репо"))
+        );
+        assert_eq!(file_url_to_path("https://example.com"), None);
+    }
 }
