@@ -18,6 +18,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -47,6 +48,7 @@ actions!(
         OpenRepository,
         CloseRepository,
         ToggleClaude,
+        ToggleSidebar,
         NewClaudeChat,
         OpenSwitcher,
         CloseSwitcher,
@@ -374,14 +376,17 @@ impl SuperGitApp {
         let show_chat = self.chat_open && self.selected.is_some();
         let sidebar_max = (total - if show_chat { 680. } else { 360. }).clamp(220., 520.);
         let saved = self.repository_view();
-        let sidebar = self
-            .sidebar_layout
-            .read(cx)
-            .sizes()
-            .first()
-            .map(|v| v.as_f32())
-            .unwrap_or(saved.sidebar_width)
-            .clamp(220., sidebar_max);
+        let sidebar = if saved.sidebar_open {
+            self.sidebar_layout
+                .read(cx)
+                .sizes()
+                .first()
+                .map(|v| v.as_f32())
+                .unwrap_or(saved.sidebar_width)
+                .clamp(220., sidebar_max)
+        } else {
+            RAIL_WIDTH
+        };
         let chat_max = (total - sidebar - 360.).clamp(320., 960.);
         let chat = if show_chat {
             self.chat_layout
@@ -391,6 +396,8 @@ impl SuperGitApp {
                 .map(|v| v.as_f32())
                 .unwrap_or(saved.chat_width)
                 .clamp(320., chat_max)
+        } else if self.selected.is_some() {
+            RAIL_WIDTH
         } else {
             0.
         };
@@ -1923,6 +1930,20 @@ impl SuperGitApp {
         cx.notify();
     }
 
+    /// Collapse the worktree list to a rail of status dots, or expand it
+    /// (remembered per repository).
+    pub fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = &self.repo else { return };
+        let view = self
+            .persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default();
+        view.sidebar_open = !view.sidebar_open;
+        self.queue_persist(cx);
+        cx.notify();
+    }
+
     fn active_chat_entity(&self) -> Option<Entity<ChatSession>> {
         let path = self.selected.as_ref()?;
         let list = self.chats.get(path)?;
@@ -2148,6 +2169,75 @@ impl SuperGitApp {
 
     // ---- rendering -------------------------------------------------------
 
+    /// The collapsed worktree list: one cell per worktree with its initials
+    /// and agent status dot (name in the tooltip), and a button to expand.
+    fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let cells = self.worktrees.iter().enumerate().map(|(ix, info)| {
+            let selected = self.selected.as_deref() == Some(info.path());
+            let path = info.wt.path.clone();
+            let name = info.wt.display_name();
+            let initials = initials(&name);
+            let agent = self.agent_state_for(info, cx);
+            let tooltip = match agent {
+                Some(state) => format!("{name} · claude {}", state.label()),
+                None => name,
+            };
+            v_flex()
+                .id(("rail-worktree", ix))
+                .w_full()
+                .py_1p5()
+                .gap_1()
+                .items_center()
+                .cursor_pointer()
+                .border_l_2()
+                .border_color(if selected {
+                    theme.primary
+                } else {
+                    transparent_black()
+                })
+                .when(selected, |el| el.bg(theme.sidebar_accent))
+                .hover(|el| el.bg(theme.sidebar_accent))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| this.select_worktree(path.clone(), cx)))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(initials),
+                )
+                .child(agent_dot(agent, &theme))
+        });
+        v_flex()
+            .w(px(RAIL_WIDTH))
+            .flex_none()
+            .h_full()
+            .bg(theme.sidebar)
+            .border_r_1()
+            .border_color(theme.sidebar_border)
+            .child(
+                h_flex().justify_center().py_1().child(
+                    Button::new("expand-sidebar")
+                        .icon(IconName::PanelLeftOpen)
+                        .xsmall()
+                        .ghost()
+                        .tooltip("Expand the worktree list (cmd-b)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_sidebar(&ToggleSidebar, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("worktree-rail")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(cells),
+            )
+            .into_any_element()
+    }
+
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let indicators =
             [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
@@ -2304,9 +2394,24 @@ impl SuperGitApp {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(format!("WORKTREES · {}", self.worktrees.len()))
-                    .when_some(self.load_error.clone(), |el, e| {
-                        el.child(div().text_color(theme.danger).truncate().child(e))
-                    }),
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .when_some(self.load_error.clone(), |el, e| {
+                                el.child(div().text_color(theme.danger).truncate().child(e))
+                            })
+                            .child(
+                                Button::new("collapse-sidebar")
+                                    .icon(IconName::PanelLeftClose)
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip("Collapse the worktree list (cmd-b)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_sidebar(&ToggleSidebar, window, cx)
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 v_flex()
@@ -3906,6 +4011,102 @@ impl SuperGitApp {
         }
     }
 
+    /// Open the Claude panel on the selected worktree's conversation `ix`.
+    fn open_chat_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        self.active_chat.insert(path, ix);
+        self.chat_open = true;
+        if let Some(chat) = self.active_chat_entity() {
+            let input = chat.read(cx).input();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+        self.queue_persist(cx);
+        cx.notify();
+    }
+
+    /// The collapsed Claude panel: a button to expand it, one ✦ per
+    /// conversation of the selected worktree colored by its state (title in
+    /// the tooltip; clicking opens it), and a new-conversation button.
+    fn render_chat_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let path = self.selected.clone().unwrap_or_default();
+        self.ensure_chats(&path, window, cx);
+        let theme = cx.theme().clone();
+        let chats = self.chats.get(&path).cloned().unwrap_or_default();
+        let active = self.active_chat.get(&path).copied().unwrap_or(0);
+        let cells = chats.iter().enumerate().map(|(ix, chat)| {
+            let c = chat.read(cx);
+            let kind = c.attention().kind;
+            let tooltip = if kind == Kind::Idle {
+                c.title()
+            } else {
+                format!("{} · {}", c.title(), kind.label())
+            };
+            div()
+                .id(("rail-chat", ix))
+                .w_full()
+                .py_1p5()
+                .flex()
+                .justify_center()
+                .cursor_pointer()
+                .border_r_2()
+                .border_color(if ix == active {
+                    theme.primary
+                } else {
+                    transparent_black()
+                })
+                .hover(|el| el.bg(theme.list_hover))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| this.open_chat_at(ix, window, cx)))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(attention_color(kind, &theme))
+                        .child("✦"),
+                )
+        });
+        v_flex()
+            .w(px(RAIL_WIDTH))
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .child(
+                h_flex().justify_center().py_1().child(
+                    Button::new("expand-chat")
+                        .icon(IconName::PanelRightOpen)
+                        .xsmall()
+                        .ghost()
+                        .tooltip("Expand the Claude panel (cmd-l)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_claude(&ToggleClaude, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("chat-rail")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(cells)
+                    .child(
+                        h_flex().justify_center().py_1().child(
+                            Button::new("rail-chat-new")
+                                .label("+")
+                                .xsmall()
+                                .ghost()
+                                .tooltip("New conversation (cmd-n)")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
+                                ),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
@@ -4018,10 +4219,10 @@ impl SuperGitApp {
                     )
                     .child(
                         Button::new("chat-hide")
-                            .label("⇥")
+                            .icon(IconName::PanelRightClose)
                             .xsmall()
                             .ghost()
-                            .tooltip("Hide the Claude panel (cmd-l)")
+                            .tooltip("Collapse the Claude panel (cmd-l)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_claude(&ToggleClaude, window, cx)
                             })),
@@ -4157,6 +4358,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::open_repository))
             .on_action(cx.listener(Self::close_repository))
             .on_action(cx.listener(Self::toggle_claude))
+            .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::new_chat_action))
             .on_action(cx.listener(Self::update_creation_base))
             .on_action(cx.listener(Self::open_switcher))
@@ -4189,33 +4391,52 @@ impl Render for SuperGitApp {
                                 .child(chat),
                         )
                         .into_any_element()
+                } else if self.selected.is_some() {
+                    let rail = self.render_chat_rail(window, cx);
+                    h_flex()
+                        .size_full()
+                        .child(div().flex_1().min_w_0().h_full().child(main))
+                        .child(rail)
+                        .into_any_element()
                 } else {
                     main
                 };
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        h_resizable("sidebar-layout")
-                            .with_state(&self.sidebar_layout)
-                            .on_resize(cx.listener(|this, state, _, cx| {
-                                this.remember_layout(LayoutPanel::Sidebar, state, cx)
-                            }))
-                            .child(
-                                resizable_panel()
-                                    .size(px(self.repository_view().sidebar_width.min(sidebar_max)))
-                                    .size_range(px(220.)..px(sidebar_max))
-                                    .child(self.render_sidebar(cx)),
-                            )
-                            .child(
-                                resizable_panel()
-                                    .size_range(
-                                        px(if show_chat { 680. } else { 360. })..Pixels::MAX,
-                                    )
-                                    .child(workspace),
-                            ),
-                    )
-                    .into_any_element()
+                if !self.repository_view().sidebar_open {
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_sidebar_rail(cx))
+                        .child(div().flex_1().min_w_0().h_full().child(workspace))
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            h_resizable("sidebar-layout")
+                                .with_state(&self.sidebar_layout)
+                                .on_resize(cx.listener(|this, state, _, cx| {
+                                    this.remember_layout(LayoutPanel::Sidebar, state, cx)
+                                }))
+                                .child(
+                                    resizable_panel()
+                                        .size(px(self
+                                            .repository_view()
+                                            .sidebar_width
+                                            .min(sidebar_max)))
+                                        .size_range(px(220.)..px(sidebar_max))
+                                        .child(self.render_sidebar(cx)),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .size_range(
+                                            px(if show_chat { 680. } else { 360. })..Pixels::MAX,
+                                        )
+                                        .child(workspace),
+                                ),
+                        )
+                        .into_any_element()
+                }
             } else {
                 self.render_welcome(cx).into_any_element()
             })
@@ -4257,6 +4478,30 @@ fn attention_color(kind: Kind, theme: &gpui_kit::component::Theme) -> Hsla {
         Kind::Running => theme.blue,
         Kind::Idle => theme.muted_foreground,
     }
+}
+
+/// Width of a collapsed side panel (worktree list, Claude panel).
+const RAIL_WIDTH: f32 = 48.;
+
+/// Two letters for a worktree in the collapsed list: the first letters of
+/// the first two words (`claude-auto-mode` → `CA`), else the name's first
+/// two letters (`main` → `Ma`).
+fn initials(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(['-', '_', '/', '.', ' '])
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut out = String::new();
+    if words.len() >= 2 {
+        for word in &words[..2] {
+            out.extend(word.chars().next().into_iter().flat_map(char::to_uppercase));
+        }
+    } else {
+        let mut chars = name.chars();
+        out.extend(chars.next().into_iter().flat_map(char::to_uppercase));
+        out.extend(chars.next());
+    }
+    out
 }
 
 fn agent_dot(state: Option<AgentState>, theme: &gpui_kit::component::Theme) -> impl IntoElement {
@@ -4639,7 +4884,17 @@ fn pr_row(
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's glob import brings its own `test` attribute.
-    use super::{DiffFile, FileState, commit_file, reflow};
+    use super::{DiffFile, FileState, commit_file, initials, reflow};
+
+    #[test]
+    fn rail_initials() {
+        assert_eq!(initials("main"), "Ma");
+        assert_eq!(initials("FaceLifting"), "Fa");
+        assert_eq!(initials("Claude-Auto-mode"), "CA");
+        assert_eq!(initials("feat/keyboard-switcher"), "FK");
+        assert_eq!(initials("x"), "X");
+        assert_eq!(initials(""), "");
+    }
 
     #[test]
     fn commit_bodies_reflow_paragraphs_but_keep_lists_and_trailers() {
