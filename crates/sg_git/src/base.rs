@@ -174,19 +174,8 @@ fn validate_checkout(worktree: &Worktree) -> Result<()> {
         status(&worktree.path)?.is_clean(),
         "Base worktree has local changes; commit or handle them before updating"
     );
-    let directory = PathBuf::from(git(&worktree.path, ["rev-parse", "--absolute-git-dir"])?.trim());
-    for marker in [
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "rebase-merge",
-        "rebase-apply",
-        "index.lock",
-    ] {
-        ensure!(
-            !directory.join(marker).exists(),
-            "Base worktree has an unfinished Git operation ({marker})"
-        );
+    if let Some(marker) = crate::rebase::unfinished_operation(&worktree.path)? {
+        anyhow::bail!("Base worktree has an unfinished Git operation ({marker})");
     }
     Ok(())
 }

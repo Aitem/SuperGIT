@@ -12,7 +12,10 @@ use crate::model;
 
 pub fn run(repo: &Repo) -> Result<()> {
     let index = Arc::new(Mutex::new(SessionIndex::new()));
-    let worktrees = model::load_worktrees(repo, &index)?;
+    let base = sg_git::load_base(&repo.root, None)
+        .ok()
+        .and_then(|base| base.branch);
+    let worktrees = model::load_worktrees(repo, &index, base.as_deref())?;
     let prs = if sg_github::gh_available() {
         sg_github::list_prs(&repo.root, 100, 20).map_err(|e| e.to_string())
     } else {
@@ -35,12 +38,16 @@ pub fn run(repo: &Repo) -> Result<()> {
             ),
             Err(e) => format!("status error: {e}"),
         };
+        let behind = match (&base, info.behind_base) {
+            (Some(base), Some(n)) if n > 0 => format!("  {n} behind {base}"),
+            _ => String::new(),
+        };
         let agent = info
             .agent_state()
             .map(|a| format!("  claude: {}", a.label()))
             .unwrap_or_default();
         println!(
-            "  {}{}  {}  ({}){agent}",
+            "  {}{}  {}{behind}  ({}){agent}",
             info.wt.display_name(),
             if info.wt.is_main { " [main]" } else { "" },
             st,

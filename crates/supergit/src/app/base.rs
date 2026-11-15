@@ -147,6 +147,165 @@ impl SuperGitApp {
         }));
     }
 
+    /// The local branch worktrees rebase onto: the base new worktrees start from.
+    pub(super) fn rebase_base(&self) -> Option<String> {
+        let info = self.creation_base.value()?;
+        info.tip.as_ref()?;
+        info.branch.clone()
+    }
+
+    /// Why `info` cannot be rebased onto `base` right now.
+    fn rebase_blocker(&self, info: &WorktreeInfo, base: &str, cx: &App) -> Option<String> {
+        let Ok(status) = &info.status else {
+            return Some("its status is unavailable".into());
+        };
+        if self.action_task.is_some() || self.cleanup_task.is_some() {
+            return Some("another Git operation is in progress".into());
+        }
+        if self.cleanup_paths.contains(info.path()) || self.base_update_paths.contains(info.path())
+        {
+            return Some("a Git operation is in progress here".into());
+        }
+        if status
+            .files
+            .iter()
+            .any(|file| file.unstaged != Some(FileState::Untracked))
+        {
+            return Some("commit or discard its changes first".into());
+        }
+        if self.worktree_busy(info, cx) {
+            return Some("Claude is working here; wait until it finishes".into());
+        }
+        match info.behind_base {
+            Some(0) => Some(format!("already up to date with {base}")),
+            Some(_) => None,
+            None => Some("checking how far it is behind…".into()),
+        }
+    }
+
+    /// Rebase a worktree's branch onto the sidebar's base. Conflicts abort the
+    /// rebase in `sg_git`, so the branch ends up rebased or untouched.
+    pub(super) fn rebase_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(base) = self.rebase_base() else {
+            self.flash(
+                "Base is unavailable. Refresh and choose a local branch",
+                true,
+                cx,
+            );
+            return;
+        };
+        let Some(info) = self.worktrees.iter().find(|info| info.path() == path) else {
+            return;
+        };
+        let branch = info
+            .wt
+            .branch
+            .clone()
+            .unwrap_or_else(|| info.wt.display_name());
+        if let Some(reason) = self.rebase_blocker(info, &base, cx) {
+            self.flash(format!("Cannot rebase {branch}: {reason}"), true, cx);
+            return;
+        }
+        let Some(head) = info
+            .status
+            .as_ref()
+            .ok()
+            .and_then(|status| status.head_oid.clone())
+        else {
+            return;
+        };
+        let Some(root) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
+            return;
+        };
+        self.base_update_paths.insert(path.clone());
+        for chat in self.chats.get(&path).into_iter().flatten() {
+            chat.update(cx, |chat, cx| chat.set_git_busy(true, cx));
+        }
+        self.flash(format!("Rebasing {branch} onto {base}…"), false, cx);
+        let request = (path.clone(), base.clone());
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let (path, base) = request;
+                    sg_git::rebase_onto(&path, &base, &head).map_err(model::git_error_message)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.action_task = None;
+                this.base_update_paths.remove(&path);
+                for chat in this.chats.get(&path).into_iter().flatten() {
+                    chat.update(cx, |chat, cx| chat.set_git_busy(false, cx));
+                }
+                if this.repo.as_ref().is_some_and(|repo| repo.root == root) {
+                    match result {
+                        Ok(sg_git::RebaseOutcome::UpToDate) => {
+                            this.flash(format!("{branch} already contains {base}"), false, cx)
+                        }
+                        Ok(sg_git::RebaseOutcome::Rebased { commits: 0 }) => {
+                            this.flash(format!("{branch} fast-forwarded to {base}"), false, cx)
+                        }
+                        Ok(sg_git::RebaseOutcome::Rebased { commits }) => this.flash(
+                            format!(
+                                "Rebased {branch} onto {base}: {commits} commit{} replayed",
+                                if commits == 1 { "" } else { "s" }
+                            ),
+                            false,
+                            cx,
+                        ),
+                        Err(error) => {
+                            this.flash(format!("Rebase {branch} stopped: {error}"), true, cx)
+                        }
+                    }
+                }
+                this.start_polling(cx);
+            });
+        }));
+        cx.notify();
+    }
+
+    /// The row's "Rebase" button: every worktree on a branch other than the
+    /// base gets one; the tooltip says what it would do or why it cannot.
+    pub(super) fn render_rebase_button(
+        &self,
+        ix: usize,
+        info: &WorktreeInfo,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let base = self.rebase_base()?;
+        let branch = info.wt.branch.clone()?;
+        if branch == base || info.status.is_err() {
+            return None;
+        }
+        let running = self.base_update_paths.contains(info.path());
+        let blocker = self.rebase_blocker(info, &base, cx);
+        let tooltip = match (&blocker, info.behind_base) {
+            _ if running => format!("Rebasing {branch} onto {base}…"),
+            (Some(reason), _) => format!("Rebase onto {base}: {reason}"),
+            (None, behind) => {
+                let behind = behind.unwrap_or_default();
+                format!(
+                    "Rebase {branch} onto {base} ({behind} new commit{} on {base}). Conflicts abort the rebase and leave the branch unchanged",
+                    if behind == 1 { "" } else { "s" }
+                )
+            }
+        };
+        let path = info.wt.path.clone();
+        Some(
+            Button::new(("worktree-rebase", ix))
+                .label(if running { "Rebasing…" } else { "Rebase" })
+                .xsmall()
+                .ghost()
+                .tooltip(tooltip)
+                .disabled(running || blocker.is_some())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.rebase_worktree(path.clone(), cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn render_creation_base(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let info = self.creation_base.value();

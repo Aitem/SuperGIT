@@ -1111,14 +1111,15 @@ impl SuperGitApp {
         }
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                let Ok(Some((repo, index))) = this.read_with(cx, |this, _| {
-                    this.repo.clone().map(|r| (r, this.index.clone()))
+                let Ok(Some((repo, index, base))) = this.read_with(cx, |this, _| {
+                    let base = this.rebase_base();
+                    this.repo.clone().map(|r| (r, this.index.clone(), base))
                 }) else {
                     return;
                 };
                 let result = cx
                     .background_executor()
-                    .spawn(async move { model::load_worktrees(&repo, &index) })
+                    .spawn(async move { model::load_worktrees(&repo, &index, base.as_deref()) })
                     .await;
                 if this
                     .update(cx, |this, cx| this.apply_worktrees(result, cx))
@@ -2613,6 +2614,9 @@ impl SuperGitApp {
                                 .text_color(agent_color(a, theme))
                                 .child(format!("Claude {} (estimated)", a.label())),
                         )
+                    })
+                    .when_some(self.render_rebase_button(ix, info, cx), |el, button| {
+                        el.child(div().flex_1()).child(button)
                     }),
             )
             .child(
