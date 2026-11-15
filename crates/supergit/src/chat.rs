@@ -185,6 +185,10 @@ impl ChatSession {
         self.convo.status
     }
 
+    pub fn local_id(&self) -> &str {
+        &self.local_id
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.convo.session_id.as_deref()
     }

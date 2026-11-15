@@ -21,6 +21,7 @@ use crate::chat::ChatSession;
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::settings::Appearance;
+use crate::switcher::{self, Destination, Entry};
 use crate::workspace::{self, RepositoryView, ReviewPosition, WindowRect};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -34,7 +35,11 @@ actions!(
         OpenRepository,
         CloseRepository,
         ToggleClaude,
-        NewClaudeChat
+        NewClaudeChat,
+        OpenSwitcher,
+        CloseSwitcher,
+        SwitcherNext,
+        SwitcherPrevious
     ]
 );
 
@@ -83,6 +88,13 @@ struct ReviewView {
     commit_diff: Entity<DiffState>,
 }
 
+struct Switcher {
+    previous_focus: Option<FocusHandle>,
+    entries: Vec<Entry>,
+    selected: usize,
+    scroll: ScrollHandle,
+}
+
 const TABS: [MainTab; 4] = [
     MainTab::Changes,
     MainTab::History,
@@ -91,6 +103,8 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    switcher_input: Entity<InputState>,
+    switcher: Option<Switcher>,
     /// `None` shows the welcome screen (e.g. first launch from the Dock).
     repo: Option<Repo>,
     recent: Vec<PathBuf>,
@@ -149,6 +163,18 @@ impl SuperGitApp {
     ) -> Self {
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("new branch → worktree"));
+        let switcher_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Branch, PR number or conversation…")
+        });
+        let switcher_subscription = cx.subscribe_in(
+            &switcher_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.filter_switcher(cx),
+                InputEvent::PressEnter { .. } => this.accept_switcher(window, cx),
+                _ => {}
+            },
+        );
         let subscription = cx.subscribe_in(
             &branch_input,
             window,
@@ -187,6 +213,8 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            switcher_input,
+            switcher: None,
             repo,
             recent: crate::recent::load(),
             launch_dir,
@@ -227,6 +255,7 @@ impl SuperGitApp {
             action_task: None,
             _subscriptions: vec![
                 subscription,
+                switcher_subscription,
                 appearance_subscription,
                 quit_subscription,
                 release_subscription,
@@ -515,6 +544,302 @@ impl SuperGitApp {
         self.queue_persist(cx);
     }
 
+    fn navigation_entries(&self, cx: &App) -> Vec<Entry> {
+        let mut entries = Vec::new();
+        for info in self
+            .worktrees
+            .iter()
+            .filter(|info| info.path().is_dir() && !info.wt.is_bare && info.wt.prunable.is_none())
+        {
+            let path = info.wt.path.clone();
+            let branch = info.wt.branch.as_deref().unwrap_or("Detached HEAD");
+            let pr = self
+                .pr_for_branch(info.wt.branch.as_deref())
+                .map(|pr| format!(" #{} {}", pr.number, pr.title))
+                .unwrap_or_default();
+            let detail = path.display().to_string();
+            let search = format!("{branch}{pr} {detail}");
+            entries.push(Entry {
+                key: format!("worktree:{}", path.display()),
+                path: path.clone(),
+                title: format!("{branch}{pr}"),
+                detail: format!("Worktree · {detail}"),
+                search: search.clone(),
+                destination: Destination::Worktree,
+            });
+            let mut opened_sessions = std::collections::HashSet::new();
+            if let Some(chats) = self.chats.get(&path) {
+                for chat in chats {
+                    let chat = chat.read(cx);
+                    if let Some(id) = chat.session_id() {
+                        opened_sessions.insert(id.to_string());
+                    }
+                    entries.push(Entry {
+                        key: format!("chat:{}:{}", path.display(), chat.local_id()),
+                        path: path.clone(),
+                        title: chat.title(),
+                        detail: format!("Claude · {branch} · {}", path.display()),
+                        search: format!("{} {search} claude", chat.title()),
+                        destination: Destination::Conversation(chat.local_id().into()),
+                    });
+                }
+            } else if let Some(chats) = self.repository_view().conversations.get(&path) {
+                for chat in chats
+                    .iter()
+                    .filter(|c| c.provider.is_empty() || c.provider == "claude")
+                {
+                    if let Some(id) = &chat.session_id {
+                        opened_sessions.insert(id.clone());
+                    }
+                    entries.push(Entry {
+                        key: format!("chat:{}:{}", path.display(), chat.local_id),
+                        path: path.clone(),
+                        title: chat.title.clone(),
+                        detail: format!("Claude · {branch} · {}", path.display()),
+                        search: format!("{} {search} claude", chat.title),
+                        destination: Destination::Conversation(chat.local_id.clone()),
+                    });
+                }
+            }
+            for session in info
+                .sessions
+                .iter()
+                .filter(|s| !opened_sessions.contains(&s.id))
+            {
+                entries.push(Entry {
+                    key: format!("session:claude:{}", session.id),
+                    path: path.clone(),
+                    title: session.title.clone(),
+                    detail: format!("Claude · {branch} · {}", path.display()),
+                    search: format!("{} {search} claude", session.title),
+                    destination: Destination::Transcript(session.clone()),
+                });
+            }
+        }
+        entries
+    }
+
+    fn remember_target(&mut self, key: String, cx: &mut Context<Self>) {
+        if let Some(repo) = &self.repo {
+            let recent = &mut self
+                .persisted
+                .repositories
+                .entry(repo.root.clone())
+                .or_default()
+                .recent_targets;
+            recent.retain(|previous| previous != &key);
+            recent.insert(0, key);
+            recent.truncate(50);
+            self.queue_persist(cx);
+        }
+    }
+
+    fn open_switcher(&mut self, _: &OpenSwitcher, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_some() {
+            return;
+        }
+        self.switcher = Some(Switcher {
+            previous_focus: window.focused(cx),
+            entries: Vec::new(),
+            selected: 0,
+            scroll: ScrollHandle::new(),
+        });
+        self.switcher_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        self.filter_switcher(cx);
+    }
+
+    fn filter_switcher(&mut self, cx: &mut Context<Self>) {
+        let entries = switcher::ranked(
+            &self.navigation_entries(cx),
+            &self.switcher_input.read(cx).value(),
+            &self.repository_view().recent_targets,
+        );
+        if let Some(switcher) = &mut self.switcher {
+            switcher.entries = entries;
+            switcher.selected = 0;
+            switcher.scroll.scroll_to_item(0);
+            cx.notify();
+        }
+    }
+
+    fn close_switcher(&mut self, _: &CloseSwitcher, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(switcher) = self.switcher.take() {
+            if let Some(focus) = switcher.previous_focus {
+                focus.focus(window, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn move_switcher(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(switcher) = &mut self.switcher {
+            if switcher.entries.is_empty() {
+                return;
+            }
+            switcher.selected = (switcher.selected as isize + delta)
+                .rem_euclid(switcher.entries.len() as isize)
+                as usize;
+            switcher.scroll.scroll_to_item(switcher.selected);
+            cx.notify();
+        }
+    }
+
+    fn switcher_next(&mut self, _: &SwitcherNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_switcher(1, cx);
+    }
+
+    fn switcher_previous(&mut self, _: &SwitcherPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_switcher(-1, cx);
+    }
+
+    fn accept_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = self
+            .switcher
+            .as_ref()
+            .and_then(|switcher| switcher.entries.get(switcher.selected))
+            .cloned();
+        let Some(entry) = entry else {
+            return;
+        };
+        self.close_switcher(&CloseSwitcher, window, cx);
+        // A worktree can disappear between the search and Return.
+        if !entry.path.is_dir() || !self.worktrees.iter().any(|info| info.path() == entry.path) {
+            self.flash(
+                "This worktree is no longer available. Refresh and try again.",
+                true,
+                cx,
+            );
+            return;
+        }
+        self.select_worktree(entry.path.clone(), cx);
+        match entry.destination {
+            Destination::Worktree => {}
+            Destination::Conversation(id) => {
+                self.ensure_chats(&entry.path, window, cx);
+                if let Some(ix) = self
+                    .chats
+                    .get(&entry.path)
+                    .and_then(|chats| chats.iter().position(|chat| chat.read(cx).local_id() == id))
+                {
+                    self.active_chat.insert(entry.path, ix);
+                    self.chat_open = true;
+                    if let Some(chat) = self.active_chat_entity() {
+                        chat.read(cx)
+                            .input()
+                            .update(cx, |input, cx| input.focus(window, cx));
+                    }
+                }
+            }
+            Destination::Transcript(session) => self.open_session_chat(session, window, cx),
+        }
+        self.remember_target(entry.key, cx);
+        cx.notify();
+    }
+
+    fn render_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(switcher) = &self.switcher else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let rows = switcher.entries.iter().enumerate().map(|(ix, entry)| {
+            v_flex()
+                .id(("switcher-entry", ix))
+                .px_3()
+                .py_2()
+                .gap_1()
+                .cursor_pointer()
+                .bg(if ix == switcher.selected {
+                    theme.list_active
+                } else {
+                    theme.background
+                })
+                .hover(|el| el.bg(theme.list_hover))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(switcher) = &mut this.switcher {
+                        switcher.selected = ix;
+                    }
+                    this.accept_switcher(window, cx);
+                }))
+                .child(div().truncate().child(entry.title.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(entry.detail.clone()),
+                )
+        });
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(64.))
+            .bg(gpui_kit::black().opacity(0.35))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.close_switcher(&CloseSwitcher, window, cx);
+                }),
+            )
+            .child(
+                v_flex()
+                    .key_context("Switcher")
+                    .w(px(620.))
+                    .max_w_full()
+                    .h_auto()
+                    .bg(theme.background)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_action(cx.listener(Self::close_switcher))
+                    .on_action(cx.listener(Self::switcher_next))
+                    .on_action(cx.listener(Self::switcher_previous))
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "up" => this.move_switcher(-1, cx),
+                            "down" => this.move_switcher(1, cx),
+                            "escape" => this.close_switcher(&CloseSwitcher, window, cx),
+                            "enter" => this.accept_switcher(window, cx),
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .child(div().p_2().child(Input::new(&self.switcher_input)))
+                    .child(
+                        v_flex()
+                            .id("switcher-results")
+                            .max_h(px(400.))
+                            .overflow_y_scroll()
+                            .track_scroll(&switcher.scroll)
+                            .children(rows)
+                            .when(switcher.entries.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .p_4()
+                                        .text_color(theme.muted_foreground)
+                                        .child("No matching worktrees or conversations"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("↑ ↓ Navigate    Return Open    Esc Cancel"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     // ---- data flow -------------------------------------------------------
 
     /// (Re)start the refresh loop. Restarting refreshes immediately, PRs included.
@@ -632,6 +957,25 @@ impl SuperGitApp {
     /// session in the panel, `SUPERGIT_DEBUG_CHAT=prompt:<text>` sends a turn.
     #[cfg(feature = "screenshot")]
     fn debug_chat_once(&mut self, cx: &mut Context<Self>) {
+        if let Ok(query) = std::env::var("SUPERGIT_DEBUG_SWITCHER")
+            && std::env::var_os("SUPERGIT_DEBUG_SWITCHER_DONE").is_none()
+        {
+            // SAFETY: isolated screenshot builds only, on the main thread.
+            unsafe { std::env::set_var("SUPERGIT_DEBUG_SWITCHER_DONE", "1") };
+            if let Some(window) = cx.windows().first().copied() {
+                let this = cx.entity();
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.open_switcher(&OpenSwitcher, window, cx);
+                            this.switcher_input
+                                .update(cx, |input, cx| input.set_value(query, window, cx));
+                            this.filter_switcher(cx);
+                        });
+                    });
+                });
+            }
+        }
         let Ok(spec) = std::env::var("SUPERGIT_DEBUG_CHAT") else {
             return;
         };
@@ -775,6 +1119,7 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.remember_target(format!("worktree:{}", path.display()), cx);
         if self.selected.as_ref() == Some(&path) {
             return;
         }
@@ -1263,6 +1608,16 @@ impl SuperGitApp {
                     h_flex()
                         .gap_3()
                         .text_xs()
+                        .child(
+                            Button::new("open-switcher")
+                                .label("Switch…")
+                                .small()
+                                .ghost()
+                                .tooltip("Switch worktree or conversation (cmd-p)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_switcher(&OpenSwitcher, window, cx)
+                                })),
+                        )
                         .when(working > 0, |el| {
                             el.child(
                                 div()
@@ -1889,6 +2244,7 @@ impl SuperGitApp {
             .into_any_element();
         v_flex()
             .size_full()
+            .relative()
             .children(notice)
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
@@ -2148,13 +2504,12 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let path = self.selected.clone().unwrap_or_default();
+    fn ensure_chats(&mut self, path: &PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // Every worktree gets a ready-to-type conversation; the `claude`
         // process only starts with the first message.
-        if !self.chats.contains_key(&path) {
+        if !self.chats.contains_key(path) {
             let saved = self.repository_view().clone();
-            let conversations = saved.conversations.get(&path).cloned().unwrap_or_default();
+            let conversations = saved.conversations.get(path).cloned().unwrap_or_default();
             let mut restored = Vec::new();
             for conversation in conversations
                 .iter()
@@ -2174,7 +2529,7 @@ impl SuperGitApp {
                     path.clone(),
                     saved
                         .active_conversations
-                        .get(&path)
+                        .get(path)
                         .copied()
                         .unwrap_or(0)
                         .min(restored.len() - 1),
@@ -2182,7 +2537,7 @@ impl SuperGitApp {
                 self.chats.insert(path.clone(), restored);
             }
         }
-        if self.chats.get(&path).is_none_or(Vec::is_empty) {
+        if self.chats.get(path).is_none_or(Vec::is_empty) {
             let chat = cx.new(|cx| ChatSession::new(path.clone(), window, cx));
             cx.observe(&chat, |this, _, cx| {
                 this.queue_persist(cx);
@@ -2192,6 +2547,11 @@ impl SuperGitApp {
             self.chats.insert(path.clone(), vec![chat]);
             self.active_chat.insert(path.clone(), 0);
         }
+    }
+
+    fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let path = self.selected.clone().unwrap_or_default();
+        self.ensure_chats(&path, window, cx);
         let theme = cx.theme().clone();
         let chats = self.chats.get(&path).cloned().unwrap_or_default();
         let active = self
@@ -2404,6 +2764,7 @@ impl Render for SuperGitApp {
         let theme = cx.theme().clone();
         v_flex()
             .size_full()
+            .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::refresh))
@@ -2411,6 +2772,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::close_repository))
             .on_action(cx.listener(Self::toggle_claude))
             .on_action(cx.listener(Self::new_chat_action))
+            .on_action(cx.listener(Self::open_switcher))
             .child(self.render_title_bar(cx))
             .child(if self.repo.is_some() {
                 let show_chat = self.chat_open && self.selected.is_some();
@@ -2466,6 +2828,9 @@ impl Render for SuperGitApp {
                 self.render_welcome(cx).into_any_element()
             })
             .child(self.render_status_bar(cx))
+            .when(self.switcher.is_some(), |el| {
+                el.child(self.render_switcher(cx))
+            })
     }
 }
 
