@@ -85,6 +85,48 @@ fn parse_log(out: &str) -> Vec<Commit> {
         .collect()
 }
 
+/// One commit with what its card shows beyond the list row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitDetails {
+    pub commit: Commit,
+    /// The message after the subject line, trailers included.
+    pub body: String,
+    /// Author date in local time, `2026-11-15 17:52`.
+    pub date: String,
+    pub committer: String,
+    pub committer_email: String,
+}
+
+/// The commit `sha` with its full message, for the commit card.
+pub fn commit_details(path: &Path, sha: &str) -> Result<CommitDetails> {
+    let commit = log(path, sha, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("commit {sha} not found"))?;
+    let format = format!("--format=%ad{FIELD}%cn{FIELD}%ce{FIELD}%b");
+    let out = git(
+        path,
+        [
+            "show",
+            "-s",
+            "--date=format-local:%Y-%m-%d %H:%M",
+            &format,
+            sha,
+            "--",
+        ],
+    )?;
+    let mut fields = out.splitn(4, FIELD);
+    let mut next = || fields.next().unwrap_or_default().to_string();
+    let (date, committer, committer_email, body) = (next(), next(), next(), next());
+    Ok(CommitDetails {
+        commit,
+        body: body.trim_end().to_string(),
+        date: date.trim().to_string(),
+        committer,
+        committer_email,
+    })
+}
+
 /// How far a worktree's branch has gone since it forked from the base branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fork {

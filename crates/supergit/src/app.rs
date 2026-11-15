@@ -18,7 +18,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_agents::{AgentState, Session};
-use sg_git::{Commit, FileChange, FileState, Repo, relative_time};
+use sg_git::{Commit, CommitDetails, FileChange, FileState, Repo, relative_time};
 use sg_github::{PrState, PullRequest};
 
 use crate::chat::ChatSession;
@@ -146,6 +146,8 @@ pub struct SuperGitApp {
     selected_commit: Option<String>,
     commit_diff: Entity<DiffState>,
     commit_patch: LoadState<String>,
+    /// The selected commit's card (full message, dates); matched by sha.
+    commit_details: Option<CommitDetails>,
     details_generation: u64,
     commit_generation: u64,
 
@@ -272,6 +274,7 @@ impl SuperGitApp {
             selected_commit: None,
             commit_diff,
             commit_patch: LoadState::Loading,
+            commit_details: None,
             details_generation: 0,
             commit_generation: 0,
             branch_input,
@@ -1256,11 +1259,14 @@ impl SuperGitApp {
         self.commit_task = Some(cx.spawn(async move |this, cx| {
             let request_path = path.clone();
             let request_sha = sha.clone();
-            let patch = cx
+            let (patch, details) = cx
                 .background_executor()
                 .spawn(async move {
-                    sg_git::commit_patch(&request_path, &request_sha)
-                        .map_err(model::git_error_message)
+                    let patch = sg_git::commit_patch(&request_path, &request_sha)
+                        .map_err(model::git_error_message);
+                    // The card is extra: without it the diff still shows.
+                    let details = sg_git::commit_details(&request_path, &request_sha).ok();
+                    (patch, details)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1278,6 +1284,7 @@ impl SuperGitApp {
                     Ok(patch)
                 });
                 this.commit_patch.update(LoadState::from_result(patch));
+                this.commit_details = details;
                 this.commit_task = None;
                 this.restore_position(true, cx);
                 this.queue_persist(cx);
@@ -2701,9 +2708,15 @@ impl SuperGitApp {
                 cx,
             )
         });
+        let card = self
+            .commit_details
+            .as_ref()
+            .filter(|d| self.selected_commit.as_deref() == Some(d.commit.sha.as_str()))
+            .map(|details| self.render_commit_card(details, cx));
         v_flex()
             .size_full()
             .children(notice)
+            .children(card)
             .when_some(self.commit_patch.value(), |el, patch| {
                 el.child(div().flex_1().min_h_0().child(if patch.is_empty() {
                     self.render_data_notice("No changes in this commit", None, false, cx)
@@ -2711,6 +2724,141 @@ impl SuperGitApp {
                     self.render_commit_files(width, cx)
                 }))
             })
+            .into_any_element()
+    }
+
+    /// Above a commit's files and diff: its message, author, date, sha
+    /// (copyable), parents (clickable), refs and change totals.
+    fn render_commit_card(&self, details: &CommitDetails, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let commit = &details.commit;
+        let (files, additions, deletions) = {
+            let diff = self.commit_diff.read(cx);
+            let files = diff.files();
+            (
+                files.len(),
+                files.iter().map(DiffFile::additions).sum::<usize>(),
+                files.iter().map(DiffFile::deletions).sum::<usize>(),
+            )
+        };
+        let sha = commit.sha.clone();
+        let parents = commit.parents.iter().enumerate().map(|(ix, parent)| {
+            let parent = parent.clone();
+            Button::new(("commit-parent", ix))
+                .label(parent[..parent.len().min(8)].to_string())
+                .xsmall()
+                .ghost()
+                .tooltip("Show this parent commit")
+                .on_click(cx.listener(move |this, _, _, cx| this.select_commit(parent.clone(), cx)))
+        });
+        let refs = commit.refs.iter().map(|r| {
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .bg(theme.secondary)
+                .text_color(theme.secondary_foreground)
+                .child(r.replace("HEAD -> ", "➜ "))
+        });
+        v_flex()
+            .flex_none()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(commit.subject.clone()),
+            )
+            .when(!details.body.is_empty(), |el| {
+                el.child(
+                    div()
+                        .id("commit-body")
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(reflow(&details.body)),
+                )
+            })
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .when(commit.by_agent, |el| {
+                        el.child(div().text_color(theme.blue).child("✦ with Claude"))
+                    })
+                    .child(
+                        div()
+                            .text_color(theme.foreground)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(commit.author.clone()),
+                    )
+                    .child(commit.email.clone())
+                    .child({
+                        let ago = relative_time(commit.time);
+                        let ago = if ago == "now" {
+                            ago
+                        } else {
+                            format!("{ago} ago")
+                        };
+                        format!("{} · {ago}", details.date)
+                    })
+                    .when(details.committer != commit.author, |el| {
+                        el.child(format!("committed by {}", details.committer))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        div()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_color(theme.foreground)
+                            .child(commit.short_sha().to_string()),
+                    )
+                    .child(
+                        Button::new("copy-commit-sha")
+                            .label("Copy SHA")
+                            .xsmall()
+                            .ghost()
+                            .tooltip(format!("Copy {sha}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()));
+                                this.flash("Copied commit SHA", false, cx);
+                            })),
+                    )
+                    .when(!commit.parents.is_empty(), |el| {
+                        el.child(div().pl_2().child(if commit.parents.len() > 1 {
+                            "merge of"
+                        } else {
+                            "parent"
+                        }))
+                        .children(parents)
+                    })
+                    .children(refs)
+                    .child(div().flex_1())
+                    .child(format!("{files} file{}", if files == 1 { "" } else { "s" }))
+                    .child(
+                        div()
+                            .text_color(theme.success)
+                            .child(format!("+{additions}")),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.danger)
+                            .child(format!("−{deletions}")),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -3282,6 +3430,41 @@ fn time_ago(t: SystemTime) -> String {
         .unwrap_or_default()
 }
 
+/// Commit messages are hard-wrapped at ~72 columns; rejoin each paragraph
+/// so it wraps to the pane instead. Blank lines, list items (`- `, `* `,
+/// `1. `) and trailers (`Key: value`) keep their own lines.
+fn reflow(body: &str) -> String {
+    fn list_item(line: &str) -> bool {
+        let line = line.trim_start();
+        ["- ", "* ", "• "].iter().any(|p| line.starts_with(p))
+            || line.split_once(['.', ')']).is_some_and(|(n, rest)| {
+                !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' ')
+            })
+    }
+    fn trailer(line: &str) -> bool {
+        line.split_once(": ").is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key.len() <= 30
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    }
+    let mut out = String::new();
+    let mut joinable = false;
+    for line in body.lines().map(str::trim_end) {
+        if joinable && !line.is_empty() && !list_item(line) && !trailer(line) {
+            out.push(' ');
+            out.push_str(line.trim_start());
+        } else {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+        joinable = !line.is_empty() && !trailer(line);
+    }
+    out
+}
+
 /// A file of a commit's diff as a list row: committed, so never "staged".
 fn commit_file(file: &DiffFile) -> FileChange {
     let state = match file.status() {
@@ -3571,7 +3754,37 @@ fn pr_row(
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's glob import brings its own `test` attribute.
-    use super::{DiffFile, FileState, commit_file};
+    use super::{DiffFile, FileState, commit_file, reflow};
+
+    #[test]
+    fn commit_bodies_reflow_paragraphs_but_keep_lists_and_trailers() {
+        let body = "\
+Selecting a commit now lays out like the
+Changes tab: commits | files | diff.
+
+- The file list is the same component
+  as in Changes.
+- Built from the parsed diff.
+1. First step
+Note: a trailer-like line
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Signed-off-by: Someone <a@b.c>";
+        assert_eq!(
+            reflow(body),
+            "\
+Selecting a commit now lays out like the Changes tab: commits | files | diff.
+
+- The file list is the same component as in Changes.
+- Built from the parsed diff.
+1. First step
+Note: a trailer-like line
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Signed-off-by: Someone <a@b.c>"
+        );
+        assert_eq!(reflow(""), "");
+    }
 
     #[test]
     fn commit_files_carry_their_change_kind() {
