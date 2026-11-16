@@ -137,7 +137,9 @@ Then read the PNG. Use this to verify every UI change. Screenshot runs open a
 real (unfocused) window — keep them few, the user may be working.
 `SUPERGIT_TAB=history|changes|claude|prs` picks the tab;
 `SUPERGIT_CHANGES_TREE=1` (screenshot builds) shows the Changes list as a tree;
-`SUPERGIT_DEBUG_REBASE=<branch>` (screenshot builds) opens the Rebase dialog.
+`SUPERGIT_DEBUG_REBASE=<branch>` (screenshot builds) opens the Rebase dialog;
+`SUPERGIT_DEBUG_COMMIT=<sha prefix>` (screenshot builds) selects that History
+commit two seconds after startup, like a click.
 
 Set `SUPERGIT_STATE_DIR=/tmp/supergit-profile` for isolated UI checks. Settings,
 recent repositories and workspace restoration then use that directory instead
