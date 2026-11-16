@@ -5209,7 +5209,10 @@ fn ref_badges(
     badges
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a History row draws one commit from independent view state"
+)]
 fn commit_row(
     ix: usize,
     c: &Commit,
