@@ -1289,7 +1289,37 @@ impl SuperGitApp {
         self.debug_chat_once(cx);
         #[cfg(feature = "screenshot")]
         self.debug_rebase_once(cx);
+        #[cfg(feature = "screenshot")]
+        self.debug_commit_once(cx);
         cx.notify();
+    }
+
+    /// Screenshot builds only: `SUPERGIT_DEBUG_COMMIT=<sha prefix>` selects
+    /// that History commit two seconds after startup, as a click would.
+    #[cfg(feature = "screenshot")]
+    fn debug_commit_once(&mut self, cx: &mut Context<Self>) {
+        let Ok(prefix) = std::env::var("SUPERGIT_DEBUG_COMMIT") else {
+            return;
+        };
+        let Some(sha) = self
+            .details
+            .commits
+            .value()
+            .and_then(|commits| commits.iter().find(|c| c.sha.starts_with(&prefix)))
+            .map(|c| c.sha.clone())
+        else {
+            return;
+        };
+        if std::env::var_os("SUPERGIT_DEBUG_COMMIT_DONE").is_some() {
+            return;
+        }
+        // SAFETY: isolated screenshot builds only, on the main thread.
+        unsafe { std::env::set_var("SUPERGIT_DEBUG_COMMIT_DONE", "1") };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |this, cx| this.select_commit(sha, cx));
+        })
+        .detach();
     }
 
     /// Screenshot builds only: `SUPERGIT_DEBUG_CHAT=resume` opens the latest
@@ -3500,16 +3530,13 @@ impl SuperGitApp {
                         .changes_width
                         .min((width - 180.).clamp(140., 600.))))
                     .size_range(px(140.)..px((width - 180.).clamp(140., 600.)))
+                    .fixed()
                     .child(self.render_file_list(FileList::Changes, &files, theme, cx)),
             )
             .child(
-                resizable_panel().size_range(px(180.)..Pixels::MAX).child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(self.render_review_diff(&self.changes_diff, cx)),
-                ),
+                resizable_panel()
+                    .size_range(px(180.)..Pixels::MAX)
+                    .child(elastic(self.render_review_diff(&self.changes_diff, cx))),
             )
             .into_any_element();
         v_flex()
@@ -3745,6 +3772,7 @@ impl SuperGitApp {
                         .history_width
                         .min((width - 180.).clamp(160., 800.))))
                     .size_range(px(160.)..px((width - 180.).clamp(160., 800.)))
+                    .fixed()
                     .child(
                         v_flex()
                             .id("commit-list")
@@ -3760,7 +3788,7 @@ impl SuperGitApp {
             .child(
                 resizable_panel()
                     .size_range(px(180.)..Pixels::MAX)
-                    .child(self.render_commit_patch(width - commits_width, cx)),
+                    .child(elastic(self.render_commit_patch(width - commits_width, cx))),
             );
         v_flex()
             .size_full()
@@ -4040,15 +4068,13 @@ impl SuperGitApp {
                 resizable_panel()
                     .size(px(self.repository_view().commit_files_width.min(list_max)))
                     .size_range(px(140.)..px(list_max))
+                    .fixed()
                     .child(self.render_file_list(FileList::Commit, &files, &theme, cx)),
             )
             .child(
-                resizable_panel().size_range(px(180.)..Pixels::MAX).child(
-                    div()
-                        .size_full()
-                        .min_w_0()
-                        .child(self.render_review_diff(&self.commit_diff, cx)),
-                ),
+                resizable_panel()
+                    .size_range(px(180.)..Pixels::MAX)
+                    .child(elastic(self.render_review_diff(&self.commit_diff, cx))),
             )
             .into_any_element()
     }
@@ -4497,12 +4523,13 @@ impl SuperGitApp {
                         resizable_panel()
                             .size(px(self.persisted.projects.width.min(max)))
                             .size_range(px(160.)..px(max))
+                            .fixed()
                             .child(self.render_projects(cx)),
                     )
                     .child(
                         resizable_panel()
                             .size_range(px(rest)..Pixels::MAX)
-                            .child(project),
+                            .child(elastic(project)),
                     ),
             )
             .into_any_element()
@@ -4524,12 +4551,13 @@ impl SuperGitApp {
                     .child(
                         resizable_panel()
                             .size_range(px(360.)..Pixels::MAX)
-                            .child(main),
+                            .child(elastic(main)),
                     )
                     .child(
                         resizable_panel()
                             .size(px(self.repository_view().chat_width.min(chat_max)))
                             .size_range(px(320.)..px(chat_max))
+                            .fixed()
                             .child(chat),
                     )
                     .into_any_element()
@@ -4564,6 +4592,7 @@ impl SuperGitApp {
                                 resizable_panel()
                                     .size(px(self.repository_view().sidebar_width.min(sidebar_max)))
                                     .size_range(px(220.)..px(sidebar_max))
+                                    .fixed()
                                     .child(self.render_sidebar(cx)),
                             )
                             .child(
@@ -4571,7 +4600,7 @@ impl SuperGitApp {
                                     .size_range(
                                         px(if show_chat { 680. } else { 360. })..Pixels::MAX,
                                     )
-                                    .child(workspace),
+                                    .child(elastic(workspace)),
                             ),
                     )
                     .into_any_element()
@@ -4731,6 +4760,20 @@ impl Render for SuperGitApp {
                 el.child(self.render_cleanup_results(cx))
             })
     }
+}
+
+/// The content of a panel that should give way: it takes the panel's size
+/// and clips what does not fit (long diff lines scroll inside), so wide
+/// content never widens the panel and pushes the chat or sidebar away. A
+/// column, so the content is exactly as wide as the panel and `flex_1` /
+/// `h_full` children fill its height.
+fn elastic(content: impl IntoElement) -> Div {
+    v_flex()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .overflow_hidden()
+        .child(content)
 }
 
 /// `SUPERGIT_TAB=history|changes|claude|prs` picks the tab shown at startup.
