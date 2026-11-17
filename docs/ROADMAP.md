@@ -91,12 +91,14 @@ unchanged history/diffs on every poll and evaluate filesystem notifications.
 
 Done: PR tab scoped to the worktree (by branch/upstream, manual link/unlink)
 or all PRs, search (local + GitHub search), details with description,
-comments, reviews, inline review threads, checks, and merge (method choice,
-confirmation, auto-merge).
+comments, reviews, inline review threads, checks, the diff (Files changed:
+Unified/Split, difftastic, local fallback for large diffs, agent context),
+and merge (method choice, confirmation, auto-merge).
 
-Next: failing job logs inline (`gh run view --log-failed`), diff of the PR,
-create PR from a worktree (`gh pr create --fill`), "send review comments /
-failing check to the agent in this worktree", reply / resolve threads.
+Next: failing job logs inline (`gh run view --log-failed`), review comments
+inline in the diff, create PR from a worktree (`gh pr create --fill`), "send
+review comments / failing check to the agent in this worktree", reply /
+resolve threads.
 
 ## 5. Commit & sync
 

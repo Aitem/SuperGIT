@@ -102,11 +102,13 @@ enum LayoutPanel {
     Pulls,
 }
 
-/// A file list beside a diff: the Changes tab's, or the selected commit's.
+/// A file list beside a diff: the Changes tab's, the selected commit's, or
+/// the selected pull request's.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileList {
     Changes,
     Commit,
+    Pull,
 }
 
 #[derive(Clone, Copy)]
@@ -295,7 +297,7 @@ impl SuperGitApp {
         let commit_diff = new_diff_state(diff_layout, cx);
         let changes_difft = cx.new(|_| DifftView::new(diff_mode(diff_layout)));
         let commit_difft = cx.new(|_| DifftView::new(diff_mode(diff_layout)));
-        let pulls = pulls::Pulls::new(window, cx);
+        let pulls = pulls::Pulls::new(window, diff_layout, cx);
 
         let mut persisted = workspace::load();
         if let Some(repo) = &repo {
@@ -696,27 +698,27 @@ impl SuperGitApp {
     /// Click handler for a file in `list`: scroll its diff to the file.
     fn open_file(list: FileList, path: String, cx: &mut Context<Self>) -> ClickHandler {
         Box::new(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            let commit = list == FileList::Commit;
-            this.remember_position(
-                ReviewPosition {
-                    path: path.clone(),
-                    line: 1,
-                    original: false,
-                },
-                commit,
-                cx,
-            );
-            let diff = if commit {
-                &this.commit_diff
-            } else {
-                &this.changes_diff
+            let (diff, difft) = match list {
+                FileList::Pull => (this.pulls.diff.clone(), this.pulls.difft.clone()),
+                FileList::Changes | FileList::Commit => {
+                    let commit = list == FileList::Commit;
+                    this.remember_position(
+                        ReviewPosition {
+                            path: path.clone(),
+                            line: 1,
+                            original: false,
+                        },
+                        commit,
+                        cx,
+                    );
+                    if commit {
+                        (this.commit_diff.clone(), this.commit_difft.clone())
+                    } else {
+                        (this.changes_diff.clone(), this.changes_difft.clone())
+                    }
+                }
             };
             diff.update(cx, |state, cx| state.scroll_to_file(&path, cx));
-            let difft = if commit {
-                &this.commit_difft
-            } else {
-                &this.changes_difft
-            };
             difft.update(cx, |view, cx| view.scroll_to_file(&path, cx));
         }))
     }
@@ -737,6 +739,7 @@ impl SuperGitApp {
         let collapsed = match list {
             FileList::Changes => &mut self.changes_collapsed,
             FileList::Commit => &mut self.commit_collapsed,
+            FileList::Pull => &mut self.pulls.files_collapsed,
         };
         if !collapsed.remove(&path) {
             collapsed.insert(path);
@@ -3259,7 +3262,13 @@ impl SuperGitApp {
                     .get(&path)
                     .and_then(|view| view.commit_position.as_ref()),
             ),
-            _ => anyhow::bail!("Open Changes or History and select a file or source lines first"),
+            MainTab::PullRequests => {
+                let (state, patch, comparison) = self.pr_diff_context()?;
+                (state, patch, comparison, None)
+            }
+            MainTab::Sessions => {
+                anyhow::bail!("Open Changes, History or a pull request's files first")
+            }
         };
         let patch_text = patch.value().ok_or_else(|| {
             anyhow::anyhow!("Wait for an available diff before attaching context")
@@ -3437,19 +3446,25 @@ impl SuperGitApp {
         menu
     }
 
-    /// The diff beside a file list (Changes, or the selected commit): a
-    /// toolbar with the layout and difftastic toggles above the diff itself.
+    /// The diff beside a file list (Changes, the selected commit or pull
+    /// request): a toolbar with the layout and difftastic toggles above the
+    /// diff itself.
     fn render_review_diff(&self, list: FileList, cx: &mut Context<Self>) -> AnyElement {
         let owner = cx.entity().downgrade();
-        let content = if self.difftastic_active() {
+        // A PR whose commits are not local keeps the line diff.
+        let difftastic =
+            self.difftastic_active() && !(list == FileList::Pull && self.pr_difft_unavailable());
+        let content = if difftastic {
             match list {
                 FileList::Changes => self.changes_difft.clone().into_any_element(),
                 FileList::Commit => self.commit_difft.clone().into_any_element(),
+                FileList::Pull => self.pulls.difft.clone().into_any_element(),
             }
         } else {
             let state = match list {
                 FileList::Changes => &self.changes_diff,
                 FileList::Commit => &self.commit_diff,
+                FileList::Pull => &self.pulls.diff,
             };
             // Split wraps long lines so each side keeps half the width, as
             // on GitHub; Unified scrolls sideways instead.
@@ -3555,6 +3570,7 @@ impl SuperGitApp {
                 this.difft_version = Some(version);
                 this.refresh_difft(FileList::Changes, cx);
                 this.refresh_difft(FileList::Commit, cx);
+                this.refresh_difft(FileList::Pull, cx);
                 cx.notify();
             })
             .ok();
@@ -3582,6 +3598,11 @@ impl SuperGitApp {
                 self.commit_difft.clone(),
                 self.commit_patch.value(),
             ),
+            FileList::Pull => (
+                &self.pulls.diff,
+                self.pulls.difft.clone(),
+                self.pr_difft_parts().map(|(patch, _, _)| patch),
+            ),
         };
         let files: Vec<_> = state.read(cx).files().iter().map(file_request).collect();
         let sources = match list {
@@ -3602,6 +3623,8 @@ impl SuperGitApp {
                     sg_git::difftastic::Source::Revision(sha),
                 )
             }),
+            // The PR's merge base and head, when both are local.
+            FileList::Pull => self.pr_difft_parts().map(|(_, old, new)| (old, new)),
         };
         let (Some((old, new)), Some(patch), false) = (sources, patch, files.is_empty()) else {
             view.update(cx, |view, cx| view.clear(cx));
@@ -3630,18 +3653,26 @@ impl SuperGitApp {
         crate::settings::save(&settings);
         let mode = diff_mode(layout);
         let cached = self.review_views.values();
-        let states: Vec<_> = [self.changes_diff.clone(), self.commit_diff.clone()]
-            .into_iter()
-            .chain(
-                cached
-                    .clone()
-                    .flat_map(|view| [view.changes_diff.clone(), view.commit_diff.clone()]),
-            )
-            .collect();
-        let views: Vec<_> = [self.changes_difft.clone(), self.commit_difft.clone()]
-            .into_iter()
-            .chain(cached.flat_map(|view| [view.changes_difft.clone(), view.commit_difft.clone()]))
-            .collect();
+        let states: Vec<_> = [
+            self.changes_diff.clone(),
+            self.commit_diff.clone(),
+            self.pulls.diff.clone(),
+        ]
+        .into_iter()
+        .chain(
+            cached
+                .clone()
+                .flat_map(|view| [view.changes_diff.clone(), view.commit_diff.clone()]),
+        )
+        .collect();
+        let views: Vec<_> = [
+            self.changes_difft.clone(),
+            self.commit_difft.clone(),
+            self.pulls.difft.clone(),
+        ]
+        .into_iter()
+        .chain(cached.flat_map(|view| [view.changes_difft.clone(), view.commit_difft.clone()]))
+        .collect();
         for state in states {
             state.update(cx, |state, cx| state.set_mode(mode, cx));
         }
@@ -3658,6 +3689,7 @@ impl SuperGitApp {
         crate::settings::save(&settings);
         self.refresh_difft(FileList::Changes, cx);
         self.refresh_difft(FileList::Commit, cx);
+        self.refresh_difft(FileList::Pull, cx);
         cx.notify();
     }
 
@@ -3953,6 +3985,11 @@ impl SuperGitApp {
         let (id, filter, collapsed) = match list {
             FileList::Changes => ("change-list", &self.changes_filter, &self.changes_collapsed),
             FileList::Commit => ("commit-files", &self.commit_filter, &self.commit_collapsed),
+            FileList::Pull => (
+                "pr-files",
+                &self.pulls.files_filter,
+                &self.pulls.files_collapsed,
+            ),
         };
         let filter = filter.clone();
         // Screenshot builds: `SUPERGIT_CHANGES_TREE=1` shows the tree.

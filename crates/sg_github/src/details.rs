@@ -209,6 +209,9 @@ pub struct AutoMerge {
 pub struct PrDetails {
     /// The pull request itself, fresher than the list it was picked from.
     pub pr: PullRequest,
+    /// The base commit the PR's diff starts from (with the head's merge
+    /// base): the base tip while open, the base when it merged.
+    pub base_oid: String,
     pub body: String,
     pub merge_status: MergeStatus,
     pub merged_by: Option<String>,
@@ -235,7 +238,7 @@ const DETAILS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int
     pullRequest(number: $number) {
       number title body url state isDraft createdAt updatedAt mergedAt closedAt
       author { login }
-      headRefName baseRefName headRefOid
+      headRefName baseRefName headRefOid baseRefOid
       headRepository { nameWithOwner }
       additions deletions changedFiles
       mergeable mergeStateStatus reviewDecision
@@ -394,6 +397,8 @@ struct RawDetails {
     base_ref_name: String,
     #[serde(default)]
     head_ref_oid: String,
+    #[serde(default)]
+    base_ref_oid: String,
     head_repository: Option<NameWithOwner>,
     #[serde(default)]
     additions: u64,
@@ -679,6 +684,7 @@ fn parse_details(json: &[u8]) -> Result<PrDetails> {
     };
     Ok(PrDetails {
         pr,
+        base_oid: raw.base_ref_oid,
         body: raw.body,
         // GitHub may report a draft as merely BLOCKED; it never merges one.
         merge_status: if raw.is_draft {
@@ -760,7 +766,7 @@ mod tests {
       "pullRequest":{"number":42,"title":"Каталог: поиск","body":"Fixes things","url":"https://github.com/o/r/pull/42",
         "state":"OPEN","isDraft":false,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z",
         "mergedAt":null,"closedAt":null,"author":{"login":"alice"},"headRefName":"search","baseRefName":"main",
-        "headRefOid":"abc","headRepository":{"nameWithOwner":"o/r"},"additions":10,"deletions":2,"changedFiles":3,
+        "headRefOid":"abc","baseRefOid":"def","headRepository":{"nameWithOwner":"o/r"},"additions":10,"deletions":2,"changedFiles":3,
         "mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED","reviewDecision":"CHANGES_REQUESTED",
         "autoMergeRequest":null,"mergedBy":null,
         "commits":{"totalCount":4,"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[
@@ -789,6 +795,7 @@ mod tests {
         assert_eq!(d.pr.title, "Каталог: поиск");
         assert_eq!(d.pr.state, PrState::Open);
         assert_eq!(d.pr.head_repository.as_deref(), Some("o/r"));
+        assert_eq!(d.base_oid, "def");
         assert_eq!(d.merge_status, MergeStatus::Blocked);
         assert_eq!(d.merge_methods, [MergeMethod::Squash, MergeMethod::Rebase]);
         // The viewer's default is not allowed here: the first allowed one wins.
@@ -877,5 +884,7 @@ mod tests {
         let found = crate::search_prs(repo, "Wide diffs", 10).unwrap();
         assert!(found.iter().any(|pr| pr.number == 36));
         assert_eq!(crate::view_pr(repo, 36).unwrap().number, 36);
+        let diff = crate::pr_diff(repo, 36).unwrap();
+        assert!(diff.starts_with("diff --git"), "{diff}");
     }
 }

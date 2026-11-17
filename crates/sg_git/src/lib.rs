@@ -22,7 +22,9 @@ pub use cleanup::{
     cleanup_base_branch, cleanup_worktree, delete_cleanup_branch, fetch_cleanup_base,
     worktree_identity,
 };
-pub use comparison::{BranchChanges, branch_changes, resolve_branch, suggested_base};
+pub use comparison::{
+    BranchChanges, branch_changes, pr_merge_base, range_patch, resolve_branch, suggested_base,
+};
 pub use log::{
     Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
     commit_patch, fork, history, log,

@@ -30,9 +30,13 @@ Written in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates
 - **Pull requests** — the selected worktree's PRs (its branch or the branch it
   pushes to, plus PRs linked by hand) or all of them, searchable (number,
   title, branch, `@author`; older PRs via GitHub search). A PR shows its
-  description, comments, reviews, inline review threads with their diff, every
-  check with links to its logs, and a merge box: merge / squash / rebase after
-  a confirmation (pinned to the shown head commit) or enable auto-merge.
+  conversation — description, comments, reviews, inline review threads (jump
+  to the line in the diff), every check with links to its logs — and a merge
+  box: merge / squash / rebase after a confirmation (pinned to the shown head
+  commit) or enable auto-merge. **Files changed** shows its diff like History
+  does — file list (filter, tree), Unified/Split, difftastic when the PR's
+  commits are local; right-click asks the worktree's agent about a file or
+  hunk. Diffs GitHub refuses (too large) are computed from local commits.
   Open in the browser or check one out into a new worktree.
 - **Create / remove worktrees** — new branch → sibling directory
   `<repo>-<branch>`; removal asks for confirmation (twice when dirty).

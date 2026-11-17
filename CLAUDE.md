@@ -184,9 +184,13 @@ real (unfocused) window — keep them few, the user may be working.
 commit two seconds after startup, like a click;
 `SUPERGIT_DEBUG_PR=<number>` (screenshot builds, with `SUPERGIT_TAB=prs`)
 selects that pull request, `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its details
-(conversation, review threads) and `SUPERGIT_DEBUG_PR_MERGE=1` opens its merge
-dialog. For rich PR data use a shallow clone of a public repository (e.g.
-`git clone --depth 1 https://github.com/cli/cli /tmp/x`) — never merge there.
+(conversation, review threads), `SUPERGIT_DEBUG_PR_FILES=1` opens its Files
+tab (diff) and `SUPERGIT_DEBUG_PR_MERGE=1` opens its merge dialog. A background
+screenshot window only renders at startup and for the shot itself: anything
+loaded from `render` (the PR tab's `ensure_pulls`) must be due by the first
+frame, so these switches take effect before it. For rich PR data use a shallow
+clone of a public repository (e.g. `git clone --depth 1
+https://github.com/cli/cli /tmp/x`) — never merge there.
 
 Set `SUPERGIT_STATE_DIR=/tmp/supergit-profile` for isolated UI checks. Settings,
 recent repositories and workspace restoration then use that directory instead

@@ -36,6 +36,48 @@ pub fn resolve_branch(worktree: &Path, base: &str) -> Result<String> {
     bail!("Base branch '{base}' is unavailable locally. Fetch it or choose another branch.")
 }
 
+/// Where a pull request's changes start, from local commits: the merge base
+/// of `head` with the base commit GitHub reports (`baseRefOid` — exact, for
+/// merged PRs too) or, when that commit is not here, with `origin/<base>` or
+/// the local `<base>` (right for open PRs). Nothing is fetched.
+pub fn pr_merge_base(repo: &Path, base_oid: &str, base: &str, head: &str) -> Result<String> {
+    let commit = |oid: &str| {
+        oid.len() >= 7
+            && oid.chars().all(|c| c.is_ascii_hexdigit())
+            && git(repo, ["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_ok()
+    };
+    if !commit(head) {
+        bail!(
+            "Its head {} is not in the local repository; fetch the branch first",
+            &head[..8.min(head.len())]
+        );
+    }
+    let base_oid = if commit(base_oid) {
+        base_oid.to_string()
+    } else {
+        resolve_branch(repo, &format!("origin/{base}")).or_else(|_| resolve_branch(repo, base))?
+    };
+    Ok(git(repo, ["merge-base", &base_oid, head])?
+        .trim()
+        .to_string())
+}
+
+/// The patch from `from` to `head`, as `git diff` shows it.
+pub fn range_patch(repo: &Path, from: &str, head: &str) -> Result<String> {
+    git(
+        repo,
+        [
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            from,
+            head,
+            "--",
+        ],
+    )
+}
+
 /// An explicit default suggestion, never a hard-coded assumption about main.
 pub fn suggested_base(worktree: &Path) -> Option<String> {
     git(
