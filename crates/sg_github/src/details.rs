@@ -187,6 +187,8 @@ pub enum CheckStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
+    /// Opaque GitHub ID. Legacy status contexts have no check-run diagnostics.
+    pub run_id: Option<String>,
     pub name: String,
     /// The Actions workflow a job belongs to.
     pub workflow: Option<String>,
@@ -249,7 +251,7 @@ const DETAILS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int
         nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
           __typename
           ... on CheckRun {
-            name status conclusion detailsUrl startedAt completedAt
+            id name status conclusion detailsUrl startedAt completedAt
             isRequired(pullRequestNumber: $number)
             checkSuite { workflowRun { workflow { name } } }
           }
@@ -458,6 +460,7 @@ struct RawRollup {
 #[serde(rename_all = "camelCase")]
 struct RawContext {
     // CheckRun
+    id: Option<String>,
     name: Option<String>,
     status: Option<String>,
     conclusion: Option<String>,
@@ -576,6 +579,7 @@ impl RawContext {
                 conclusion
             };
             Check {
+                run_id: self.id,
                 name,
                 workflow: self
                     .check_suite
@@ -597,6 +601,7 @@ impl RawContext {
                 _ => CheckStatus::Failed,
             };
             Check {
+                run_id: None,
                 name: self.context.unwrap_or_default(),
                 workflow: None,
                 status,
@@ -867,7 +872,7 @@ mod tests {
            "checkSuite":{"workflowRun":{"workflow":{"name":"CI"}}}},
           {"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://ci/2",
            "startedAt":null,"completedAt":null,"isRequired":false,"checkSuite":{"workflowRun":null}},
-          {"__typename":"CheckRun","name":"build","status":"IN_PROGRESS","conclusion":null,"detailsUrl":"",
+          {"__typename":"CheckRun","id":"check-build","name":"build","status":"IN_PROGRESS","conclusion":null,"detailsUrl":"",
            "startedAt":null,"completedAt":null,"isRequired":true,"checkSuite":null},
           {"__typename":"StatusContext","context":"deploy","state":"PENDING","targetUrl":null,
            "description":"Waiting","createdAt":"2026-01-01T00:00:00Z","isRequired":false},
@@ -923,6 +928,8 @@ mod tests {
         );
         let build = &d.checks[1];
         assert_eq!(build.detail, "in progress");
+        assert_eq!(build.run_id.as_deref(), Some("check-build"));
+        assert_eq!(d.checks[2].run_id, None);
         assert!(build.required);
         assert_eq!(build.url, None, "empty URLs are dropped");
         assert_eq!(d.checks[2].detail, "Waiting");

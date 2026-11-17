@@ -6,6 +6,8 @@
 //! the branch it pushes to) in the same repository, or when it was linked
 //! by hand; a hand-made unlink overrides both.
 
+mod checks;
+
 use std::time::Instant;
 
 use gpui_kit::component::menu::DropdownMenu as _;
@@ -98,6 +100,8 @@ pub(super) struct Pulls {
     /// (resolved ones start collapsed).
     toggled_threads: HashSet<String>,
     show_passed_checks: bool,
+    check_inspection: Option<checks::OpenCheck>,
+    check_inspection_task: Option<Task<()>>,
     /// The details column; back to the top when another PR is shown.
     details_scroll: ScrollHandle,
     shown: Option<u64>,
@@ -160,6 +164,8 @@ impl Pulls {
             commits_task: None,
             toggled_threads: HashSet::new(),
             show_passed_checks: false,
+            check_inspection: None,
+            check_inspection_task: None,
             details_scroll: ScrollHandle::new(),
             shown: None,
             // Screenshot builds: `SUPERGIT_DEBUG_PR_FILES=1` starts on Files
@@ -206,6 +212,7 @@ impl Pulls {
         self.commits.clear();
         self.commits_task = None;
         self.toggled_threads.clear();
+        self.close_check_inspection();
         self.merge = None;
         self.patches.clear();
         self.patch_task = None;
@@ -590,6 +597,7 @@ impl SuperGitApp {
         let selected = self.selected_pr_number(&path, &visible);
         if self.pulls.shown != selected {
             self.pulls.shown = selected;
+            self.pulls.close_check_inspection();
             self.pulls.details_scroll.set_offset(point(px(0.), px(0.)));
         }
         if let Some(number) = selected {
@@ -1051,6 +1059,8 @@ impl SuperGitApp {
                 });
                 loaded.at = Instant::now();
                 loaded.details.update(LoadState::from_result(result));
+                #[cfg(feature = "screenshot")]
+                this.debug_check_inspection(number, cx);
                 // The Files tab waits for the head and base commit: start
                 // its diff now rather than at the next frame.
                 if this.pulls.tab == DetailsTab::Files
@@ -1342,6 +1352,7 @@ impl SuperGitApp {
     /// then opens its merge dialog once the details are loaded,
     /// `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its conversation and
     /// `SUPERGIT_DEBUG_PR_FILES=1` opens its Files tab.
+    /// `SUPERGIT_DEBUG_PR_CHECK=<name>` inspects a check in Conversation.
     #[cfg(feature = "screenshot")]
     fn debug_pr_once(&mut self, info: &WorktreeInfo, cx: &mut Context<Self>) {
         let Some(number) = std::env::var("SUPERGIT_DEBUG_PR")
@@ -2357,7 +2368,12 @@ impl SuperGitApp {
             .map(|(ix, check)| {
                 let (glyph, color) = check_glyph(check.status, theme);
                 let url = check.url.clone();
-                h_flex()
+                let open = self
+                    .pulls
+                    .check_inspection
+                    .as_ref()
+                    .filter(|open| Some(&open.id) == check.run_id.as_ref());
+                let row = h_flex()
                     .id(("pr-check", ix))
                     .gap_2()
                     .py_0p5()
@@ -2402,10 +2418,25 @@ impl SuperGitApp {
                                 None => check.detail.clone(),
                             }),
                     )
+                    .when_some(check.run_id.clone(), |el, id| {
+                        el.child(
+                            Button::new(("pr-check-inspect", ix))
+                                .label(if open.is_some() {
+                                    "Hide details"
+                                } else {
+                                    "Inspect"
+                                })
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_check_inspection(&id, cx);
+                                })),
+                        )
+                    })
                     .when_some(url, |el, url| {
                         el.child(
                             Button::new(("pr-check-open", ix))
-                                .label("Details")
+                                .label("GitHub")
                                 .xsmall()
                                 .ghost()
                                 .tooltip(url.clone())
@@ -2414,6 +2445,12 @@ impl SuperGitApp {
                                     this.report(r, "Opened in browser", cx);
                                 })),
                         )
+                    });
+                v_flex()
+                    .flex_none()
+                    .child(row)
+                    .when_some(open, |el, open| {
+                        el.child(self.render_check_inspection(open, check, theme, cx))
                     })
                     .into_any_element()
             })
