@@ -28,7 +28,7 @@ pub use comparison::{
 };
 pub use log::{
     Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
-    commit_patch, fork, history, log,
+    commit_patch, fork, history, history_refs, log,
 };
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};

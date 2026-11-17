@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use sg_agents::{AgentState, Session, SessionIndex};
 use sg_codex::CodexSessionIndex;
-use sg_git::{Commit, Fork, Repo, Worktree, WorktreeStatus};
+use sg_git::{Repo, Worktree, WorktreeStatus};
+
+mod history;
+pub use history::{History, HistorySource};
 
 #[derive(Clone, Debug)]
 pub struct WorktreeInfo {
@@ -186,33 +189,6 @@ pub struct Details {
     pub patch: LoadState<String>,
     /// The submodules `patch` changes, their own diffs inlined in it.
     pub submodules: Vec<sg_git::SubmoduleChange>,
-}
-
-/// History refreshes separately from the working copy and diff.
-#[derive(Clone, Debug, Default)]
-pub struct History {
-    pub commits: LoadState<Arc<Vec<Commit>>>,
-    /// Commits since the branch forked from the base branch.
-    pub fork: Option<Fork>,
-}
-
-impl History {
-    pub fn update(&mut self, next: Self) {
-        if next.commits.error().is_none() {
-            self.fork = next.fork;
-        }
-        self.commits.update(next.commits);
-    }
-}
-
-pub fn load_history(path: &Path) -> History {
-    let commits = sg_git::history(path, 400)
-        .map(Arc::new)
-        .map_err(git_error_message);
-    History {
-        commits: LoadState::from_result(commits),
-        fork: sg_git::fork(path).ok().flatten(),
-    }
 }
 
 impl Details {
@@ -401,10 +377,22 @@ mod tests {
         let details = load_details(&temp.0, status, None);
         assert!(details.status.error().is_some());
         assert!(details.patch.error().is_some());
-        assert!(load_history(&temp.0).commits.error().is_some());
+        assert!(
+            History::default()
+                .load(&temp.0, None)
+                .commits
+                .error()
+                .is_some()
+        );
         assert!(details.status.value().is_none());
         assert!(details.patch.value().is_none());
-        assert!(load_history(&temp.0).commits.value().is_none());
+        assert!(
+            History::default()
+                .load(&temp.0, None)
+                .commits
+                .value()
+                .is_none()
+        );
     }
 
     #[test]
@@ -420,7 +408,7 @@ mod tests {
         assert!(details.status.value().unwrap().is_clean());
         assert_eq!(details.patch.value().map(String::as_str), Some(""));
         assert!(
-            matches!(load_history(&temp.0).commits, LoadState::Ready(commits) if commits.is_empty())
+            matches!(History::default().load(&temp.0, None).commits, LoadState::Ready(commits) if commits.is_empty())
         );
     }
 
@@ -431,11 +419,95 @@ mod tests {
         temp.git(&["config", "user.email", "test@example.com"]);
         temp.git(&["config", "user.name", "Tester"]);
         temp.git(&["commit", "--allow-empty", "-qm", "initial"]);
-        let mut history = load_history(&temp.0);
+        let mut history = History::default().load(&temp.0, None);
         let original = history.commits.value().unwrap().clone();
-        history.update(load_history(&temp.0.join("missing")));
+        history.update(History::default().load(&temp.0.join("missing"), None));
         assert!(history.commits.error().is_some());
         assert!(Arc::ptr_eq(history.commits.value().unwrap(), &original));
+    }
+
+    #[test]
+    fn history_reuses_unchanged_commits_and_invalidates_ref_changes() {
+        let temp = TempDir::new();
+        temp.git(&["init", "-q", "-b", "main"]);
+        temp.git(&["config", "user.email", "test@example.com"]);
+        temp.git(&["config", "user.name", "Tester"]);
+        temp.git(&["commit", "--allow-empty", "-qm", "initial"]);
+        temp.git(&["branch", "feature"]);
+        let source = || HistorySource::new(&temp.0.join(".git"), &sg_git::status(&temp.0).unwrap());
+        let load = |previous: &History| previous.load(&temp.0, Some(&source()));
+        let initial = load(&History::default());
+        std::fs::write(temp.0.join("work.txt"), "uncommitted edit").unwrap();
+        let cached = load(&initial);
+        assert!(Arc::ptr_eq(
+            cached.commits.value().unwrap(),
+            initial.commits.value().unwrap()
+        ));
+
+        temp.git(&["tag", "v1"]);
+        let tagged = load(&cached);
+        let commit = &tagged.commits.value().unwrap()[0];
+        assert!(commit.refs.iter().any(|label| label.name == "v1"));
+
+        temp.git(&["switch", "-q", "feature"]);
+        let switched = load(&tagged);
+        let commit = &switched.commits.value().unwrap()[0];
+        assert!(
+            commit
+                .refs
+                .iter()
+                .any(|label| label.name == "feature" && label.current)
+        );
+        assert!(
+            !commit
+                .refs
+                .iter()
+                .any(|label| label.name == "main" && label.current)
+        );
+
+        temp.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let fetched = load(&switched);
+        assert!(
+            fetched.commits.value().unwrap()[0]
+                .refs
+                .iter()
+                .any(|label| label.name == "origin/main")
+        );
+
+        let mut before_manual_refresh = fetched.clone();
+        before_manual_refresh.invalidate();
+        let refreshed = load(&before_manual_refresh);
+        assert!(!Arc::ptr_eq(
+            refreshed.commits.value().unwrap(),
+            fetched.commits.value().unwrap()
+        ));
+    }
+
+    #[test]
+    fn history_refreshes_after_deepening_a_shallow_clone_with_the_same_refs() {
+        let remote = TempDir::new();
+        remote.git(&["init", "-q", "-b", "main"]);
+        remote.git(&["config", "user.email", "test@example.com"]);
+        remote.git(&["config", "user.name", "Tester"]);
+        remote.git(&["commit", "--allow-empty", "-qm", "first"]);
+        remote.git(&["commit", "--allow-empty", "-qm", "second"]);
+        let clone = TempDir::new();
+        clone.git(&[
+            "clone",
+            "-q",
+            "--no-local",
+            "--depth=1",
+            remote.0.to_str().unwrap(),
+            ".",
+        ]);
+        let source = HistorySource::new(&clone.0.join(".git"), &sg_git::status(&clone.0).unwrap());
+        let initial = History::default().load(&clone.0, Some(&source));
+        assert_eq!(initial.commits.value().unwrap().len(), 1);
+        let before = sg_git::history_refs(&clone.0).unwrap();
+        clone.git(&["fetch", "-q", "--deepen=1"]);
+        assert_eq!(sg_git::history_refs(&clone.0).unwrap(), before);
+        let deepened = initial.load(&clone.0, Some(&source));
+        assert_eq!(deepened.commits.value().unwrap().len(), 2);
     }
 
     #[test]
@@ -461,7 +533,15 @@ mod tests {
         );
         assert!(details.status.error().is_none());
         assert!(details.patch.error().is_some());
-        assert_eq!(load_history(&temp.0).commits.value().unwrap().len(), 1);
+        assert_eq!(
+            History::default()
+                .load(&temp.0, None)
+                .commits
+                .value()
+                .unwrap()
+                .len(),
+            1
+        );
 
         temp.git(&["config", "--unset", "diff.broken.textconv"]);
         details.update(load_details(
