@@ -4,7 +4,7 @@
 
 <h1 align="center">SuperGIT</h1>
 
-<p align="center"><strong>One window for your worktrees, agents, and pull requests.</strong></p>
+<p align="center"><strong>Run agents in parallel. Decide exactly what ships.</strong></p>
 
 <p align="center">
   A native Git client for macOS and Linux, built for working on several branches with Claude Code and Codex.
@@ -16,9 +16,9 @@
   <a href="https://github.com/Aitem/SuperGIT/issues">Issues</a>
 </p>
 
-![SuperGIT showing a branch diff beside a Claude Code conversation in the same worktree](assets/media/supergit.png)
+**[Watch the 21-second SuperGIT launch film ↗](assets/media/supergit-demo.mp4)**
 
-[Watch the SuperGIT demo ↗](assets/media/supergit-demo.mp4)
+![SuperGIT showing a branch diff beside a Claude Code conversation in the same worktree](assets/media/supergit.png)
 
 ## From worktree to review
 
