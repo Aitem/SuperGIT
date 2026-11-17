@@ -42,7 +42,7 @@ use crate::difft_view::{self, DifftView};
 use crate::file_tree::{self, TreeRow};
 use crate::graph;
 use crate::launch::{self, TerminalApp};
-use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
+use crate::model::{self, Details, History, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::notifications;
 use crate::settings::{Appearance, DiffLayout};
 use crate::switcher::{self, Destination, Entry};
@@ -145,6 +145,7 @@ enum ContextScope {
 
 struct ReviewView {
     details: Details,
+    history: History,
     selected_commit: Option<String>,
     commit_patch: LoadState<String>,
     commit_submodules: Vec<SubmoduleChange>,
@@ -212,6 +213,7 @@ pub struct SuperGitApp {
     selected: Option<PathBuf>,
     tab: MainTab,
     details: Details,
+    history: History,
     changes_diff: Entity<DiffState>,
     /// The sidebar's width (window-wide, not per project).
     sidebar_layout: Entity<ResizableState>,
@@ -269,6 +271,8 @@ pub struct SuperGitApp {
     poll_task: Option<Task<()>>,
     prs_task: Option<Task<()>>,
     details_task: Option<Task<()>>,
+    history_task: Option<Task<()>>,
+    history_generation: u64,
     commit_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     /// Commit authors' GitHub avatars, loaded once per repository.
@@ -394,6 +398,7 @@ impl SuperGitApp {
             selected: None,
             tab: initial_tab(),
             details: Details::default(),
+            history: History::default(),
             changes_diff,
             sidebar_layout: cx.new(|_| ResizableState::default()),
             chat_layout: cx.new(|_| ResizableState::default()),
@@ -431,6 +436,8 @@ impl SuperGitApp {
             poll_task: None,
             prs_task: None,
             details_task: None,
+            history_task: None,
+            history_generation: 0,
             commit_task: None,
             action_task: None,
             avatars: avatars::Avatars::new(),
@@ -588,6 +595,7 @@ impl SuperGitApp {
                 path.clone(),
                 ReviewView {
                     details: self.details.clone(),
+                    history: self.history.clone(),
                     selected_commit: self.selected_commit.clone(),
                     commit_patch: self.commit_patch.clone(),
                     commit_submodules: self.commit_submodules.clone(),
@@ -609,6 +617,7 @@ impl SuperGitApp {
         self.tab = initial_tab();
         if let Some(cached) = self.review_views.remove(&path) {
             self.details = cached.details;
+            self.history = cached.history;
             self.selected_commit = cached.selected_commit;
             self.commit_patch = cached.commit_patch;
             self.commit_submodules = cached.commit_submodules;
@@ -1358,6 +1367,7 @@ impl SuperGitApp {
             self.queue_persist(cx);
         }
         self.reload_details(cx);
+        self.reload_history(cx);
         if let Some(target) = self.pending_notification.take() {
             let this = cx.entity();
             if let Some(window) = cx.windows().first().copied() {
@@ -1385,7 +1395,7 @@ impl SuperGitApp {
             return;
         };
         let Some(sha) = self
-            .details
+            .history
             .commits
             .value()
             .and_then(|commits| commits.iter().find(|c| c.sha.starts_with(&prefix)))
@@ -1583,20 +1593,6 @@ impl SuperGitApp {
                 }
             }
         }
-        // A failed history refresh must not clear the current review selection.
-        if let LoadState::Ready(commits) = &details.commits
-            && let Some(sha) = &self.selected_commit
-            && !commits.iter().any(|c| &c.sha == sha)
-        {
-            self.selected_commit = None;
-            self.commit_task = None;
-            self.commit_generation += 1;
-            self.commit_patch = LoadState::Loading;
-            self.commit_submodules.clear();
-            self.commit_diff
-                .update(cx, |state, cx| state.set_files(Vec::new(), cx));
-            self.commit_difft.update(cx, |view, cx| view.clear(cx));
-        }
         self.details.update(details);
         if patch_changed {
             self.refresh_difft(FileList::Changes, cx);
@@ -1617,10 +1613,56 @@ impl SuperGitApp {
                 });
             }
         }
-        if self.commit_task.is_none()
+        cx.notify();
+    }
+
+    fn reload_history(&mut self, cx: &mut Context<Self>) {
+        if self.tab != MainTab::History || self.history_task.is_some() {
+            return;
+        }
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        self.history_generation += 1;
+        let generation = self.history_generation;
+        self.history_task = Some(cx.spawn(async move |this, cx| {
+            let selected = path.clone();
+            let history = cx
+                .background_executor()
+                .spawn(async move { model::load_history(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if generation == this.history_generation
+                    && this.selected.as_ref() == Some(&selected)
+                {
+                    this.history_task = None;
+                    this.apply_history(history, cx);
+                }
+            });
+        }));
+    }
+
+    fn apply_history(&mut self, history: History, cx: &mut Context<Self>) {
+        // A failed history refresh must not clear the current review selection.
+        if let LoadState::Ready(commits) = &history.commits
+            && let Some(sha) = &self.selected_commit
+            && !commits.iter().any(|c| &c.sha == sha)
+        {
+            self.selected_commit = None;
+            self.commit_task = None;
+            self.commit_generation += 1;
+            self.commit_patch = LoadState::Loading;
+            self.commit_submodules.clear();
+            self.commit_diff
+                .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+            self.commit_difft.update(cx, |view, cx| view.clear(cx));
+        }
+        self.history.update(history);
+        if self.tab == MainTab::History
+            && self.commit_task.is_none()
             && self.commit_patch.is_loading()
             && let Some(sha) = self.selected_commit.clone().or_else(|| {
-                self.details
+                self.history
                     .commits
                     .value()
                     .and_then(|commits| commits.first())
@@ -1635,9 +1677,12 @@ impl SuperGitApp {
     fn reset_details(&mut self, cx: &mut Context<Self>) {
         self.details_generation += 1;
         self.commit_generation += 1;
+        self.history_generation += 1;
         self.details_task = None;
+        self.history_task = None;
         self.commit_task = None;
         self.details = Details::default();
+        self.history = History::default();
         self.selected_commit = None;
         self.commit_patch = LoadState::Loading;
         self.commit_submodules.clear();
@@ -1673,6 +1718,7 @@ impl SuperGitApp {
         self.refresh_difft(FileList::Changes, cx);
         self.refresh_difft(FileList::Commit, cx);
         self.reload_details(cx);
+        self.reload_history(cx);
         self.queue_persist(cx);
         cx.notify();
     }
@@ -2624,8 +2670,8 @@ impl SuperGitApp {
         };
         let sessions = info.sessions.len();
         // Commits since the branch forked from main; none on main itself.
-        let history = match &self.details.fork {
-            Some(fork) if self.details.path == info.wt.path => {
+        let history = match &self.history.fork {
+            Some(fork) if self.tab == MainTab::History => {
                 format!("History · {}", fork.commits)
             }
             _ => "History".to_string(),
@@ -2674,6 +2720,7 @@ impl SuperGitApp {
                     .selected_index(tab_ix)
                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
                         this.tab = TABS[*ix];
+                        this.reload_history(cx);
                         this.queue_persist(cx);
                         cx.notify();
                     }))
@@ -3864,8 +3911,8 @@ impl SuperGitApp {
         let error = self
             .load_error
             .as_deref()
-            .or_else(|| self.details.commits.error());
-        let Some(commits) = self.details.commits.value() else {
+            .or_else(|| self.history.commits.error());
+        let Some(commits) = self.history.commits.value() else {
             return if let Some(error) = error {
                 self.render_data_notice("History unavailable", Some(error), false, cx)
             } else {
@@ -3977,10 +4024,7 @@ impl SuperGitApp {
 
     /// The selected worktree's fork data, once it is loaded for it.
     fn selected_fork(&self) -> Option<&sg_git::Fork> {
-        self.details
-            .fork
-            .as_ref()
-            .filter(|_| self.selected.as_ref() == Some(&self.details.path))
+        self.history.fork.as_ref()
     }
 
     /// The branch new work forks from (`origin/main`), for ordering badges.
