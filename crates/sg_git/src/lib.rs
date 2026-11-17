@@ -9,6 +9,7 @@
 mod base;
 mod cleanup;
 mod comparison;
+mod diff_hunk;
 pub mod difftastic;
 mod log;
 mod rebase;
@@ -27,13 +28,14 @@ pub use cleanup::{
 pub use comparison::{
     BranchChanges, branch_changes, pr_merge_base, range_patch, resolve_branch, suggested_base,
 };
+pub use diff_hunk::hunk_patch;
 pub use log::{
     Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
     commit_patch, fork, history, log,
 };
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
-pub use staging::{Staging, change_staging};
+pub use staging::{Staging, change_staging, change_staging_hunk, text_hunk};
 pub use status::{
     ChangeScope, FileChange, FileState, WorktreeStatus, scoped_worktree_patch, status,
     worktree_patch,

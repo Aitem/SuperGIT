@@ -639,7 +639,13 @@ impl SuperGitApp {
                 if *active != source {
                     return;
                 }
-                if let DiffEvent::SelectionChanged(Some(range)) = event {
+                if let DiffEvent::SelectionChanged(range) = event {
+                    if !commit {
+                        cx.notify();
+                    }
+                    let Some(range) = range else {
+                        return;
+                    };
                     this.remember_position(
                         ReviewPosition {
                             path: range.path().to_string(),
@@ -3214,6 +3220,9 @@ impl SuperGitApp {
             .border_color(theme.border)
             .children(layouts)
             .child(div().flex_1())
+            .when_some(self.hunk_action_button(list, cx), |toolbar, action| {
+                toolbar.child(action)
+            })
             .child(
                 Button::new(("diff-difftastic", key))
                     .icon(IconName::FileDiff)

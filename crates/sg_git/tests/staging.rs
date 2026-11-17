@@ -159,3 +159,86 @@ fn rejects_stale_selection_and_directory_overlap() {
             .is_empty()
     );
 }
+
+#[test]
+fn stages_and_unstages_one_hunk_without_touching_other_hunks_or_files() {
+    let temp = repository();
+    let root = temp.path();
+    let base: String = (1..=60).map(|line| format!("Line {line}\n")).collect();
+    let file = root.join("two [hunks].txt");
+    std::fs::write(&file, &base).unwrap();
+    git(root, ["add", "."]).unwrap();
+    git(root, ["commit", "-qm", "baseline"]).unwrap();
+
+    let working = base
+        .replace("Line 5\n", "First edit\n")
+        .replace("Line 55\n", "Second edit\n");
+    std::fs::write(&file, &working).unwrap();
+    let snapshot = status(root).unwrap();
+    let change = &snapshot.files[0];
+    let patch = scoped_worktree_patch(root, &snapshot, ChangeScope::Unstaged).unwrap();
+    sg_git::change_staging_hunk(
+        root,
+        &snapshot,
+        change,
+        Staging::Stage,
+        &patch.text,
+        (false, 55),
+    )
+    .unwrap();
+
+    let index = git(root, ["show", ":two [hunks].txt"]).unwrap();
+    assert!(index.contains("Line 5\n") && !index.contains("First edit"));
+    assert!(index.contains("Second edit"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), working);
+
+    let staged = status(root).unwrap();
+    let patch = scoped_worktree_patch(root, &staged, ChangeScope::Staged).unwrap();
+    sg_git::change_staging_hunk(
+        root,
+        &staged,
+        &staged.files[0],
+        Staging::Unstage,
+        &patch.text,
+        (true, 55),
+    )
+    .unwrap();
+    assert_eq!(git(root, ["show", ":two [hunks].txt"]).unwrap(), base);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), working);
+}
+
+#[test]
+fn hunk_action_rejects_a_stale_diff_even_when_status_is_unchanged() {
+    let temp = repository();
+    let root = temp.path();
+    std::fs::write(root.join("chosen.txt"), "preceding\nbase\nfollowing\n").unwrap();
+    git(root, ["add", "."]).unwrap();
+    git(root, ["commit", "-qm", "baseline"]).unwrap();
+    std::fs::write(root.join("chosen.txt"), "preceding\nreviewed\nfollowing\n").unwrap();
+
+    let snapshot = status(root).unwrap();
+    let patch = scoped_worktree_patch(root, &snapshot, ChangeScope::Unstaged).unwrap();
+    std::fs::write(root.join("chosen.txt"), "preceding\nnewer\nfollowing\n").unwrap();
+    assert_eq!(status(root).unwrap(), snapshot);
+    assert!(
+        sg_git::change_staging_hunk(
+            root,
+            &snapshot,
+            &snapshot.files[0],
+            Staging::Stage,
+            &patch.text,
+            (false, 2)
+        )
+        .is_err()
+    );
+    assert!(
+        git(root, ["diff", "--cached", "--name-only"])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        std::fs::read_to_string(root.join("chosen.txt"))
+            .unwrap()
+            .contains("newer")
+    );
+}
