@@ -52,6 +52,7 @@ fn request(path: &str) -> FileRequest {
         old_path: None,
         added: false,
         deleted: false,
+        submodule: false,
     }
 }
 
@@ -70,6 +71,7 @@ fn compares_commits_and_the_working_tree() {
         &Source::Revision("HEAD^".into()),
         &Source::Revision("HEAD".into()),
         &[request("lib.rs")],
+        &[],
     )
     .unwrap();
     assert_eq!(pairs[0].old, Content::Absent);
@@ -96,6 +98,7 @@ fn compares_commits_and_the_working_tree() {
                 ..request("new.py")
             },
         ],
+        &[],
     )
     .unwrap();
     let files = difftastic::compare_many(&pairs.iter().collect::<Vec<_>>());
@@ -115,6 +118,7 @@ fn compares_commits_and_the_working_tree() {
         &Source::Revision("HEAD".into()),
         &Source::WorkTree,
         &[request("lib.rs")],
+        &[],
     )
     .unwrap();
     let file = &difftastic::compare_many(&pairs.iter().collect::<Vec<_>>())[0];

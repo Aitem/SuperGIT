@@ -14,6 +14,7 @@ mod log;
 mod rebase;
 mod runner;
 mod status;
+mod submodule;
 mod worktree;
 
 pub use base::{BaseInfo, Upstream, load_base, update_base};
@@ -32,6 +33,10 @@ pub use log::{
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
 pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};
+pub use submodule::{
+    Inline, MAX_COMMITS, Patch, SubmoduleChange, SubmoduleCommit, SubmoduleFlags,
+    inline_submodules, submodule_of, with_submodule_files,
+};
 pub use worktree::{Worktree, add_worktree, list_worktrees, remove_worktree};
 
 use std::path::{Path, PathBuf};

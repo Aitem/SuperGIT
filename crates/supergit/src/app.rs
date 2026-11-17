@@ -15,7 +15,8 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable as _, Selectable as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{
-    Diff, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffMode, DiffSide, DiffState,
+    Diff, DiffAnnotation, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffMode,
+    DiffSide, DiffState,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
@@ -27,7 +28,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_agents::{AgentState, Provider, Session};
 use sg_git::{
-    Commit, CommitDetails, FileChange, FileState, RefKind, RefLabel, Repo, relative_time,
+    Commit, CommitDetails, FileChange, FileState, RefKind, RefLabel, Repo, SubmoduleChange,
+    relative_time,
 };
 use sg_github::{PrState, PullRequest};
 
@@ -144,6 +146,7 @@ struct ReviewView {
     details: Details,
     selected_commit: Option<String>,
     commit_patch: LoadState<String>,
+    commit_submodules: Vec<SubmoduleChange>,
     changes_diff: Entity<DiffState>,
     commit_diff: Entity<DiffState>,
     changes_difft: Entity<DifftView>,
@@ -226,6 +229,8 @@ pub struct SuperGitApp {
     /// `None` until looked up; then the installed version, if any.
     difft_version: Option<Option<String>>,
     commit_patch: LoadState<String>,
+    /// The submodules the selected commit moves, inlined in its patch.
+    commit_submodules: Vec<SubmoduleChange>,
     /// The selected commit's card (full message, dates); matched by sha.
     commit_details: Option<CommitDetails>,
     details_generation: u64,
@@ -401,6 +406,7 @@ impl SuperGitApp {
             difftastic: settings.difftastic,
             difft_version: None,
             commit_patch: LoadState::Loading,
+            commit_submodules: Vec::new(),
             commit_details: None,
             details_generation: 0,
             commit_generation: 0,
@@ -583,6 +589,7 @@ impl SuperGitApp {
                     details: self.details.clone(),
                     selected_commit: self.selected_commit.clone(),
                     commit_patch: self.commit_patch.clone(),
+                    commit_submodules: self.commit_submodules.clone(),
                     changes_diff: self.changes_diff.clone(),
                     commit_diff: self.commit_diff.clone(),
                     changes_difft: self.changes_difft.clone(),
@@ -603,6 +610,7 @@ impl SuperGitApp {
             self.details = cached.details;
             self.selected_commit = cached.selected_commit;
             self.commit_patch = cached.commit_patch;
+            self.commit_submodules = cached.commit_submodules;
             self.changes_diff = cached.changes_diff;
             self.commit_diff = cached.commit_diff;
             self.changes_difft = cached.changes_difft;
@@ -1579,6 +1587,7 @@ impl SuperGitApp {
             self.commit_task = None;
             self.commit_generation += 1;
             self.commit_patch = LoadState::Loading;
+            self.commit_submodules.clear();
             self.commit_diff
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
             self.commit_difft.update(cx, |view, cx| view.clear(cx));
@@ -1626,6 +1635,7 @@ impl SuperGitApp {
         self.details = Details::default();
         self.selected_commit = None;
         self.commit_patch = LoadState::Loading;
+        self.commit_submodules.clear();
         self.changes_diff = new_diff_state(self.diff_layout, cx);
         self.commit_diff = new_diff_state(self.diff_layout, cx);
         let mode = diff_mode(self.diff_layout);
@@ -1679,6 +1689,7 @@ impl SuperGitApp {
                     .commit_position = None;
             }
             self.commit_patch = LoadState::Loading;
+            self.commit_submodules.clear();
             self.commit_diff
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
             self.commit_difft.update(cx, |view, cx| view.clear(cx));
@@ -1707,11 +1718,12 @@ impl SuperGitApp {
                     return;
                 }
                 let patch = patch.and_then(|patch| {
-                    let files = crate::syntax::parse_patch(&patch)
+                    let files = crate::syntax::parse_patch(&patch.text)
                         .map_err(|e| format!("Cannot display commit diff: {e}"))?;
                     this.commit_diff
                         .update(cx, |state, cx| state.set_files(files, cx));
-                    Ok(patch)
+                    this.commit_submodules = patch.submodules;
+                    Ok(patch.text)
                 });
                 this.commit_patch.update(LoadState::from_result(patch));
                 this.commit_details = details;
@@ -3119,10 +3131,10 @@ impl SuperGitApp {
             };
             // Split wraps long lines so each side keeps half the width, as
             // on GitHub; Unified scrolls sideways instead.
-            Diff::new(state)
+            let diff = Diff::new(state)
                 .line_number(true)
-                .soft_wrap(self.diff_layout == DiffLayout::Split)
-                .into_any_element()
+                .soft_wrap(self.diff_layout == DiffLayout::Split);
+            with_submodule_cards(diff, self.submodules(list)).into_any_element()
         };
         v_flex()
             .size_full()
@@ -3255,7 +3267,13 @@ impl SuperGitApp {
                 self.pr_difft_parts().map(|(patch, _, _)| patch),
             ),
         };
-        let files: Vec<_> = state.read(cx).files().iter().map(file_request).collect();
+        let submodules = self.submodules(list).to_vec();
+        let files: Vec<_> = state
+            .read(cx)
+            .files()
+            .iter()
+            .map(|file| file_request(file, &submodules))
+            .collect();
         let sources = match list {
             FileList::Changes => Some((
                 match (&self.details.base, &self.details.merge_base) {
@@ -3292,9 +3310,19 @@ impl SuperGitApp {
             old,
             new,
             files,
+            submodules,
             revision,
         };
         view.update(cx, |view, cx| view.load(request, cx));
+    }
+
+    /// The submodules `list`'s patch changes.
+    fn submodules(&self, list: FileList) -> &[SubmoduleChange] {
+        match list {
+            FileList::Changes => &self.details.submodules,
+            FileList::Commit => &self.commit_submodules,
+            FileList::Pull => self.pr_submodules(),
+        }
     }
 
     fn set_diff_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
@@ -3648,6 +3676,8 @@ impl SuperGitApp {
             || (cfg!(feature = "screenshot")
                 && std::env::var_os("SUPERGIT_CHANGES_TREE").is_some());
         let query = filter.read(cx).value().to_string();
+        let submodules = self.submodules(list);
+        let submodule = |path: &str| submodules.iter().find(|s| s.path == path);
         let visible: Vec<usize> = (0..files.len())
             .filter(|&ix| file_tree::matches(&files[ix].path, &query))
             .collect();
@@ -3666,20 +3696,63 @@ impl SuperGitApp {
             .into_iter()
             .enumerate()
             .map(|(row, entry)| match entry {
+                // A submodule with changed files inside: a click shows its
+                // entry, the chevron folds its files.
+                TreeRow::Dir {
+                    path,
+                    name,
+                    depth,
+                    collapsed,
+                    files: count,
+                    entry: Some(ix),
+                } => Self::file_menu(
+                    submodule_dir_row(
+                        row,
+                        &files[ix],
+                        submodule(&files[ix].path),
+                        name,
+                        depth,
+                        (collapsed, count),
+                        theme,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_dir(list, path.clone(), cx)
+                        }),
+                    )
+                    .on_click(Self::open_file(
+                        list,
+                        files[ix].path.clone(),
+                        cx,
+                    )),
+                    files[ix].path.clone(),
+                    cx,
+                ),
                 TreeRow::Dir {
                     path,
                     name,
                     depth,
                     collapsed,
                     files,
+                    entry: None,
                 } => tree_dir_row(row, name, depth, collapsed, files, theme)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.toggle_dir(list, path.clone(), cx)),
                     )
                     .into_any_element(),
                 TreeRow::File { ix, name, depth } => Self::file_menu(
-                    change_row(ix, &files[ix], name, tree_indent(depth), theme)
-                        .on_click(Self::open_file(list, files[ix].path.clone(), cx)),
+                    change_row(
+                        ix,
+                        &files[ix],
+                        submodule(&files[ix].path),
+                        name,
+                        tree_indent(depth),
+                        theme,
+                    )
+                    .on_click(Self::open_file(
+                        list,
+                        files[ix].path.clone(),
+                        cx,
+                    )),
                     files[ix].path.clone(),
                     cx,
                 ),
@@ -3691,8 +3764,19 @@ impl SuperGitApp {
                 .map(|&ix| {
                     let file = &files[ix];
                     Self::file_menu(
-                        change_row(ix, file, file.path.clone(), px(12.), theme)
-                            .on_click(Self::open_file(list, file.path.clone(), cx)),
+                        change_row(
+                            ix,
+                            file,
+                            submodule(&file.path),
+                            file.path.clone(),
+                            px(12.),
+                            theme,
+                        )
+                        .on_click(Self::open_file(
+                            list,
+                            file.path.clone(),
+                            cx,
+                        )),
                         file.path.clone(),
                         cx,
                     )
@@ -4801,8 +4885,46 @@ fn diff_mode(layout: DiffLayout) -> DiffMode {
     }
 }
 
+/// Submodule entries in `diff` get a `submodule` tag after their path and a
+/// card under their header: the recorded commits, the commits in between
+/// and the state of the checkout.
+fn with_submodule_cards(diff: Diff, submodules: &[SubmoduleChange]) -> Diff {
+    if submodules.is_empty() {
+        return diff;
+    }
+    let submodules = std::rc::Rc::new(submodules.to_vec());
+    let cards = submodules.clone();
+    let tags = submodules.clone();
+    diff.annotations(submodules.iter().map(|submodule| {
+        DiffAnnotation::file(
+            crate::submodules::card_id(submodule),
+            submodule.path.clone(),
+        )
+    }))
+    .render_annotation(move |annotation, _, cx| {
+        cards
+            .iter()
+            .find(|submodule| submodule.path == annotation.path().as_ref())
+            .map(|submodule| crate::submodules::card(submodule, cx.theme()))
+            .unwrap_or_else(div)
+    })
+    .render_header_title_suffix(move |file, _, cx| {
+        if tags
+            .iter()
+            .any(|submodule| submodule.path == file.path().as_ref())
+        {
+            crate::submodules::tag(cx.theme())
+        } else {
+            div()
+        }
+    })
+}
+
 /// A file of a parsed patch, as difftastic should compare it.
-fn file_request(file: &DiffFile) -> sg_git::difftastic::FileRequest {
+fn file_request(
+    file: &DiffFile,
+    submodules: &[SubmoduleChange],
+) -> sg_git::difftastic::FileRequest {
     let old_path = match (file.original_path(), file.modified_path()) {
         (Some(old), Some(new)) if old != new => Some(old.to_string()),
         _ => None,
@@ -4812,6 +4934,7 @@ fn file_request(file: &DiffFile) -> sg_git::difftastic::FileRequest {
         old_path,
         added: file.status() == DiffFileStatus::Added,
         deleted: file.status() == DiffFileStatus::Deleted,
+        submodule: submodules.iter().any(|s| s.path == file.path().as_ref()),
     }
 }
 
@@ -4992,6 +5115,7 @@ fn commit_file(file: &DiffFile) -> FileChange {
             .map(|orig| orig.to_string()),
         staged: None,
         unstaged: Some(state),
+        submodule: None,
     }
 }
 
@@ -5001,15 +5125,18 @@ fn tree_indent(depth: usize) -> Pixels {
 }
 
 /// A changed file in the Changes tab's list, labelled `label` (the path, or
-/// the file name inside the tree).
+/// the file name inside the tree). A submodule shows its icon and what
+/// changed in it.
 fn change_row(
     ix: usize,
     file: &FileChange,
+    submodule: Option<&SubmoduleChange>,
     label: String,
     indent: Pixels,
     theme: &gpui_kit::component::Theme,
 ) -> Stateful<Div> {
     let state = file.state();
+    let is_submodule = submodule.is_some() || file.submodule.is_some();
     h_flex()
         .id(("change", ix))
         .pl(indent)
@@ -5027,7 +5154,95 @@ fn change_row(
                 .text_color(file_state_color(state, theme))
                 .child(state.letter()),
         )
-        .child(div().min_w_0().truncate().child(label))
+        .when(is_submodule, |el| {
+            el.child(
+                Icon::new(IconName::FolderGit2)
+                    .small()
+                    .text_color(theme.muted_foreground),
+            )
+        })
+        .child(submodule_label(label, submodule, theme))
+        .when(file.staged.is_some(), |el| {
+            el.child(div().text_xs().text_color(theme.success).child("staged"))
+        })
+}
+
+/// A file-list label; a submodule's has what changed in it underneath.
+fn submodule_label(
+    label: String,
+    submodule: Option<&SubmoduleChange>,
+    theme: &gpui_kit::component::Theme,
+) -> Div {
+    let summary = submodule
+        .map(crate::submodules::summary)
+        .filter(|summary| !summary.is_empty());
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .child(div().truncate().child(label))
+        .when_some(summary, |el, summary| {
+            el.child(
+                div()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(summary),
+            )
+        })
+}
+
+/// A submodule in the tree whose changed files are listed inside it: a
+/// folder row (`toggle` on its chevron) that is also the submodule's entry.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one row builder, mirroring change_row and tree_dir_row"
+)]
+fn submodule_dir_row(
+    row: usize,
+    file: &FileChange,
+    submodule: Option<&SubmoduleChange>,
+    name: String,
+    depth: usize,
+    (collapsed, files): (bool, usize),
+    theme: &gpui_kit::component::Theme,
+    toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let muted = theme.muted_foreground;
+    let state = file.state();
+    h_flex()
+        .id(("change-dir", row))
+        .pl(tree_indent(depth))
+        .pr_3()
+        .py_1()
+        .gap_2()
+        .text_sm()
+        .cursor_pointer()
+        .hover(|el| el.bg(theme.list_hover))
+        .child(
+            div()
+                .id(("change-dir-toggle", row))
+                .w(px(14.))
+                .flex_none()
+                .on_click(toggle)
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .small()
+                    .text_color(muted),
+                ),
+        )
+        .child(
+            Icon::new(IconName::FolderGit2)
+                .small()
+                .text_color(file_state_color(state, theme)),
+        )
+        .child(submodule_label(name, submodule, theme))
+        .when(collapsed, |el| {
+            el.child(div().text_xs().text_color(muted).child(files.to_string()))
+        })
         .when(file.staged.is_some(), |el| {
             el.child(div().text_xs().text_color(theme.success).child("staged"))
         })

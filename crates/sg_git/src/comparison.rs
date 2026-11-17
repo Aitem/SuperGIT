@@ -5,13 +5,17 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use crate::runner::git_bytes_in_index;
+use crate::status::PATCH_OPTIONS;
+use crate::submodule::{Patch, SubmoduleChange, inline_submodules, with_submodule_files};
 use crate::{FileChange, FileState, WorktreeStatus, git};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchChanges {
     pub merge_base: String,
+    /// The superproject's files, each changed submodule's after its entry.
     pub files: Vec<FileChange>,
     pub patch: String,
+    pub submodules: Vec<SubmoduleChange>,
 }
 
 /// Only branch refs are accepted; revision expressions/options are not bases.
@@ -62,20 +66,13 @@ pub fn pr_merge_base(repo: &Path, base_oid: &str, base: &str, head: &str) -> Res
         .to_string())
 }
 
-/// The patch from `from` to `head`, as `git diff` shows it.
-pub fn range_patch(repo: &Path, from: &str, head: &str) -> Result<String> {
-    git(
-        repo,
-        [
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "-M",
-            from,
-            head,
-            "--",
-        ],
-    )
+/// The patch from `from` to `head`, as `git diff` shows it, with changed
+/// submodules inlined from their checkouts in `repo`.
+pub fn range_patch(repo: &Path, from: &str, head: &str) -> Result<Patch> {
+    let mut args = vec!["diff"];
+    args.extend(PATCH_OPTIONS);
+    args.extend([from, head, "--"]);
+    Ok(inline_submodules(repo, &git(repo, args)?, None))
 }
 
 /// An explicit default suggestion, never a hard-coded assumption about main.
@@ -135,26 +132,47 @@ pub fn branch_changes(
             git_bytes_in_index(worktree, args, Some(index))?;
         }
     }
-    let patch = git_bytes_in_index(
+    let mut args = vec!["diff"];
+    args.extend(PATCH_OPTIONS);
+    args.extend(["--no-textconv", &merge_base, "--"]);
+    let patch = git_bytes_in_index(worktree, args, index.as_deref())?;
+    let patch = inline_submodules(worktree, &String::from_utf8_lossy(&patch), Some(status));
+    let raw = git_bytes_in_index(
         worktree,
         [
             "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
+            "--name-status",
+            "-z",
             "-M",
+            "--submodule=short",
             &merge_base,
             "--",
         ],
         index.as_deref(),
     )?;
-    let patch = String::from_utf8_lossy(&patch).into_owned();
-    let raw = git_bytes_in_index(
-        worktree,
-        ["diff", "--name-status", "-z", "-M", &merge_base, "--"],
-        index.as_deref(),
-    )?;
-    let text = String::from_utf8_lossy(&raw);
+    let mut files = parse_name_status(&String::from_utf8_lossy(&raw));
+    // A conflicted index may emit multiple records for a path.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
+    for file in &mut files {
+        if status
+            .files
+            .iter()
+            .any(|current| current.path == file.path && current.state() == FileState::Conflicted)
+        {
+            file.unstaged = Some(FileState::Conflicted);
+        }
+    }
+    Ok(BranchChanges {
+        merge_base,
+        files: with_submodule_files(files, &patch.submodules),
+        patch: patch.text,
+        submodules: patch.submodules,
+    })
+}
+
+/// `git diff --name-status -z` records as changed files.
+pub(crate) fn parse_name_status(text: &str) -> Vec<FileChange> {
     let mut fields = text.split('\0');
     let mut files = Vec::new();
     while let Some(code) = fields.next().filter(|code| !code.is_empty()) {
@@ -173,25 +191,9 @@ pub fn branch_changes(
         files.push(FileChange {
             path,
             orig_path,
-            staged: None,
             unstaged: Some(FileState::from_code(kind).unwrap_or(FileState::Conflicted)),
+            ..FileChange::default()
         });
     }
-    // A conflicted index may emit multiple records for a path.
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files.dedup_by(|a, b| a.path == b.path);
-    for file in &mut files {
-        if status
-            .files
-            .iter()
-            .any(|current| current.path == file.path && current.state() == FileState::Conflicted)
-        {
-            file.unstaged = Some(FileState::Conflicted);
-        }
-    }
-    Ok(BranchChanges {
-        merge_base,
-        files,
-        patch,
-    })
+    files
 }

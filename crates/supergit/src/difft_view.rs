@@ -16,6 +16,7 @@ use gpui_kit::component::scroll::{ScrollableMask, Scrollbar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use sg_git::SubmoduleChange;
 use sg_git::difftastic::{self, FilePair, FileRequest, Line, Outcome, Source, StructuralFile};
 
 use crate::syntax::{self, LineHighlights};
@@ -35,6 +36,8 @@ pub struct Request {
     pub old: Source,
     pub new: Source,
     pub files: Vec<FileRequest>,
+    /// Submodules the patch changes: their files are read from their checkouts.
+    pub submodules: Vec<SubmoduleChange>,
     /// Changes with the patch, so edits in the working tree are picked up.
     pub revision: u64,
 }
@@ -92,6 +95,8 @@ enum LineKind {
 enum Item {
     Header(usize),
     Note(SharedString),
+    /// A submodule's recorded commits: the same card as in the line diff.
+    Submodule(Box<SubmoduleChange>),
     /// Folded unchanged rows of a file; a click reveals them.
     Gap {
         file: usize,
@@ -295,6 +300,15 @@ impl DifftView {
             if self.collapsed.contains(&file.path) {
                 continue;
             }
+            if file.outcome == Outcome::Submodule
+                && let Some(change) = self
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.submodules.iter().find(|s| s.path == file.path))
+            {
+                items.push(Item::Submodule(Box::new(change.clone())));
+                continue;
+            }
             let note = match &file.outcome {
                 Outcome::Binary => Some("Binary file not shown".to_string()),
                 Outcome::TooLarge => Some("File too large for difftastic".to_string()),
@@ -307,6 +321,7 @@ impl DifftView {
                     "No syntactic changes — only whitespace, formatting or the file mode differ"
                         .to_string(),
                 ),
+                Outcome::Submodule => Some("Submodule".to_string()),
                 Outcome::Changed | Outcome::Created | Outcome::Deleted => None,
             };
             if let Some(note) = note {
@@ -417,6 +432,7 @@ fn prepare(
         &request.old,
         &request.new,
         &request.files,
+        &request.submodules,
     )?;
     let fingerprints: Vec<u64> = pairs.iter().map(FilePair::fingerprint).collect();
     let missing: Vec<&FilePair> = pairs
@@ -607,6 +623,15 @@ fn render_item(ix: usize, p: &Presentation, _window: &mut Window, cx: &mut App) 
             .text_sm()
             .text_color(cx.theme().muted_foreground)
             .child(text.clone())
+            .into_any_element(),
+        Item::Submodule(change) => div()
+            .w_full()
+            .px_3()
+            .py_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.18))
+            .child(crate::submodules::card(change, cx.theme()))
             .into_any_element(),
         Item::Gap { file, rows } => render_gap(ix, *file, rows.clone(), p, cx),
         Item::Pair { file, row } => {

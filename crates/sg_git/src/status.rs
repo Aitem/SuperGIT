@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::submodule::{Patch, SubmoduleFlags, inline_submodules};
 use crate::{git, git_bytes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +45,7 @@ impl FileState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileChange {
     pub path: String,
     pub orig_path: Option<String>,
@@ -52,6 +53,8 @@ pub struct FileChange {
     pub staged: Option<FileState>,
     /// Change in the working tree not yet staged.
     pub unstaged: Option<FileState>,
+    /// A submodule: what changed in its checkout (`git status` only).
+    pub submodule: Option<SubmoduleFlags>,
 }
 
 impl FileChange {
@@ -142,7 +145,7 @@ fn parse_status(out: &str) -> WorktreeStatus {
             b'1' => {
                 let parts: Vec<&str> = entry.splitn(9, ' ').collect();
                 if parts.len() == 9 {
-                    st.files.push(change(parts[1], parts[8], None));
+                    st.files.push(change(parts[1], parts[2], parts[8], None));
                 }
             }
             // 2 XY sub mH mI mW hH hI Xscore path \0 origPath
@@ -150,7 +153,7 @@ fn parse_status(out: &str) -> WorktreeStatus {
                 let parts: Vec<&str> = entry.splitn(10, ' ').collect();
                 let orig = fields.next().map(str::to_string);
                 if parts.len() == 10 {
-                    st.files.push(change(parts[1], parts[9], orig));
+                    st.files.push(change(parts[1], parts[2], parts[9], orig));
                 }
             }
             // u XY sub m1 m2 m3 mW h1 h2 h3 path
@@ -159,17 +162,16 @@ fn parse_status(out: &str) -> WorktreeStatus {
                 if parts.len() == 11 {
                     st.files.push(FileChange {
                         path: parts[10].into(),
-                        orig_path: None,
-                        staged: None,
                         unstaged: Some(FileState::Conflicted),
+                        submodule: SubmoduleFlags::parse(parts[2]),
+                        ..FileChange::default()
                     });
                 }
             }
             b'?' => st.files.push(FileChange {
                 path: entry[2..].into(),
-                orig_path: None,
-                staged: None,
                 unstaged: Some(FileState::Untracked),
+                ..FileChange::default()
             }),
             _ => {}
         }
@@ -177,34 +179,48 @@ fn parse_status(out: &str) -> WorktreeStatus {
     st
 }
 
-fn change(xy: &str, path: &str, orig_path: Option<String>) -> FileChange {
+fn change(xy: &str, sub: &str, path: &str, orig_path: Option<String>) -> FileChange {
     let xy = xy.as_bytes();
     FileChange {
         path: path.into(),
         orig_path,
         staged: xy.first().copied().and_then(FileState::from_code),
         unstaged: xy.get(1).copied().and_then(FileState::from_code),
+        submodule: SubmoduleFlags::parse(sub),
     }
 }
+
+/// `git diff` options for every patch SuperGIT shows: plain output whatever
+/// the user's config, with submodules as `Subproject commit` entries for
+/// [`inline_submodules`] to expand.
+pub(crate) const PATCH_OPTIONS: [&str; 6] = [
+    "--no-color",
+    "--no-ext-diff",
+    "--submodule=short",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "-M",
+];
 
 const MAX_UNTRACKED_FILES: usize = 100;
 const MAX_UNTRACKED_BYTES: u64 = 256 * 1024;
 
 /// Unified patch of everything that differs from HEAD in the worktree:
-/// staged and unstaged changes, plus untracked files as new-file patches.
-pub fn worktree_patch(worktree: &Path, status: &WorktreeStatus) -> Result<String> {
+/// staged and unstaged changes, plus untracked files as new-file patches;
+/// changed submodules with their own changes inlined.
+pub fn worktree_patch(worktree: &Path, status: &WorktreeStatus) -> Result<Patch> {
+    let diff = |args: &[&str]| {
+        let mut all = vec!["diff"];
+        all.extend(PATCH_OPTIONS);
+        all.extend(args);
+        git(worktree, all)
+    };
     let mut patch = if status.is_unborn() {
-        let mut p = git(
-            worktree,
-            ["diff", "--cached", "--no-color", "--no-ext-diff"],
-        )?;
-        p.push_str(&git(worktree, ["diff", "--no-color", "--no-ext-diff"])?);
+        let mut p = diff(&["--cached"])?;
+        p.push_str(&diff(&[])?);
         p
     } else {
-        git(
-            worktree,
-            ["diff", "HEAD", "--no-color", "--no-ext-diff", "-M", "--"],
-        )?
+        diff(&["HEAD", "--"])?
     };
 
     for file in status
@@ -215,10 +231,10 @@ pub fn worktree_patch(worktree: &Path, status: &WorktreeStatus) -> Result<String
     {
         append_new_file_patch(&mut patch, worktree, &file.path);
     }
-    Ok(patch)
+    Ok(inline_submodules(worktree, &patch, Some(status)))
 }
 
-fn append_new_file_patch(patch: &mut String, worktree: &Path, rel: &str) {
+pub(crate) fn append_new_file_patch(patch: &mut String, worktree: &Path, rel: &str) {
     let full = worktree.join(rel);
     let Ok(meta) = std::fs::symlink_metadata(&full) else {
         return;
