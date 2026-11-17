@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod details;
+mod publish;
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -15,6 +16,11 @@ use serde::Deserialize;
 pub use details::{
     AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review,
     ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_details,
+};
+
+pub use publish::{
+    DraftPullRequest, PublishBase, PublishRepository, create_draft_pr, open_pr_from_branch,
+    publish_repository,
 };
 
 /// Run `gh` in `repo` without prompts or colors; stdout on success, its

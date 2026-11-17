@@ -4871,7 +4871,7 @@ impl Render for SuperGitApp {
                 el.child(self.render_rebase_dialog(cx))
             })
             .when(self.pulls.dialog_open(), |el| {
-                el.child(self.render_merge_dialog(cx))
+                el.child(self.render_pr_dialog(cx))
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
