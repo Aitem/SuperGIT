@@ -1,107 +1,75 @@
-# SuperGIT
+<p align="center">
+  <img src="assets/icon-1024.png" width="104" alt="SuperGIT app icon">
+</p>
 
-A native Git GUI for macOS and Linux built around agent-driven development: many
-**worktrees**, many **Claude Code sessions**, and the **commits and pull
-requests** they produce — all in one window.
+<h1 align="center">SuperGIT</h1>
 
-Written in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
-(Zed's GPU UI framework) via [gpui-kit](https://gpui-kit.com).
+<p align="center"><strong>Run agents in parallel. Decide exactly what ships.</strong></p>
 
-## What it does
+<p align="center">
+  A native Git client for macOS and Linux, built for working on several branches with Claude Code and Codex.
+</p>
 
-- **Claude, built in** — a native chat panel on the right (`cmd-l`), like the
-  VS Code extension: streaming answers in Markdown, tool calls with inline
-  diffs, **permission prompts as cards** (Allow / Allow all edits this session
-  / Deny), Stop, permission mode (Ask / Edits / Plan / Auto / Bypass; Auto by
-  default). Every worktree has its own conversations (tabs) that keep running
-  while you look at other worktrees; `cmd-n` starts a new one. Sessions are
-  regular Claude Code sessions — open any past one from the **Claude** tab
-  (history included) or continue it in a terminal.
+<p align="center">
+  <a href="https://github.com/Aitem/SuperGIT/releases">Releases</a> ·
+  <a href="#get-started">Get started</a> ·
+  <a href="https://github.com/Aitem/SuperGIT/issues">Issues</a>
+</p>
 
-- **Worktrees sidebar** — every worktree of the repo with branch, changed files,
-  ahead/behind, its PR (number, state, CI) and live Claude activity
-  (`working` / `needs you` / `done`).
-- **Changes** — full diff of the worktree against HEAD, untracked files included.
-- **History** — commits of the worktree's branch with refs; commits co-authored
-  by Claude are marked `✦`; click a commit to see its diff.
-- **Claude tab** — every session that ran in this worktree (found from Claude
-  Code's own transcripts, nothing to configure): AI title, last prompt,
-  branch, age; **Open** it in the panel or resume it in a **Terminal**.
-- **Pull requests** — the selected worktree's PRs (its branch or the branch it
-  pushes to, plus PRs linked by hand) or all of them, searchable (number,
-  title, branch, `@author`; older PRs via GitHub search). A PR shows its
-  conversation — description, comments, reviews, inline review threads (jump
-  to the line in the diff), every check with links to its logs — and a merge
-  box: merge / squash / rebase after a confirmation (pinned to the shown head
-  commit) or enable auto-merge. **Files changed** shows its diff like History
-  does — file list (filter, tree), Unified/Split, difftastic when the PR's
-  commits are local; right-click asks the worktree's agent about a file or
-  hunk. Diffs GitHub refuses (too large) are computed from local commits.
-  Open in the browser or check one out into a new worktree.
-- **Create / remove worktrees** — new branch → sibling directory
-  `<repo>-<branch>`; removal asks for confirmation (twice when dirty).
-- Refreshes every 3 s (PRs every minute); `cmd-r` refreshes now.
+**[Watch the 21-second SuperGIT launch film ↗](assets/media/supergit-demo.mp4)**
 
-## Install
+![SuperGIT showing a branch diff beside a Claude Code conversation in the same worktree](assets/media/supergit.png)
 
-Requires macOS or Linux, [rustup](https://rustup.rs), `git`, and the
-[`gh` CLI](https://cli.github.com) (logged in) for pull requests.
+## From worktree to review
 
-As a Mac app in `/Applications` (Dock, Spotlight, Launchpad):
+| When you need to… | In SuperGIT |
+| --- | --- |
+| **Work on several branches** | Give each branch its own worktree. Switch projects and see the branch status, PR, and agent activity in the sidebar. |
+| **Review exactly what goes into a commit** | Compare staged and unstaged changes, stage a file or a single hunk, then commit, amend, or squash a run of local commits. |
+| **Give an agent the right context** | Send a file or hunk to Claude Code or Codex. Pick the model and reasoning effort, inspect tool diffs, and answer approval prompts in the chat. Each worktree keeps its own conversations. |
+| **Sync a branch** | Fetch remote refs, pull its upstream by fast-forward, or preview a rebase onto a local branch. |
+| **Review a GitHub PR** | Read the conversation, commits, checks, and changed files. Jump from a review thread to the exact line, check out the PR in a worktree, or merge it from the app. |
+
+## Get started
+
+You’ll need **Git**. For GitHub pull requests, install the [GitHub CLI](https://cli.github.com/) and run `gh auth login`. Native chats use your existing [Claude Code](https://code.claude.com/docs/en/quickstart) or [Codex CLI](https://developers.openai.com/codex/cli) installation and sign-in.
+
+Download packages from [GitHub Releases](https://github.com/Aitem/SuperGIT/releases). Choose the Apple Silicon app ZIP on macOS or the matching binary archive on Linux.
+
+For builds from source, install [Rustup](https://rustup.rs/). The repository pins its Rust toolchain.
+
+**macOS** · Build and install `SuperGIT.app` in Applications.
 
 ```sh
-scripts/bundle-macos.sh --install   # rebuild + reinstall after every pull/change
+scripts/bundle-macos.sh --install
 ```
 
-It is a local, ad-hoc signed build — no Apple developer account needed.
-The script quits a running SuperGIT, moves the new bundle into place (the
-staging folder is `.noindex`, so Spotlight never shows a second copy).
-Launched from the Dock it reopens the last repository; `cmd-o` opens another,
-**Recent** (`cmd-shift-o`) lists the previous ones. You can also drop a repo
-folder on the Dock icon or run `open -a SuperGIT ~/Work/myrepo`. The app takes
-`PATH` from your login shell, so `gh`/`claude` resolve as in a terminal.
-
-On Linux (needs the usual GPUI libraries: Wayland or X11, `libxkbcommon`,
-Vulkan drivers, `fontconfig`), for the current user:
+**Linux** · Install the binary and desktop launcher for the current user. The app uses the system’s Wayland or X11, `libxkbcommon`, Vulkan drivers, and fontconfig.
 
 ```sh
-scripts/install-linux.sh            # ~/.local/bin/supergit + launcher + icon
-scripts/install-linux.sh --uninstall
+scripts/install-linux.sh
 ```
 
-Shortcuts use `ctrl` where macOS uses `cmd`, menus sit in the window's title
-bar, notifications go to the desktop's notification server (click one to open
-the conversation), and settings live in `~/.config/supergit`. Running
-`supergit <dir>` (or "Open with SuperGIT" in a file manager) while SuperGIT is
-open hands the folder to the running window, like `open -a` on macOS.
-
-As a terminal command:
+Open SuperGIT from the launcher or point the CLI at any worktree:
 
 ```sh
-cargo install --path crates/supergit
+supergit ~/work/my-project
 ```
 
-## Use
+### Shortcuts worth learning
 
-```sh
-supergit                  # the repository containing the current directory
-supergit ~/Work/myrepo    # a specific repository (any of its worktrees works)
-supergit --dump [PATH]    # print worktrees, sessions and PRs as text
-```
+| Action | macOS | Linux |
+| --- | --- | --- |
+| Jump to a project, worktree, PR, or conversation | ⌘ P | Ctrl P |
+| Toggle the chat | ⌘ L | Ctrl L |
+| Start a conversation in the selected worktree | ⌘ N | Ctrl N |
+| Refresh | ⌘ R | Ctrl R |
+| Open a repository | ⌘ O | Ctrl O |
 
-| Variable            | Meaning                                                        |
-| ------------------- | -------------------------------------------------------------- |
-| `SUPERGIT_TERMINAL` | where sessions open — macOS: `ghostty`, `iterm`, `terminal`; Linux: `ghostty`, `kitty`, `wezterm`, `alacritty`, `konsole`, `gnome-terminal`, `ptyxis`, `xfce4-terminal`, `foot`, `xterm` (default: first installed; on Linux `$TERMINAL`, then the desktop's own) |
-| `SUPERGIT_EDITOR`   | editor CLI for the **Editor** button, e.g. `zed`, `cursor` (default: VS Code; on Linux the first of `code`, `codium`, `zed`, `zeditor`, `cursor`) |
-| `SUPERGIT_NEW_INSTANCE` | Linux: run a separate instance instead of handing the folder to the open one |
-| `SUPERGIT_TAB`      | tab at startup: `changes`, `history`, `claude`, `prs`          |
-| `SUPERGIT_APPEARANCE` | `system`, `light`, `dark` for this run (the saved choice is in View ▸ Appearance) |
+## Built with Rust and GPUI
 
-## Develop
+SuperGIT uses your local Git CLI and its repository configuration. Claude Code and Codex conversations are ordinary provider sessions you can resume from the app or a terminal. Unified and split diffs are built in, with optional structural diffs through [Difftastic](https://difftastic.wilfred.me.uk/).
 
-See [CLAUDE.md](CLAUDE.md) for the layout, commands and conventions, and
-[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next.
+See the [developer notes](CLAUDE.md) for build and test commands and the [roadmap](docs/ROADMAP.md) for what’s next.
 
-## License
-
-[MIT](LICENSE)
+[MIT License](LICENSE)
