@@ -14,7 +14,7 @@ use crate::attention::{Attention, Kind};
 use futures::StreamExt as _;
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
+use gpui_kit::component::diff::{Diff, DiffState};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::TextView;
@@ -815,7 +815,9 @@ impl ChatSession {
         if let Some(d) = self.diffs.get(key) {
             return Some(d.clone());
         }
-        let files = DiffFile::parse(patch).ok().filter(|f| !f.is_empty())?;
+        let files = crate::syntax::parse_patch(patch)
+            .ok()
+            .filter(|f| !f.is_empty())?;
         let lines = patch
             .lines()
             .filter(|l| {

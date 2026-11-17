@@ -8,7 +8,8 @@ for the author and colleagues: macOS only, GitHub only (via `gh`).
 
 ```
 crates/
-  sg_git/      git core: worktrees, status, log, diffs (git CLI, porcelain -z)
+  sg_git/      git core: worktrees, status, log, diffs (git CLI, porcelain -z);
+               difftastic.rs runs the optional `difft` and aligns its JSON
   sg_github/   pull requests through the `gh` CLI
   sg_agents/   provider-neutral agent layer: `Provider`, chat model
                (chat.rs: Conversation/Item/PermissionRequest), `AgentProcess`
@@ -21,7 +22,8 @@ crates/
                item summaries/diffs (tools.rs), rollout discovery (sessions.rs)
   supergit/    the app (GPUI): main.rs, app.rs (view), model.rs (background
                loading), launch.rs (terminals/editor/browser), dump.rs,
-               screenshot.rs (feature `screenshot`)
+               screenshot.rs (feature `screenshot`), difft_view.rs (the
+               difftastic diff view), syntax.rs (syntect highlight names)
 docs/ROADMAP.md
 ```
 
@@ -220,3 +222,12 @@ never commit, push or create worktrees there without asking.
 - Never modify the user's `~/.claude` configuration (hooks etc.) without asking.
 - Commits by agents carry a `Co-Authored-By: Claude …` trailer — the History
   view relies on it for the `✦` marker.
+- **Diffs**: gpui-kit's `Diff` with its `syntect` feature (syntax colors;
+  `syntax::parse_patch` names languages its detector misses, e.g. Clojure).
+  Unified/Split and "show with difftastic" live in `settings.json`
+  (`diff_layout`, `difftastic`) and the toolbar above each diff. The
+  difftastic view needs `difft` on PATH (`DFT_UNSTABLE=yes --display json`);
+  JSON gives novel token ranges only, so `sg_git::difftastic` reads both
+  sides itself and lines them up. Screenshot checks: write
+  `{"diff_layout":"split","difftastic":true}` to
+  `$SUPERGIT_STATE_DIR/settings.json`.

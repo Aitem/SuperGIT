@@ -112,6 +112,34 @@ pub(crate) fn git_input(cwd: &Path, args: &[&str], input: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run git with `input` on stdin and return raw stdout. Stdin is written on
+/// its own thread so a large request cannot deadlock against a full stdout.
+pub(crate) fn git_bytes_with_input(cwd: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let (mut command, printable) = command(cwd, args);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output()?;
+    let written = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git stdin writer failed"))?;
+    if !out.status.success() {
+        return Err(GitError {
+            args: printable,
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+        .into());
+    }
+    written?;
+    Ok(out.stdout)
+}
+
 /// Bound network operations, including credential and SSH subprocesses.
 pub(crate) fn git_timeout(cwd: &Path, args: &[&str], timeout: std::time::Duration) -> Result<()> {
     use std::io::Read as _;

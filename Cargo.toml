@@ -20,7 +20,9 @@ sg_codex = { path = "crates/sg_codex" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-gpui-kit = "0.9.1"
+# `syntect`: syntax highlighting in diffs and code blocks (~200 languages,
+# including Clojure, for a few MB — the tree-sitter set costs tens).
+gpui-kit = { version = "0.9.1", features = ["syntect"] }
 futures = "0.3"
 
 # Guardrails for agent-written code (warnings fail CI). Silence one only with

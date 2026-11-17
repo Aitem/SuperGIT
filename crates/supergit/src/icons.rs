@@ -7,7 +7,18 @@ use std::borrow::Cow;
 use gpui_kit::assets::Assets;
 use gpui_kit::{AssetSource, SharedString};
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [List, ListTree, Tag]);
+gpui_kit::assets::icon_assets!(
+    ExtraIcons,
+    [
+        List,
+        ListTree,
+        Tag,
+        Rows2,
+        Columns2,
+        FileDiff,
+        ChevronsUpDown
+    ]
+);
 
 pub struct AppAssets;
 
@@ -38,6 +49,10 @@ mod tests {
             IconName::List,
             IconName::ListTree,
             IconName::Tag,
+            IconName::Rows2,
+            IconName::Columns2,
+            IconName::FileDiff,
+            IconName::ChevronsUpDown,
             IconName::ChevronRight,
             IconName::ChevronDown,
             IconName::Folder,

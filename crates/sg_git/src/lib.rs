@@ -9,6 +9,7 @@
 mod base;
 mod cleanup;
 mod comparison;
+pub mod difftastic;
 mod log;
 mod rebase;
 mod runner;
