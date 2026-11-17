@@ -3077,6 +3077,7 @@ impl SuperGitApp {
             ("File diff".into(), raw.to_string())
         };
         Ok(Attachment {
+            kind: agent_context::AttachmentKind::Diff,
             worktree: path,
             path: relative,
             comparison: format!(
@@ -3107,7 +3108,7 @@ impl SuperGitApp {
     ) {
         if self.selected.as_ref() != Some(&item.worktree) {
             self.flash(
-                "This selection belongs to another worktree. Reopen its diff to attach it.",
+                "This context belongs to another worktree. Switch back before attaching it.",
                 true,
                 cx,
             );
