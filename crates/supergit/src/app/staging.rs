@@ -92,3 +92,138 @@ impl SuperGitApp {
         })
     }
 }
+
+struct IndexHunk {
+    worktree: PathBuf,
+    snapshot: sg_git::WorktreeStatus,
+    file: FileChange,
+    action: Staging,
+    source: String,
+    original: bool,
+    line: usize,
+}
+
+impl SuperGitApp {
+    fn selected_index_hunk(&self, action: Staging, cx: &App) -> Option<IndexHunk> {
+        let expected_scope = match action {
+            Staging::Stage => ChangeScope::Unstaged,
+            Staging::Unstage => ChangeScope::Staged,
+        };
+        if self.tab != MainTab::Changes
+            || self.change_scope() != expected_scope
+            || self.details.scope != expected_scope
+            || self.difftastic_active()
+        {
+            return None;
+        }
+        let path = self.selected.as_ref()?;
+        if self.details.path != *path
+            || self.details.base.is_some()
+            || self.details.patch.error().is_some()
+            || self.details.status.error().is_some()
+            || self.load_error.is_some()
+        {
+            return None;
+        }
+        let status = self.details.status.value()?;
+        let state = self.changes_diff.read(cx);
+        let range = state.selected_lines()?;
+        let parsed = state
+            .files()
+            .iter()
+            .find(|file| file.path() == range.path())?;
+        if parsed.is_truncated() || parsed.is_binary() {
+            return None;
+        }
+        let file = status
+            .files
+            .iter()
+            .find(|file| file.path == range.path().as_ref() && action.hunk_available(file))?;
+        let patch = self.details.patch.value()?;
+        let source = agent_context::file_patch(patch, &file.path)?;
+        let original = range.side() == DiffSide::Original;
+        let selected = sg_git::text_hunk(source, original, range.start())?;
+        if range.start() != range.end() || range.side() != range.end_side() {
+            let end =
+                sg_git::text_hunk(source, range.end_side() == DiffSide::Original, range.end())?;
+            if selected != end {
+                return None;
+            }
+        }
+        Some(IndexHunk {
+            worktree: path.clone(),
+            snapshot: sg_git::WorktreeStatus {
+                branch: status.branch.clone(),
+                head_oid: status.head_oid.clone(),
+                ..Default::default()
+            },
+            file: file.clone(),
+            action,
+            source: source.to_owned(),
+            original,
+            line: range.start(),
+        })
+    }
+
+    pub(super) fn hunk_action_button(
+        &self,
+        list: FileList,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
+        if list != FileList::Changes || self.difftastic_active() || self.comparison_base().is_some()
+        {
+            return None;
+        }
+        let (action, name) = match self.change_scope() {
+            ChangeScope::Staged => (Staging::Unstage, "Unstage hunk"),
+            ChangeScope::Unstaged => (Staging::Stage, "Stage hunk"),
+            ChangeScope::All => return None,
+        };
+        let selected = self.selected_index_hunk(action, cx);
+        let disabled = self.action_task.is_some()
+            || self.cleanup_task.is_some()
+            || selected
+                .as_ref()
+                .is_none_or(|hunk| self.base_update_paths.contains(&hunk.worktree));
+        Some(
+            Button::new("change-index-hunk")
+                .label(name)
+                .xsmall()
+                .outline()
+                .tooltip("Select line numbers inside one hunk of a tracked text file")
+                .disabled(disabled)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.apply_selected_index_hunk(action, name, cx);
+                })),
+        )
+    }
+
+    fn apply_selected_index_hunk(
+        &mut self,
+        action: Staging,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.selected_index_hunk(action, cx) else {
+            return;
+        };
+        if self.base_update_paths.contains(&selection.worktree) {
+            return;
+        }
+        self.run_git_action(
+            format!("{label} in {}", selection.file.path),
+            None,
+            move || {
+                sg_git::change_staging_hunk(
+                    &selection.worktree,
+                    &selection.snapshot,
+                    &selection.file,
+                    selection.action,
+                    &selection.source,
+                    (selection.original, selection.line),
+                )
+            },
+            cx,
+        );
+    }
+}
