@@ -2,6 +2,7 @@
 //! history, agent sessions and pull requests on the right.
 
 mod base;
+mod issue_worktree;
 mod projects;
 mod pulls;
 mod sidebar;
@@ -169,6 +170,8 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
+    issue_worktree: Option<issue_worktree::IssueWorktree>,
+    issue_handle: FocusHandle,
     creation_base: LoadState<sg_git::BaseInfo>,
     creation_base_task: Option<Task<()>>,
     base_update_error: Option<String>,
@@ -354,6 +357,8 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
+            issue_worktree: None,
+            issue_handle: cx.focus_handle(),
             creation_base: LoadState::Loading,
             creation_base_task: None,
             base_update_error: None,
@@ -1835,6 +1840,7 @@ impl SuperGitApp {
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.issue_worktree = None;
         self.creation_base = LoadState::Loading;
         self.base_update_error = None;
         self.observed_open_prs.clear();
@@ -4872,6 +4878,9 @@ impl Render for SuperGitApp {
             })
             .when(self.pulls.dialog_open(), |el| {
                 el.child(self.render_merge_dialog(cx))
+            })
+            .when(self.issue_worktree.is_some(), |el| {
+                el.child(self.render_issue_worktree(cx))
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))

@@ -12,6 +12,9 @@ use std::process::{Command, Stdio};
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
+mod issues;
+pub use issues::{Issue, IssueReference, view_issue};
+
 pub use details::{
     AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review,
     ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_details,

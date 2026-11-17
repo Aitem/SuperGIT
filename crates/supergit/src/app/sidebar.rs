@@ -736,12 +736,29 @@ impl SuperGitApp {
             .child(self.render_creation_base(cx))
             .child(Input::new(&self.branch_input).small())
             .child(
-                Button::new("create-worktree")
-                    .label("Create worktree")
-                    .small()
-                    .primary()
-                    .disabled(self.action_task.is_some() || self.cleanup_task.is_some())
-                    .on_click(cx.listener(|this, _, window, cx| this.create_worktree(window, cx))),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("create-worktree")
+                            .flex_1()
+                            .label("Create worktree")
+                            .small()
+                            .primary()
+                            .disabled(self.action_task.is_some() || self.cleanup_task.is_some())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.create_worktree(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("create-from-issue")
+                            .label("From issue…")
+                            .small()
+                            .outline()
+                            .disabled(self.action_task.is_some() || self.cleanup_task.is_some())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_issue_worktree(window, cx)
+                            })),
+                    ),
             )
             .into_any_element()
     }
