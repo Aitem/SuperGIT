@@ -20,6 +20,8 @@ use sg_github::{
 
 use super::*;
 
+mod publish;
+
 /// Open PRs change while you look at them (checks, reviews, pushes).
 const OPEN_DETAILS_REFRESH: Duration = Duration::from_secs(20);
 const CLOSED_DETAILS_REFRESH: Duration = Duration::from_secs(300);
@@ -120,6 +122,10 @@ pub(super) struct Pulls {
     /// A review thread's file and line to show once the diff is ready.
     pending_jump: Option<(u64, String, Option<u64>)>,
     merge: Option<MergeDialog>,
+    publish: Option<publish::PublishDialog>,
+    publish_task: Option<Task<()>>,
+    #[cfg(feature = "screenshot")]
+    debug_publish_opened: bool,
     merge_task: Option<Task<()>>,
     merge_handle: FocusHandle,
     _subscriptions: [Subscription; 2],
@@ -191,6 +197,10 @@ impl Pulls {
             files_layout: cx.new(|_| ResizableState::default()),
             pending_jump: None,
             merge: None,
+            publish: None,
+            publish_task: None,
+            #[cfg(feature = "screenshot")]
+            debug_publish_opened: false,
             merge_task: None,
             merge_handle: cx.focus_handle(),
             _subscriptions: [subscription, filter_subscription],
@@ -214,6 +224,7 @@ impl Pulls {
         self.toggled_threads.clear();
         self.close_check_inspection();
         self.merge = None;
+        self.publish = None;
         self.patches.clear();
         self.patch_task = None;
         self.diff_shown = None;
@@ -226,7 +237,7 @@ impl Pulls {
     }
 
     pub(super) fn dialog_open(&self) -> bool {
-        self.merge.is_some()
+        self.merge.is_some() || self.publish.is_some()
     }
 }
 
@@ -567,7 +578,10 @@ impl SuperGitApp {
             return;
         };
         #[cfg(feature = "screenshot")]
-        self.debug_pr_once(&info, cx);
+        {
+            self.debug_pr_once(&info, cx);
+            self.debug_publish_dialog(info.wt.path.clone(), cx);
+        }
         let path = info.wt.path.clone();
         let key = self.fetch_key(&info);
         let due = match self.pulls.worktree.get(&path) {
@@ -1547,6 +1561,7 @@ impl SuperGitApp {
                             .text_color(theme.muted_foreground),
                     ),
             )
+            .child(self.render_publish_button(info, cx))
             .child(
                 h_flex()
                     .gap_1()
@@ -2692,7 +2707,10 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    pub(super) fn render_merge_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_pr_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(dialog) = &self.pulls.publish {
+            return self.render_publish_dialog(dialog, cx);
+        }
         let Some(dialog) = &self.pulls.merge else {
             return div().into_any_element();
         };
