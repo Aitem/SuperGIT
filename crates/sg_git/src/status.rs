@@ -99,6 +99,18 @@ impl WorktreeStatus {
     }
 }
 
+/// Worktree sidebar polling. An explicitly opted-in probe may answer when
+/// its supported Git layout and config match. Operations still read CLI status.
+pub fn polled_status(worktree: &Path) -> Result<WorktreeStatus> {
+    #[cfg(feature = "git2-probe")]
+    if crate::use_git2_probe()
+        && let Ok(status) = crate::native_status::read(worktree)
+    {
+        return Ok(status);
+    }
+    status(worktree)
+}
+
 pub fn status(worktree: &Path) -> Result<WorktreeStatus> {
     let out = git_bytes(
         worktree,

@@ -108,6 +108,16 @@ pub fn history(path: &Path, limit: usize) -> Result<Vec<Commit>> {
 /// The refs that supply history, decorations and replacement history. Include
 /// symbolic targets and the checked out branch even when their OIDs agree.
 pub fn history_refs(path: &Path) -> Result<Vec<u8>> {
+    #[cfg(feature = "git2-probe")]
+    if crate::use_git2_probe()
+        && let Ok(refs) = crate::native_refs::read(path)
+    {
+        return Ok(refs);
+    }
+    history_refs_cli(path)
+}
+
+pub(crate) fn history_refs_cli(path: &Path) -> Result<Vec<u8>> {
     git_bytes(
         path,
         [
