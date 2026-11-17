@@ -626,21 +626,26 @@ impl SuperGitApp {
             .into_any_element()
     }
     pub(super) fn kept_active(&self, path: &Path) -> bool {
-        self.repository_view()
-            .worktrees
-            .get(path)
-            .is_some_and(|view| view.kept)
+        self.active_scope().kept(path)
     }
 
     pub(super) fn worktree_busy(&self, info: &WorktreeInfo, cx: &App) -> bool {
+        self.busy_in(self.active_scope(), info, cx)
+    }
+
+    fn busy_in(&self, scope: Scope<'_>, info: &WorktreeInfo, cx: &App) -> bool {
         matches!(
-            self.agent_state_for(info, cx),
+            self.row_agent_state(scope, info, cx),
             Some(AgentState::Working | AgentState::NeedsAttention)
         )
     }
 
     pub(super) fn worktree_has_draft(&self, path: &Path, cx: &App) -> bool {
-        let saved = self.repository_view().conversations.get(path);
+        self.has_draft_in(self.repository_view(), path, cx)
+    }
+
+    fn has_draft_in(&self, view: &RepositoryView, path: &Path, cx: &App) -> bool {
+        let saved = view.conversations.get(path);
         let native = self
             .chats
             .get(path)
@@ -661,23 +666,26 @@ impl SuperGitApp {
     }
 
     pub(super) fn is_completed(&self, info: &WorktreeInfo, cx: &App) -> bool {
-        let pr = self.pr_for_branch(info.wt.branch.as_deref());
+        self.completed_in(self.active_scope(), info, cx)
+    }
+
+    /// Whether a worktree of `scope`'s project is done with (merged, clean,
+    /// nothing pending).
+    pub(super) fn completed_in(&self, scope: Scope<'_>, info: &WorktreeInfo, cx: &App) -> bool {
+        let pr = scope.pr_for_branch(info.wt.branch.as_deref());
         crate::lifecycle::Completion {
             main: info.wt.is_main,
-            kept: self.kept_active(info.path()),
+            kept: scope.kept(info.path()),
             locked: info.wt.locked.is_some(),
             available: !info.wt.is_bare && info.wt.prunable.is_none() && info.status.is_ok(),
             clean: info.status.as_ref().is_ok_and(|status| status.is_clean()),
-            busy: self.worktree_busy(info, cx),
+            busy: self.busy_in(scope, info, cx),
             unread: matches!(
-                self.native_attention_for(info.path(), cx),
-                Some(Kind::Completed | Kind::Failed)
+                self.native_attention_in(scope.view, info.path(), cx),
+                Some((Kind::Completed | Kind::Failed, ..))
             ),
-            pending_draft: self.worktree_has_draft(info.path(), cx),
-            prs_fresh: self.prs_error.is_none()
-                && self
-                    .prs_fetched_at
-                    .is_some_and(|time| time.elapsed() < PR_POLL_INTERVAL * 2),
+            pending_draft: self.has_draft_in(scope.view, info.path(), cx),
+            prs_fresh: scope.prs_fresh,
             merged: pr.is_some_and(|pr| pr.state == PrState::Merged),
             local_tip: info
                 .status
@@ -690,15 +698,25 @@ impl SuperGitApp {
     }
 
     pub(super) fn set_completed_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
-        if let Some(repo) = &self.repo {
-            self.persisted
-                .repositories
-                .entry(repo.root.clone())
-                .or_default()
-                .completed_collapsed = collapsed;
-            self.queue_persist(cx);
-            cx.notify();
+        if let Some(root) = self.active_root().map(Path::to_path_buf) {
+            self.set_completed_collapsed_in(root, collapsed, cx);
         }
+    }
+
+    /// Fold or unfold a project's COMPLETED group in the sidebar.
+    pub(super) fn set_completed_collapsed_in(
+        &mut self,
+        root: PathBuf,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.persisted
+            .repositories
+            .entry(root)
+            .or_default()
+            .completed_collapsed = collapsed;
+        self.queue_persist(cx);
+        cx.notify();
     }
 
     pub(super) fn toggle_keep_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {

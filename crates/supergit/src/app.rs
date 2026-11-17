@@ -4,6 +4,7 @@
 mod base;
 mod projects;
 mod pulls;
+mod sidebar;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -56,7 +57,6 @@ actions!(
         CloseRepository,
         ToggleClaude,
         ToggleSidebar,
-        ToggleProjects,
         NewClaudeChat,
         OpenSwitcher,
         CloseSwitcher,
@@ -94,12 +94,34 @@ impl MainTab {
 
 #[derive(Clone, Copy)]
 enum LayoutPanel {
-    Sidebar,
     Chat,
     Changes,
     History,
     CommitFiles,
     Pulls,
+}
+
+/// The project a sidebar row belongs to: the active one (live data, every
+/// action) or another one, shown from its last snapshot.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    view: &'a RepositoryView,
+    prs: &'a [PullRequest],
+    /// The pull requests tell merged branches apart (completed worktrees).
+    prs_fresh: bool,
+    active: bool,
+}
+
+impl<'a> Scope<'a> {
+    fn kept(&self, path: &Path) -> bool {
+        self.view.worktrees.get(path).is_some_and(|view| view.kept)
+    }
+
+    fn pr_for_branch(&self, branch: Option<&str>) -> Option<&'a PullRequest> {
+        let branch = branch?;
+        // Open pull requests come first, so one wins over an old merged one.
+        self.prs.iter().find(|pr| pr.head_branch == branch)
+    }
 }
 
 /// A file list beside a diff: the Changes tab's, the selected commit's, or
@@ -187,6 +209,7 @@ pub struct SuperGitApp {
     tab: MainTab,
     details: Details,
     changes_diff: Entity<DiffState>,
+    /// The sidebar's width (window-wide, not per project).
     sidebar_layout: Entity<ResizableState>,
     chat_layout: Entity<ResizableState>,
     changes_layout: Entity<ResizableState>,
@@ -217,10 +240,11 @@ pub struct SuperGitApp {
     commit_filter: Entity<InputState>,
     commit_collapsed: HashSet<String>,
     commit_files_layout: Entity<ResizableState>,
-    /// The Projects panel's width (window-wide, not per repository).
-    projects_layout: Entity<ResizableState>,
-    /// Inactive projects' last worktrees and PRs, for instant switching.
+    /// Inactive projects' last worktrees and PRs, for the sidebar and
+    /// instant switching.
     project_cache: HashMap<PathBuf, projects::ProjectSnapshot>,
+    /// Background reads of inactive projects that have no snapshot yet.
+    project_loads: HashMap<PathBuf, projects::ProjectLoad>,
 
     /// Native agent conversations (Claude, Codex) per worktree (tabs in the
     /// right panel).
@@ -386,8 +410,8 @@ impl SuperGitApp {
             commit_filter,
             commit_collapsed: HashSet::new(),
             commit_files_layout: cx.new(|_| ResizableState::default()),
-            projects_layout: cx.new(|_| ResizableState::default()),
             project_cache: HashMap::new(),
+            project_loads: HashMap::new(),
             chats: HashMap::new(),
             active_chat: HashMap::new(),
             chat_projects: HashMap::new(),
@@ -418,26 +442,17 @@ impl SuperGitApp {
         this.detect_difftastic(cx);
         this.focus_handle.focus(window, cx);
         this.start_polling(cx);
+        this.load_inactive_projects(cx);
         this
     }
 
-    fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32, f32) {
-        let total = window.viewport_size().width.as_f32() - self.projects_width(cx);
+    /// The agent panel's widest size and the main area's width, beside the
+    /// sidebar.
+    fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32) {
+        let total = window.viewport_size().width.as_f32() - self.sidebar_width(cx);
         let show_chat = self.chat_open && self.selected.is_some();
-        let sidebar_max = (total - if show_chat { 680. } else { 360. }).clamp(220., 520.);
         let saved = self.repository_view();
-        let sidebar = if saved.sidebar_open {
-            self.sidebar_layout
-                .read(cx)
-                .sizes()
-                .first()
-                .map(|v| v.as_f32())
-                .unwrap_or(saved.sidebar_width)
-                .clamp(220., sidebar_max)
-        } else {
-            RAIL_WIDTH
-        };
-        let chat_max = (total - sidebar - 360.).clamp(320., 960.);
+        let chat_max = (total - 360.).clamp(320., 960.);
         let chat = if show_chat {
             self.chat_layout
                 .read(cx)
@@ -451,15 +466,22 @@ impl SuperGitApp {
         } else {
             0.
         };
-        (sidebar_max, chat_max, (total - sidebar - chat).max(360.))
+        (chat_max, (total - chat).max(360.))
     }
 
     fn repository_view(&self) -> &RepositoryView {
-        static EMPTY: std::sync::OnceLock<RepositoryView> = std::sync::OnceLock::new();
-        self.repo
-            .as_ref()
-            .and_then(|repo| self.persisted.repositories.get(&repo.root))
-            .unwrap_or_else(|| EMPTY.get_or_init(RepositoryView::default))
+        match &self.repo {
+            Some(repo) => self.view_of(&repo.root),
+            None => empty_view(),
+        }
+    }
+
+    /// A project's saved view (the defaults until it has one).
+    fn view_of(&self, root: &Path) -> &RepositoryView {
+        self.persisted
+            .repositories
+            .get(root)
+            .unwrap_or_else(|| empty_view())
     }
 
     fn queue_persist(&mut self, cx: &mut Context<Self>) {
@@ -768,7 +790,6 @@ impl SuperGitApp {
             .entry(repo.root.clone())
             .or_default();
         match panel {
-            LayoutPanel::Sidebar => view.sidebar_width = width,
             LayoutPanel::Chat => view.chat_width = width,
             LayoutPanel::Changes => view.changes_width = width,
             LayoutPanel::History => view.history_width = width,
@@ -1723,8 +1744,8 @@ impl SuperGitApp {
     }
 
     /// Open the repository containing `path` (from the dialog, a recent entry,
-    /// the Projects panel, a folder dropped on the Dock icon or `open -a
-    /// SuperGIT <dir>`) and add it to the Projects panel. The previous
+    /// the sidebar, a folder dropped on the Dock icon or `open -a
+    /// SuperGIT <dir>`) and add it to the sidebar's projects. The previous
     /// project keeps its conversations running. Returns whether it opened.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
         let repo = match Repo::discover(&path) {
@@ -1753,7 +1774,6 @@ impl SuperGitApp {
             self.stash_project();
             self.repo = Some(repo);
             self.reset_view(cx);
-            self.sidebar_layout = cx.new(|_| ResizableState::default());
             self.chat_layout = cx.new(|_| ResizableState::default());
             self.changes_layout = cx.new(|_| ResizableState::default());
             self.history_layout = cx.new(|_| ResizableState::default());
@@ -2170,20 +2190,6 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// Collapse the worktree list to a rail of status dots, or expand it
-    /// (remembered per repository).
-    pub fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(repo) = &self.repo else { return };
-        let view = self
-            .persisted
-            .repositories
-            .entry(repo.root.clone())
-            .or_default();
-        view.sidebar_open = !view.sidebar_open;
-        self.queue_persist(cx);
-        cx.notify();
-    }
-
     fn active_chat_entity(&self) -> Option<Entity<ChatSession>> {
         let path = self.selected.as_ref()?;
         let list = self.chats.get(path)?;
@@ -2242,38 +2248,45 @@ impl SuperGitApp {
             .min()
     }
 
-    fn native_attention_for(&self, path: &Path, cx: &App) -> Option<Kind> {
-        self.native_attention(path, cx).map(|(kind, _)| kind)
-    }
-
-    /// The most urgent attention among a worktree's conversations, with the
-    /// agent of the first conversation that has it.
-    fn native_attention(&self, path: &Path, cx: &App) -> Option<(Kind, Provider)> {
-        let states: Vec<(&crate::attention::Attention, Provider)> =
+    /// The most urgent attention among a worktree's conversations in a
+    /// project (`view` is its saved view), with the agent and local id of the
+    /// first conversation that has it.
+    fn native_attention_in(
+        &self,
+        view: &RepositoryView,
+        path: &Path,
+        cx: &App,
+    ) -> Option<(Kind, Provider, String)> {
+        let states: Vec<(&crate::attention::Attention, Provider, &str)> =
             if let Some(chats) = self.chats.get(path) {
                 chats
                     .iter()
                     .map(|chat| {
                         let chat = chat.read(cx);
-                        (chat.attention(), chat.provider())
+                        (chat.attention(), chat.provider(), chat.local_id())
                     })
                     .collect()
             } else {
-                self.repository_view()
-                    .conversations
+                view.conversations
                     .get(path)
                     .into_iter()
                     .flatten()
-                    .filter_map(|chat| Some((&chat.attention, Provider::parse(&chat.provider)?)))
+                    .filter_map(|chat| {
+                        Some((
+                            &chat.attention,
+                            Provider::parse(&chat.provider)?,
+                            chat.local_id.as_str(),
+                        ))
+                    })
                     .collect()
             };
         [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
             .into_iter()
             .find_map(|kind| {
-                states.iter().find_map(|(state, provider)| {
+                states.iter().find_map(|(state, provider, id)| {
                     (state.kind == kind
                         && (matches!(kind, Kind::Running | Kind::Approval) || state.unread))
-                        .then_some((kind, *provider))
+                        .then(|| (kind, *provider, (*id).to_string()))
                 })
             })
     }
@@ -2432,75 +2445,6 @@ impl SuperGitApp {
 
     // ---- rendering -------------------------------------------------------
 
-    /// The collapsed worktree list: one cell per worktree with its initials
-    /// and agent status dot (name in the tooltip), and a button to expand.
-    fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let cells = self.worktrees.iter().enumerate().map(|(ix, info)| {
-            let selected = self.selected.as_deref() == Some(info.path());
-            let path = info.wt.path.clone();
-            let name = info.wt.display_name();
-            let initials = initials(&name);
-            let agent = self.agent_state_for(info, cx);
-            let tooltip = match agent {
-                Some(state) => format!("{name} · claude {}", state.label()),
-                None => name,
-            };
-            v_flex()
-                .id(("rail-worktree", ix))
-                .w_full()
-                .py_1p5()
-                .gap_1()
-                .items_center()
-                .cursor_pointer()
-                .border_l_2()
-                .border_color(if selected {
-                    theme.primary
-                } else {
-                    transparent_black()
-                })
-                .when(selected, |el| el.bg(theme.sidebar_accent))
-                .hover(|el| el.bg(theme.sidebar_accent))
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| this.select_worktree(path.clone(), cx)))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(initials),
-                )
-                .child(agent_dot(agent, &theme))
-        });
-        v_flex()
-            .w(px(RAIL_WIDTH))
-            .flex_none()
-            .h_full()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex().justify_center().py_1().child(
-                    Button::new("expand-sidebar")
-                        .icon(IconName::PanelLeftOpen)
-                        .xsmall()
-                        .ghost()
-                        .tooltip("Expand the worktree list (cmd-b)")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_sidebar(&ToggleSidebar, window, cx)
-                        })),
-                ),
-            )
-            .child(
-                v_flex()
-                    .id("worktree-rail")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(cells),
-            )
-            .into_any_element()
-    }
-
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let indicators =
             [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
@@ -2622,299 +2566,6 @@ impl SuperGitApp {
         )
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let mut active = Vec::new();
-        let mut completed = Vec::new();
-        let mut completed_paths = Vec::new();
-        for (ix, info) in self.worktrees.iter().enumerate() {
-            if self.is_completed(info, cx) {
-                completed_paths.push(info.wt.path.clone());
-                if !self.repository_view().completed_collapsed {
-                    completed.push(self.render_worktree_row(ix, info, &theme, cx));
-                }
-            } else {
-                active.push(self.render_worktree_row(ix, info, &theme, cx));
-            }
-        }
-        let completed_count = completed_paths.len();
-        let active_count = active.len();
-        let collapsed = self.repository_view().completed_collapsed;
-
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .h_full()
-            .flex_none()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .justify_between()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("WORKTREES · {}", self.worktrees.len()))
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .when_some(self.load_error.clone(), |el, e| {
-                                el.child(div().text_color(theme.danger).truncate().child(e))
-                            })
-                            .child(
-                                Button::new("collapse-sidebar")
-                                    .icon(IconName::PanelLeftClose)
-                                    .xsmall()
-                                    .ghost()
-                                    .tooltip("Collapse the worktree list (cmd-b)")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_sidebar(&ToggleSidebar, window, cx)
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .id("worktrees")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .when(completed_count > 0, |list| {
-                        list.child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("ACTIVE · {active_count}")),
-                        )
-                    })
-                    .children(active)
-                    .when(completed_count > 0, |list| {
-                        list.child(
-                            h_flex()
-                                .px_2()
-                                .py_1()
-                                .justify_between()
-                                .child(
-                                    Button::new("completed-group")
-                                        .label(format!(
-                                            "{} COMPLETED · {completed_count}",
-                                            if collapsed { "▸" } else { "▾" }
-                                        ))
-                                        .xsmall()
-                                        .ghost()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_completed_collapsed(!collapsed, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("preview-completed-cleanup")
-                                        .label("Clean up…")
-                                        .tooltip(
-                                            "Clean up completed worktrees and their local branches",
-                                        )
-                                        .xsmall()
-                                        .ghost()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.open_cleanup_preview(
-                                                completed_paths.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        })),
-                                ),
-                        )
-                        .children(completed)
-                    }),
-            )
-            .child(
-                v_flex()
-                    .p_2()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(theme.sidebar_border)
-                    .child(self.render_creation_base(cx))
-                    .child(Input::new(&self.branch_input).small())
-                    .child(
-                        Button::new("create-worktree")
-                            .label("Create worktree")
-                            .small()
-                            .primary()
-                            .disabled(self.action_task.is_some() || self.cleanup_task.is_some())
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.create_worktree(window, cx)),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_worktree_row(
-        &self,
-        ix: usize,
-        info: &WorktreeInfo,
-        theme: &gpui_kit::component::Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected = self.selected.as_deref() == Some(info.path());
-        let path = info.wt.path.clone();
-        let branch = info.wt.branch.clone();
-        let pr = self.pr_for_branch(branch.as_deref());
-        let agent = self.agent_state_for(info, cx);
-        let native = self.native_attention(info.path(), cx);
-        let external = self.external_agent(info, cx);
-        let owner = cx.entity().downgrade();
-        let context_path = path.clone();
-        let kept = self.kept_active(info.path());
-
-        let mut meta: Vec<AnyElement> = Vec::new();
-        match &info.status {
-            Ok(st) => {
-                if st.is_clean() {
-                    meta.push(div().child("clean").into_any_element());
-                } else {
-                    meta.push(
-                        div()
-                            .text_color(theme.warning)
-                            .child(format!("{} changed", st.files.len()))
-                            .into_any_element(),
-                    );
-                }
-                if st.ahead > 0 {
-                    meta.push(div().child(format!("↑{}", st.ahead)).into_any_element());
-                }
-                if st.behind > 0 {
-                    meta.push(div().child(format!("↓{}", st.behind)).into_any_element());
-                }
-            }
-            Err(_) => meta.push(
-                div()
-                    .text_color(theme.danger)
-                    .child("Status unavailable")
-                    .into_any_element(),
-            ),
-        }
-
-        v_flex()
-            .id(("worktree", ix))
-            .px_3()
-            .py_2()
-            .gap_0p5()
-            .cursor_pointer()
-            .border_l_2()
-            .border_color(if selected {
-                theme.primary
-            } else {
-                transparent_black()
-            })
-            .when(selected, |el| el.bg(theme.sidebar_accent))
-            .hover(|el| el.bg(theme.sidebar_accent))
-            .on_click(cx.listener(move |this, _, _, cx| this.select_worktree(path.clone(), cx)))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(agent_dot(agent, theme))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(info.wt.display_name()),
-                    )
-                    .when(info.wt.is_main, |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("main"),
-                        )
-                    })
-                    .when(kept, |row| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("kept"),
-                        )
-                    })
-                    .when_some(pr, |el, pr| el.child(pr_badge(pr, theme))),
-            )
-            .child(
-                h_flex()
-                    .pl_4()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .children(meta)
-                    .when_some(native, |el, (kind, provider)| {
-                        let target = info.wt.path.clone();
-                        el.child(
-                            Button::new(("worktree-attention", ix))
-                                .label(format!("{} {}", provider.label(), kind.label()))
-                                .text_color(attention_color(kind, theme))
-                                .xsmall()
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    if let Some(entry) = this
-                                        .attention_entries(kind, cx)
-                                        .into_iter()
-                                        .find(|entry| entry.path == target)
-                                    {
-                                        this.open_destination(entry, window, cx);
-                                    }
-                                })),
-                        )
-                    })
-                    .when_some(external, |el, (a, provider)| {
-                        el.child(div().text_color(agent_color(a, theme)).child(format!(
-                            "{} {} (estimated)",
-                            provider.label(),
-                            a.label()
-                        )))
-                    })
-                    .when_some(self.render_rebase_button(ix, info, cx), |el, button| {
-                        el.child(div().flex_1()).child(button)
-                    }),
-            )
-            .child(
-                div()
-                    .pl_4()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(info.wt.dir_name()),
-            )
-            .context_menu(move |menu, _, _cx| {
-                let keep_owner = owner.clone();
-                let keep_path = context_path.clone();
-                let cleanup_owner = owner.clone();
-                let cleanup_path = context_path.clone();
-                menu.item(
-                    PopupMenuItem::new(if kept {
-                        "✓ Keep active"
-                    } else {
-                        "Keep active"
-                    })
-                    .on_click(move |_, _, cx| {
-                        let _ = keep_owner
-                            .update(cx, |this, cx| this.toggle_keep_path(keep_path.clone(), cx));
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new("Clean up worktree…").on_click(move |_, window, cx| {
-                        let _ = cleanup_owner.update(cx, |this, cx| {
-                            this.open_cleanup_preview(vec![cleanup_path.clone()], window, cx)
-                        });
-                    }),
-                )
-            })
-            .into_any_element()
-    }
-
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let Some(info) = self.selected_info().cloned() else {
@@ -2962,7 +2613,7 @@ impl SuperGitApp {
             .filter(|p| matches!(p.state, PrState::Open | PrState::Draft))
             .count();
 
-        let (_, _, main_width) = self.pane_widths(window, cx);
+        let (_, main_width) = self.pane_widths(window, cx);
         let content = match self.tab {
             MainTab::Changes => {
                 let comparison = self.render_comparison(window, cx);
@@ -4875,8 +4526,9 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// Everything between the title bar and the status bar: the Projects
-    /// panel, then the active project (worktrees, review, agents).
+    /// Everything between the title bar and the status bar: the sidebar
+    /// (projects and their worktrees), then the active project's review and
+    /// agents.
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let project = self.render_project(window, cx);
         if !self.projects_visible() {
@@ -4886,7 +4538,7 @@ impl SuperGitApp {
             return h_flex()
                 .flex_1()
                 .min_h_0()
-                .child(self.render_projects_rail(cx))
+                .child(self.render_sidebar_rail(cx))
                 .child(
                     div()
                         .flex_1()
@@ -4898,33 +4550,29 @@ impl SuperGitApp {
                 .into_any_element();
         }
         // What the active project needs at its narrowest.
-        let saved = self.repository_view();
         let rest = if self.repo.is_none() {
             480.
+        } else if self.chat_open && self.selected.is_some() {
+            680.
         } else {
-            (if saved.sidebar_open { 220. } else { RAIL_WIDTH })
-                + if self.chat_open && self.selected.is_some() {
-                    680.
-                } else {
-                    360.
-                }
+            360.
         };
-        let max = (window.viewport_size().width.as_f32() - rest).clamp(160., 360.);
+        let max = (window.viewport_size().width.as_f32() - rest).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         div()
             .flex_1()
             .min_h_0()
             .child(
-                h_resizable("projects-layout")
-                    .with_state(&self.projects_layout)
+                h_resizable("sidebar-layout")
+                    .with_state(&self.sidebar_layout)
                     .on_resize(
-                        cx.listener(|this, state, _, cx| this.remember_projects_width(state, cx)),
+                        cx.listener(|this, state, _, cx| this.remember_sidebar_width(state, cx)),
                     )
                     .child(
                         resizable_panel()
-                            .size(px(self.persisted.projects.width.min(max)))
-                            .size_range(px(160.)..px(max))
+                            .size(px(self.persisted.projects.sidebar_width.min(max)))
+                            .size_range(px(SIDEBAR_MIN)..px(max))
                             .fixed()
-                            .child(self.render_projects(cx)),
+                            .child(self.render_sidebar(cx)),
                     )
                     .child(
                         resizable_panel()
@@ -4935,80 +4583,52 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// The active project, or the welcome screen without one.
+    /// The active project's review and agents, or the welcome screen.
     fn render_project(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.repo.is_some() {
-            let show_chat = self.chat_open && self.selected.is_some();
-            let (sidebar_max, chat_max, _) = self.pane_widths(window, cx);
-            let main = self.render_main(window, cx);
-            let workspace = if show_chat {
-                let chat = self.render_claude_panel(window, cx);
-                h_resizable("chat-layout")
-                    .with_state(&self.chat_layout)
-                    .on_resize(cx.listener(|this, state, _, cx| {
-                        this.remember_layout(LayoutPanel::Chat, state, cx)
-                    }))
-                    .child(
-                        resizable_panel()
-                            .size_range(px(360.)..Pixels::MAX)
-                            .child(elastic(main)),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size(px(self.repository_view().chat_width.min(chat_max)))
-                            .size_range(px(320.)..px(chat_max))
-                            .fixed()
-                            .child(chat),
-                    )
-                    .into_any_element()
-            } else if self.selected.is_some() {
-                let rail = self.render_chat_rail(window, cx);
-                // Elastic like the panels above: wide content (a long commit
-                // message, a diff line) must not push the rail off-screen.
-                h_flex()
-                    .size_full()
-                    .child(div().flex_1().min_w_0().h_full().child(elastic(main)))
-                    .child(rail)
-                    .into_any_element()
-            } else {
-                main
-            };
-            if !self.repository_view().sidebar_open {
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_sidebar_rail(cx))
-                    .child(div().flex_1().min_w_0().h_full().child(elastic(workspace)))
-                    .into_any_element()
-            } else {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        h_resizable("sidebar-layout")
-                            .with_state(&self.sidebar_layout)
-                            .on_resize(cx.listener(|this, state, _, cx| {
-                                this.remember_layout(LayoutPanel::Sidebar, state, cx)
-                            }))
-                            .child(
-                                resizable_panel()
-                                    .size(px(self.repository_view().sidebar_width.min(sidebar_max)))
-                                    .size_range(px(220.)..px(sidebar_max))
-                                    .fixed()
-                                    .child(self.render_sidebar(cx)),
-                            )
-                            .child(
-                                resizable_panel()
-                                    .size_range(
-                                        px(if show_chat { 680. } else { 360. })..Pixels::MAX,
-                                    )
-                                    .child(elastic(workspace)),
-                            ),
-                    )
-                    .into_any_element()
-            }
+        if self.repo.is_none() {
+            return self.render_welcome(cx).into_any_element();
+        }
+        let main = self.render_main(window, cx);
+        if self.chat_open && self.selected.is_some() {
+            let (chat_max, _) = self.pane_widths(window, cx);
+            let chat = self.render_claude_panel(window, cx);
+            div()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(
+                    h_resizable("chat-layout")
+                        .with_state(&self.chat_layout)
+                        .on_resize(cx.listener(|this, state, _, cx| {
+                            this.remember_layout(LayoutPanel::Chat, state, cx)
+                        }))
+                        .child(
+                            resizable_panel()
+                                .size_range(px(360.)..Pixels::MAX)
+                                .child(elastic(main)),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(px(self.repository_view().chat_width.min(chat_max)))
+                                .size_range(px(320.)..px(chat_max))
+                                .fixed()
+                                .child(chat),
+                        ),
+                )
+                .into_any_element()
+        } else if self.selected.is_some() {
+            let rail = self.render_chat_rail(window, cx);
+            // Elastic like the panels above: wide content (a long commit
+            // message, a diff line) must not push the rail off-screen.
+            h_flex()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(div().flex_1().min_w_0().h_full().child(elastic(main)))
+                .child(rail)
+                .into_any_element()
         } else {
-            self.render_welcome(cx).into_any_element()
+            main
         }
     }
 
@@ -5134,7 +4754,6 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::close_repository))
             .on_action(cx.listener(Self::toggle_claude))
             .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(Self::toggle_projects))
             .on_action(cx.listener(Self::new_chat_action))
             .on_action(cx.listener(Self::update_creation_base))
             .on_action(cx.listener(Self::open_switcher))
@@ -5242,8 +4861,11 @@ pub(crate) fn default_provider() -> Provider {
     Provider::parse(&crate::settings::load().agent).unwrap_or_default()
 }
 
-/// Width of a collapsed side panel (worktree list, agent panel).
+/// Width of a collapsed side panel (sidebar, agent panel).
 const RAIL_WIDTH: f32 = 48.;
+/// The expanded sidebar's width range.
+const SIDEBAR_MIN: f32 = 220.;
+const SIDEBAR_MAX: f32 = 520.;
 
 /// Two letters for a worktree in the collapsed list: the first letters of
 /// the first two words (`claude-auto-mode` → `CA`), else the name's first
@@ -5266,15 +4888,10 @@ fn initials(name: &str) -> String {
     out
 }
 
-fn agent_dot(state: Option<AgentState>, theme: &gpui_kit::component::Theme) -> impl IntoElement {
-    div()
-        .size(px(8.))
-        .flex_none()
-        .rounded_full()
-        .bg(match state {
-            Some(s) => agent_color(s, theme),
-            None => theme.border,
-        })
+/// The saved view of a project that has none yet.
+fn empty_view() -> &'static RepositoryView {
+    static EMPTY: std::sync::OnceLock<RepositoryView> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(RepositoryView::default)
 }
 
 fn file_state_color(state: FileState, theme: &gpui_kit::component::Theme) -> Hsla {

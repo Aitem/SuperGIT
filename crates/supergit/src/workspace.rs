@@ -84,7 +84,6 @@ pub struct RepositoryView {
     pub worktrees: BTreeMap<PathBuf, WorktreeView>,
     pub conversations: BTreeMap<PathBuf, Vec<SavedConversation>>,
     pub active_conversations: BTreeMap<PathBuf, usize>,
-    pub sidebar_width: f32,
     pub chat_width: f32,
     pub changes_width: f32,
     pub history_width: f32,
@@ -93,8 +92,6 @@ pub struct RepositoryView {
     /// The pull request list beside a PR's details.
     pub pulls_width: f32,
     pub chat_open: bool,
-    /// The worktree list is expanded; collapsed it is a narrow rail.
-    pub sidebar_open: bool,
     /// File lists (Changes, and a commit's files in History) show a folder
     /// tree instead of flat paths.
     pub changes_tree: bool,
@@ -119,14 +116,12 @@ impl Default for RepositoryView {
             worktrees: BTreeMap::new(),
             conversations: BTreeMap::new(),
             active_conversations: BTreeMap::new(),
-            sidebar_width: 320.,
             chat_width: 480.,
             changes_width: 300.,
             history_width: 300.,
             commit_files_width: 240.,
             pulls_width: 320.,
             chat_open: true,
-            sidebar_open: true,
             changes_tree: false,
         }
     }
@@ -134,7 +129,6 @@ impl Default for RepositoryView {
 
 impl RepositoryView {
     pub fn sanitize(&mut self) {
-        self.sidebar_width = finite(self.sidebar_width, 320.).clamp(220., 520.);
         self.chat_width = finite(self.chat_width, 480.).clamp(320., 960.);
         self.changes_width = finite(self.changes_width, 300.).clamp(140., 600.);
         self.history_width = finite(self.history_width, 300.).clamp(160., 800.);
@@ -143,15 +137,19 @@ impl RepositoryView {
     }
 }
 
-/// The Projects panel: repositories open side by side in the window.
+/// The sidebar: a tree of the repositories open in the window (projects)
+/// and their worktrees.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Projects {
     /// Repository roots, in the order the user added them.
     pub roots: Vec<PathBuf>,
-    /// Collapsed, the panel is a narrow rail of initials.
+    /// Collapsed, the sidebar is a narrow rail of initials.
     pub collapsed: bool,
-    pub width: f32,
+    /// The sidebar's width, window-wide (not per project).
+    pub sidebar_width: f32,
+    /// Projects folded in the tree: their worktrees are hidden.
+    pub folded: Vec<PathBuf>,
 }
 
 impl Default for Projects {
@@ -159,16 +157,32 @@ impl Default for Projects {
         Self {
             roots: Vec::new(),
             collapsed: false,
-            width: 220.,
+            sidebar_width: 340.,
+            folded: Vec::new(),
         }
     }
 }
 
 impl Projects {
     pub fn sanitize(&mut self) {
-        self.width = finite(self.width, 220.).clamp(160., 360.);
+        self.sidebar_width = finite(self.sidebar_width, 340.).clamp(220., 520.);
         let mut seen = std::collections::HashSet::new();
         self.roots.retain(|root| seen.insert(root.clone()));
+        let roots = &self.roots;
+        let mut seen = std::collections::HashSet::new();
+        self.folded
+            .retain(|root| roots.contains(root) && seen.insert(root.clone()));
+    }
+
+    pub fn is_folded(&self, root: &Path) -> bool {
+        self.folded.iter().any(|known| known == root)
+    }
+
+    pub fn set_folded(&mut self, root: &Path, folded: bool) {
+        self.folded.retain(|known| known != root);
+        if folded {
+            self.folded.push(root.to_path_buf());
+        }
     }
 
     /// Append `root` unless it is already listed.
@@ -221,7 +235,7 @@ pub fn save_repository(root: &Path, view: &RepositoryView) {
 }
 
 /// Merge the given repositories (the current one and those with live
-/// conversations in the background), the Projects panel and the window.
+/// conversations in the background), the sidebar's projects and the window.
 pub fn save(views: &[(&Path, &RepositoryView)], projects: &Projects, window: Option<WindowRect>) {
     let Some(path) = file() else { return };
     let mut store = load();
@@ -255,7 +269,6 @@ mod tests {
         let mut state: RepositoryView =
             serde_json::from_str(r#"{"chat_width":9999,"future":true}"#).unwrap();
         state.sanitize();
-        assert_eq!(state.sidebar_width, 320.);
         assert_eq!(state.chat_width, 960.);
         assert!(state.chat_open);
         assert!(!state.auto_cleanup);
@@ -274,13 +287,21 @@ mod tests {
         let store: Store = serde_json::from_str("{}").unwrap();
         assert!(store.projects.roots.is_empty());
         assert!(!store.projects.collapsed);
-        assert_eq!(store.projects.width, 220.);
+        assert_eq!(store.projects.sidebar_width, 340.);
 
-        let mut projects: Projects =
-            serde_json::from_str(r#"{"roots":["/a","/b","/a"],"width":9000}"#).unwrap();
+        // `width` is the old Projects panel's: the tree ignores it.
+        let mut projects: Projects = serde_json::from_str(
+            r#"{"roots":["/a","/b","/a"],"width":200,"sidebar_width":9000,"folded":["/b","/gone","/b"]}"#,
+        )
+        .unwrap();
         projects.sanitize();
         assert_eq!(projects.roots, [PathBuf::from("/a"), PathBuf::from("/b")]);
-        assert_eq!(projects.width, 360.);
+        assert_eq!(projects.sidebar_width, 520.);
+        assert_eq!(projects.folded, [PathBuf::from("/b")]);
+        assert!(projects.is_folded(Path::new("/b")));
+        projects.set_folded(Path::new("/b"), false);
+        projects.set_folded(Path::new("/a"), true);
+        assert_eq!(projects.folded, [PathBuf::from("/a")]);
         projects.add(Path::new("/b"));
         projects.add(Path::new("/c"));
         assert_eq!(projects.roots.len(), 3);

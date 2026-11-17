@@ -429,38 +429,20 @@ impl SuperGitApp {
         });
     }
 
-    /// The row's "Rebase…" button: it only opens the dialog.
-    pub(super) fn render_rebase_button(
-        &self,
-        ix: usize,
-        info: &WorktreeInfo,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let branch = info.wt.branch.clone()?;
-        if info.status.is_err() || self.creation_branch().as_ref() == Some(&branch) {
+    /// The worktree menu's rebase item: its label, and whether it opens the
+    /// dialog (otherwise the label says why not).
+    pub(super) fn rebase_menu_item(&self, info: &WorktreeInfo, cx: &App) -> Option<(String, bool)> {
+        let branch = info.wt.branch.as_ref()?;
+        if info.status.is_err() || self.creation_branch().as_ref() == Some(branch) {
             return None;
         }
-        let running = self.base_update_paths.contains(info.path());
-        let blocker = self.rebase_blocker(info, cx);
-        let tooltip = match &blocker {
-            _ if running => format!("Rebasing {branch}…"),
-            Some(reason) => format!("Rebase: {reason}"),
-            None => format!("Choose a branch to rebase {branch} onto"),
-        };
-        let path = info.wt.path.clone();
-        Some(
-            Button::new(("worktree-rebase", ix))
-                .label(if running { "Rebasing…" } else { "Rebase…" })
-                .xsmall()
-                .ghost()
-                .tooltip(tooltip)
-                .disabled(running || blocker.is_some())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.open_rebase_dialog(path.clone(), window, cx);
-                }))
-                .into_any_element(),
-        )
+        if self.base_update_paths.contains(info.path()) {
+            return Some((format!("Rebasing {branch}…"), false));
+        }
+        Some(match self.rebase_blocker(info, cx) {
+            Some(reason) => (format!("Rebase… ({reason})"), false),
+            None => ("Rebase onto…".to_string(), true),
+        })
     }
 
     pub(super) fn render_rebase_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
