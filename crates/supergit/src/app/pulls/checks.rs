@@ -9,6 +9,11 @@ pub(super) struct OpenCheck {
     log_task: Option<Task<()>>,
 }
 
+pub(super) struct JobRetry {
+    check: String,
+    result: LoadState<()>,
+}
+
 impl Pulls {
     pub(super) fn close_check_inspection(&mut self) {
         self.check_inspection = None;
@@ -197,6 +202,83 @@ impl SuperGitApp {
         cx.notify();
     }
 
+    fn retry_actions_job(&mut self, check: String, job: ActionsJob, cx: &mut Context<Self>) {
+        if self.pulls.job_retry_task.is_some() {
+            return;
+        }
+        let Some((root, number)) = self
+            .active_root()
+            .map(Path::to_path_buf)
+            .zip(self.pulls.shown)
+        else {
+            return;
+        };
+        let current = self
+            .pulls
+            .details
+            .get(&number)
+            .and_then(|loaded| loaded.details.value())
+            .and_then(|details| {
+                details
+                    .checks
+                    .iter()
+                    .find(|candidate| candidate.run_id.as_deref() == Some(&check))
+            });
+        if !current.is_some_and(|current| {
+            current.status == CheckStatus::Failed
+                && current
+                    .url
+                    .as_deref()
+                    .and_then(ActionsJob::from_check_url)
+                    .as_ref()
+                    == Some(&job)
+        }) {
+            self.flash(
+                "The check changed. Refresh the pull request and try again",
+                true,
+                cx,
+            );
+            return;
+        }
+        if self
+            .pulls
+            .job_retry
+            .as_ref()
+            .is_some_and(|retry| retry.check == check && retry.result.value().is_some())
+        {
+            return;
+        }
+        self.pulls.job_retry = Some(JobRetry {
+            check: check.clone(),
+            result: LoadState::Loading,
+        });
+        self.pulls.job_retry_task = Some(cx.spawn(async move |this, cx| {
+            let request = root.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { job.rerun(&request).map_err(|error| error.to_string()) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.pulls.job_retry_task = None;
+                let succeeded = result.is_ok();
+                this.pulls.job_retry = Some(JobRetry {
+                    check,
+                    result: LoadState::from_result(result),
+                });
+                if succeeded {
+                    this.flash("Actions rerun requested", false, cx);
+                    if this.active_root() == Some(root.as_path())
+                        && this.pulls.shown == Some(number)
+                    {
+                        this.load_pr_details(root, number, cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn render_job_log(
         &self,
         open: &OpenCheck,
@@ -205,6 +287,22 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = open.id.clone();
+        let retry_check = id.clone();
+        let retry_job = job.clone();
+        let retry = self
+            .pulls
+            .job_retry
+            .as_ref()
+            .filter(|retry| retry.check == open.id);
+        let retry_pending = retry.is_some_and(|retry| retry.result.is_loading());
+        let retry_sent = retry.is_some_and(|retry| retry.result.value().is_some());
+        let retry_label = if retry_pending {
+            "Requesting rerun…"
+        } else if retry_sent {
+            "Rerun requested"
+        } else {
+            "Rerun job"
+        };
         let log = open.log.as_ref();
         let shown = log.and_then(LoadState::value);
         let loading = open.log_task.is_some();
@@ -232,6 +330,17 @@ impl SuperGitApp {
                                 this.fetch_failed_log(&id, job.clone(), cx)
                             })),
                     )
+                    .child(
+                        Button::new("retry-actions-job")
+                            .label(retry_label)
+                            .xsmall()
+                            .ghost()
+                            .disabled(self.pulls.job_retry_task.is_some() || retry_sent)
+                            .tooltip("Rerun this job and its dependent jobs on GitHub")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.retry_actions_job(retry_check.clone(), retry_job.clone(), cx)
+                            })),
+                    )
                     .when_some(shown.filter(|log| !log.text.is_empty()), |row, log| {
                         let text = log.text.clone();
                         row.child(
@@ -245,6 +354,10 @@ impl SuperGitApp {
                                 })),
                         )
                     }),
+            )
+            .when_some(
+                retry.and_then(|retry| retry.result.error()),
+                |card, error| card.child(div().text_color(theme.danger).child(error.to_owned())),
             )
             .when_some(log.and_then(LoadState::error), |card, error| {
                 card.child(div().text_color(theme.danger).child(error.to_owned()))

@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, ensure};
+use serde::Deserialize;
 
 use crate::{gh, repository_identity};
 
@@ -43,6 +44,38 @@ impl ActionsJob {
         })
     }
 
+    /// Rerun a terminal failed job in the current attempt. GitHub CLI takes
+    /// a database ID, so verify it against the run before dispatching.
+    pub fn rerun(&self, path: &Path) -> Result<()> {
+        let run = self.run.to_string();
+        let snapshot = gh(
+            path,
+            [
+                "run",
+                "view",
+                &run,
+                "--repo",
+                &self.repository,
+                "--json",
+                "status,jobs",
+            ],
+        )?;
+        let job = rerunnable_job(&snapshot, self.job)?.to_string();
+        gh(
+            path,
+            [
+                "run",
+                "rerun",
+                &run,
+                "--repo",
+                &self.repository,
+                "--job",
+                &job,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Read only the failed steps from this exact job and retain a display-sized tail.
     pub fn failed_log(&self, path: &Path) -> Result<JobLog> {
         let run = self.run.to_string();
@@ -62,6 +95,46 @@ impl ActionsJob {
         )?;
         Ok(JobLog::from_output(&output))
     }
+}
+
+fn rerunnable_job(output: &[u8], expected: u64) -> Result<u64> {
+    #[derive(Deserialize)]
+    struct Run {
+        status: String,
+        jobs: Vec<Job>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Job {
+        database_id: u64,
+        status: String,
+        conclusion: String,
+    }
+    let run: Run =
+        serde_json::from_slice(output).context("Invalid Actions job list from GitHub")?;
+    ensure!(
+        run.status == "completed",
+        "GitHub is still running this workflow"
+    );
+    let job = run
+        .jobs
+        .into_iter()
+        .find(|job| job.database_id == expected)
+        .context("The selected job is no longer in the current workflow attempt")?;
+    ensure!(
+        job.status == "completed"
+            && matches!(
+                job.conclusion.as_str(),
+                "failure"
+                    | "cancelled"
+                    | "timed_out"
+                    | "startup_failure"
+                    | "action_required"
+                    | "stale"
+            ),
+        "Only a completed failed job can be rerun"
+    );
+    Ok(job.database_id)
 }
 
 fn numeric_id(segment: &str) -> Option<u64> {
@@ -114,6 +187,15 @@ mod tests {
         ] {
             assert!(ActionsJob::from_check_url(url).is_none(), "{url}");
         }
+    }
+
+    #[test]
+    fn rerun_uses_a_failed_database_id_from_the_completed_attempt() {
+        let run = br#"{"status":"completed","jobs":[{"databaseId":1000202,"status":"completed","conclusion":"cancelled"},{"databaseId":1000203,"status":"completed","conclusion":"success"}]}"#;
+        assert_eq!(rerunnable_job(run, 1000202).unwrap(), 1000202);
+        assert!(rerunnable_job(run, 1000203).is_err());
+        assert!(rerunnable_job(run, 2).is_err());
+        assert!(rerunnable_job(br#"{"status":"in_progress","jobs":[]}"#, 1000202).is_err());
     }
 
     #[test]
