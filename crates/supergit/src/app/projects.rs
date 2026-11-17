@@ -5,6 +5,7 @@
 //! native conversations keep running.
 
 use super::*;
+use crate::MOD;
 use gpui_kit::component::menu::DropdownMenu as _;
 
 /// What a project showed when it was last active, or what a background read
@@ -466,7 +467,7 @@ impl SuperGitApp {
             .icon(IconName::Plus)
             .xsmall()
             .ghost()
-            .tooltip("Add a project (cmd-o)")
+            .tooltip(format!("Add a project ({MOD}-o)"))
             .dropdown_menu(move |mut menu, _, _| {
                 for root in &recent {
                     let owner = owner.clone();
@@ -505,9 +506,11 @@ impl SuperGitApp {
             let remove_owner = owner.clone();
             let remove = root.clone();
             menu.item(
-                PopupMenuItem::new("Reveal in Finder").on_click(move |_, _, _| {
-                    let _ = launch::reveal_in_finder(&reveal);
-                }),
+                PopupMenuItem::new(format!("Reveal in {}", launch::FILE_MANAGER)).on_click(
+                    move |_, _, _| {
+                        let _ = launch::reveal_in_finder(&reveal);
+                    },
+                ),
             )
             .item(
                 PopupMenuItem::new("Remove from Projects").on_click(move |_, _, cx| {

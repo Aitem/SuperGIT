@@ -1,16 +1,31 @@
-//! User settings, stored as JSON in `~/Library/Application Support/SuperGIT/`.
+//! User settings, stored as JSON in `support_dir()`.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// `~/Library/Application Support/SuperGIT`.
+/// `~/Library/Application Support/SuperGIT` on macOS,
+/// `$XDG_CONFIG_HOME/supergit` (`~/.config/supergit`) elsewhere.
 pub fn support_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("SUPERGIT_STATE_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/SuperGIT"))
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")?;
+        return Some(PathBuf::from(home).join("Library/Application Support/SuperGIT"));
+    }
+    Some(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("supergit"))
+}
+
+/// An XDG base directory: the variable when it holds an absolute path
+/// (as the spec requires), else `~/<fallback>`.
+pub fn xdg_dir(var: &str, fallback: &str) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(var).map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Some(dir);
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(fallback))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,8 +1,24 @@
 # SuperGIT — notes for agents
 
-Native macOS Git GUI for agent-driven development (worktrees + Claude Code and
+Native Git GUI for agent-driven development (worktrees + Claude Code and
 Codex sessions + commits + PRs). Rust 2024, GPUI through `gpui-kit`. Personal tool
-for the author and colleagues: macOS only, GitHub only (via `gh`).
+for the author and colleagues: macOS and Linux, GitHub only (via `gh`).
+
+Platform differences stay behind small seams; keep both working:
+- `notifications.rs` → `notifications/macos.rs` (UserNotifications, objc2;
+  a macOS-only dependency) or `notifications/freedesktop.rs` (notify-rust
+  over D-Bus, click = default action).
+- Shortcuts: `shortcut!("…")` in main.rs (cmd/ctrl) for bindings, `MOD` in
+  tooltips — never a literal `cmd-`. gpui's `secondary-` does not parse in
+  `KeyBinding::new` (panics at startup).
+- Menus: `cx.set_menus` on macOS; elsewhere `set_app_menus` copies them into
+  gpui-component's `AppMenuBar`, drawn in the title bar (`menu_bar`).
+- `launch.rs`: AppleScript/`open` on macOS; Linux terminals by binary,
+  `xdg-open`, editor CLIs on `PATH`. `launch::FILE_MANAGER` labels Finder.
+- Paths: `settings::support_dir()` (`~/.config/supergit` on Linux) and
+  `settings::xdg_dir`; Linux single instance via `single_instance.rs`
+  (Unix socket; macOS uses LaunchServices + `on_open_urls`).
+- Screenshot builds: `render_to_image` exists only on macOS.
 
 ## Layout
 
@@ -110,6 +126,7 @@ cargo lint && cargo fmt --all        # lint = CI's clippy (.cargo/config.toml)
 cargo run -- --dump $SUPERGIT_TEST_REPO  # data layer as text, no window
 cargo run -- $SUPERGIT_TEST_REPO         # the app
 scripts/bundle-macos.sh --install   # SuperGIT.app → /Applications (ad-hoc signed)
+scripts/install-linux.sh            # Linux: ~/.local/bin + .desktop launcher + icon
 scripts/make-icon.sh                # regenerate assets/AppIcon.icns (Swift/AppKit)
 ```
 

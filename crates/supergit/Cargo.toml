@@ -26,12 +26,20 @@ sg_codex.workspace = true
 # gpui-kit's `syntect` highlighter, so nothing extra is compiled.
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
+# Only for the `screenshot` feature: turns on GPUI's `render_to_image`.
+gpui_platform_test_support = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"], optional = true }
+
+# macOS notifications (src/notifications/macos.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSObject", "NSString", "NSError"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "UNUserNotificationCenter", "UNNotification", "UNNotificationRequest", "UNNotificationContent", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }
 block2 = "0.6"
-# Only for the `screenshot` feature: turns on GPUI's `render_to_image`.
-gpui_platform_test_support = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"], optional = true }
+
+# Desktop notifications (src/notifications/freedesktop.rs); the version GPUI's
+# Linux platform already builds.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+notify-rust = "4.19"
 
 [features]
 # `SUPERGIT_SCREENSHOT=out.png supergit` renders the window to a PNG and quits.

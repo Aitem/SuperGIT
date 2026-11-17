@@ -1,6 +1,6 @@
 # SuperGIT
 
-A native macOS Git GUI built around agent-driven development: many
+A native Git GUI for macOS and Linux built around agent-driven development: many
 **worktrees**, many **Claude Code sessions**, and the **commits and pull
 requests** they produce — all in one window.
 
@@ -44,7 +44,7 @@ Written in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates
 
 ## Install
 
-Requires macOS, [rustup](https://rustup.rs), `git`, and the
+Requires macOS or Linux, [rustup](https://rustup.rs), `git`, and the
 [`gh` CLI](https://cli.github.com) (logged in) for pull requests.
 
 As a Mac app in `/Applications` (Dock, Spotlight, Launchpad):
@@ -60,6 +60,20 @@ Launched from the Dock it reopens the last repository; `cmd-o` opens another,
 **Recent** (`cmd-shift-o`) lists the previous ones. You can also drop a repo
 folder on the Dock icon or run `open -a SuperGIT ~/Work/myrepo`. The app takes
 `PATH` from your login shell, so `gh`/`claude` resolve as in a terminal.
+
+On Linux (needs the usual GPUI libraries: Wayland or X11, `libxkbcommon`,
+Vulkan drivers, `fontconfig`), for the current user:
+
+```sh
+scripts/install-linux.sh            # ~/.local/bin/supergit + launcher + icon
+scripts/install-linux.sh --uninstall
+```
+
+Shortcuts use `ctrl` where macOS uses `cmd`, menus sit in the window's title
+bar, notifications go to the desktop's notification server (click one to open
+the conversation), and settings live in `~/.config/supergit`. Running
+`supergit <dir>` (or "Open with SuperGIT" in a file manager) while SuperGIT is
+open hands the folder to the running window, like `open -a` on macOS.
 
 As a terminal command:
 
@@ -77,8 +91,9 @@ supergit --dump [PATH]    # print worktrees, sessions and PRs as text
 
 | Variable            | Meaning                                                        |
 | ------------------- | -------------------------------------------------------------- |
-| `SUPERGIT_TERMINAL` | `ghostty`, `iterm` or `terminal` — where Claude sessions open (default: first installed) |
-| `SUPERGIT_EDITOR`   | editor CLI for the **Editor** button, e.g. `zed`, `cursor` (default: VS Code) |
+| `SUPERGIT_TERMINAL` | where sessions open — macOS: `ghostty`, `iterm`, `terminal`; Linux: `ghostty`, `kitty`, `wezterm`, `alacritty`, `konsole`, `gnome-terminal`, `ptyxis`, `xfce4-terminal`, `foot`, `xterm` (default: first installed; on Linux `$TERMINAL`, then the desktop's own) |
+| `SUPERGIT_EDITOR`   | editor CLI for the **Editor** button, e.g. `zed`, `cursor` (default: VS Code; on Linux the first of `code`, `codium`, `zed`, `zeditor`, `cursor`) |
+| `SUPERGIT_NEW_INSTANCE` | Linux: run a separate instance instead of handing the folder to the open one |
 | `SUPERGIT_TAB`      | tab at startup: `changes`, `history`, `claude`, `prs`          |
 | `SUPERGIT_APPEARANCE` | `system`, `light`, `dark` for this run (the saved choice is in View ▸ Appearance) |
 

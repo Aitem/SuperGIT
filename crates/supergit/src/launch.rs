@@ -10,9 +10,27 @@ use anyhow::{Context as _, Result, bail};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalApp {
     Ghostty,
+    // macOS
     ITerm,
     Terminal,
+    // Linux (and other freedesktop systems)
+    Kitty,
+    WezTerm,
+    Alacritty,
+    Konsole,
+    GnomeTerminal,
+    Ptyxis,
+    Xfce,
+    Foot,
+    Xterm,
 }
+
+/// What macOS users call Finder: the platform's file manager.
+pub const FILE_MANAGER: &str = if cfg!(target_os = "macos") {
+    "Finder"
+} else {
+    "File Manager"
+};
 
 impl TerminalApp {
     pub fn name(self) -> &'static str {
@@ -20,33 +38,122 @@ impl TerminalApp {
             Self::Ghostty => "Ghostty",
             Self::ITerm => "iTerm",
             Self::Terminal => "Terminal",
+            Self::Kitty => "kitty",
+            Self::WezTerm => "WezTerm",
+            Self::Alacritty => "Alacritty",
+            Self::Konsole => "Konsole",
+            Self::GnomeTerminal => "GNOME Terminal",
+            Self::Ptyxis => "Ptyxis",
+            Self::Xfce => "Xfce Terminal",
+            Self::Foot => "foot",
+            Self::Xterm => "xterm",
         }
     }
 
-    /// `SUPERGIT_TERMINAL=ghostty|iterm|terminal`, else the first installed.
+    /// The executable on Linux.
+    fn binary(self) -> &'static str {
+        match self {
+            Self::Ghostty => "ghostty",
+            Self::Kitty => "kitty",
+            Self::WezTerm => "wezterm",
+            Self::Alacritty => "alacritty",
+            Self::Konsole => "konsole",
+            Self::GnomeTerminal => "gnome-terminal",
+            Self::Ptyxis => "ptyxis",
+            Self::Xfce => "xfce4-terminal",
+            Self::Foot => "foot",
+            Self::Xterm | Self::ITerm | Self::Terminal => "xterm",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "ghostty" => Self::Ghostty,
+            "iterm" | "iterm2" if cfg!(target_os = "macos") => Self::ITerm,
+            "terminal" if cfg!(target_os = "macos") => Self::Terminal,
+            "kitty" => Self::Kitty,
+            "wezterm" => Self::WezTerm,
+            "alacritty" => Self::Alacritty,
+            "konsole" => Self::Konsole,
+            "gnome-terminal" | "gnome" => Self::GnomeTerminal,
+            "ptyxis" => Self::Ptyxis,
+            "xfce4-terminal" | "xfce" => Self::Xfce,
+            "foot" => Self::Foot,
+            "xterm" => Self::Xterm,
+            _ => return None,
+        })
+    }
+
+    /// `SUPERGIT_TERMINAL` (see `--help`), else the first installed.
     pub fn detect() -> Self {
-        match std::env::var("SUPERGIT_TERMINAL")
+        let wanted = std::env::var("SUPERGIT_TERMINAL")
             .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "ghostty" => return Self::Ghostty,
-            "iterm" | "iterm2" => return Self::ITerm,
-            "terminal" => return Self::Terminal,
-            _ => {}
+            .to_ascii_lowercase();
+        if let Some(app) = Self::parse(&wanted) {
+            return app;
         }
-        if app_installed("Ghostty") {
-            Self::Ghostty
-        } else if app_installed("iTerm") {
-            Self::ITerm
+        if cfg!(target_os = "macos") {
+            return if app_installed("Ghostty") {
+                Self::Ghostty
+            } else if app_installed("iTerm") {
+                Self::ITerm
+            } else {
+                Self::Terminal
+            };
+        }
+        // `$TERMINAL` is the closest Linux has to a default terminal setting;
+        // then the desktop's own terminal, then any known one.
+        let preferred = std::env::var("TERMINAL")
+            .ok()
+            .and_then(|t| {
+                let name = Path::new(&t).file_name()?.to_str()?.to_ascii_lowercase();
+                Self::parse(&name)
+            })
+            .into_iter();
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let native: &[Self] = if desktop.contains("KDE") {
+            &[Self::Konsole]
+        } else if desktop.contains("GNOME") {
+            &[Self::Ptyxis, Self::GnomeTerminal]
+        } else if desktop.contains("XFCE") {
+            &[Self::Xfce]
         } else {
-            Self::Terminal
-        }
+            &[]
+        };
+        let known = [
+            Self::Ghostty,
+            Self::Kitty,
+            Self::WezTerm,
+            Self::Alacritty,
+            Self::Foot,
+            Self::Konsole,
+            Self::Ptyxis,
+            Self::GnomeTerminal,
+            Self::Xfce,
+        ];
+        preferred
+            .chain(native.iter().copied())
+            .chain(known)
+            .find(|app| on_path(app.binary()))
+            .unwrap_or(Self::Xterm)
     }
 }
 
 fn app_installed(name: &str) -> bool {
     Path::new(&format!("/Applications/{name}.app")).exists()
+}
+
+/// Whether `program` is an executable somewhere on `PATH`.
+fn on_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(program))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 fn shell_quote(s: &str) -> String {
@@ -74,6 +181,9 @@ pub fn open_terminal(app: TerminalApp, dir: &Path, command: Option<&str>) -> Res
         Some(c) => format!("cd {} && {c}", shell_quote(&dir_s)),
         None => format!("cd {}", shell_quote(&dir_s)),
     };
+    if !cfg!(target_os = "macos") {
+        return open_linux_terminal(app, dir, command);
+    }
     match app {
         TerminalApp::Ghostty => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
@@ -103,7 +213,59 @@ pub fn open_terminal(app: TerminalApp, dir: &Path, command: Option<&str>) -> Res
              end tell",
             applescript_string(&line)
         )),
+        _ => open_linux_terminal(app, dir, command),
     }
+}
+
+/// A new terminal window in `dir`; `command` runs in the user's login shell,
+/// which stays open afterwards (like the macOS terminals).
+fn open_linux_terminal(app: TerminalApp, dir: &Path, command: Option<&str>) -> Result<()> {
+    let dir_s = dir.to_string_lossy();
+    let mut cmd = Command::new(app.binary());
+    cmd.current_dir(dir);
+    // Single-instance terminals (a server process) ignore our cwd.
+    match app {
+        TerminalApp::Ghostty | TerminalApp::Alacritty | TerminalApp::Xfce => {
+            cmd.arg(format!("--working-directory={dir_s}"));
+        }
+        TerminalApp::GnomeTerminal | TerminalApp::Ptyxis => {
+            cmd.arg("--window")
+                .arg(format!("--working-directory={dir_s}"));
+        }
+        TerminalApp::Kitty => {
+            cmd.arg("--directory").arg(dir);
+        }
+        TerminalApp::WezTerm => {
+            cmd.args(["start", "--cwd"]).arg(dir);
+        }
+        TerminalApp::Konsole => {
+            cmd.arg("--workdir").arg(dir);
+        }
+        TerminalApp::Foot => {
+            cmd.arg(format!("--working-directory={dir_s}"));
+        }
+        TerminalApp::Xterm | TerminalApp::ITerm | TerminalApp::Terminal => {}
+    }
+    if let Some(c) = command {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        // How each terminal takes the program to run.
+        match app {
+            TerminalApp::Kitty | TerminalApp::Foot => {}
+            TerminalApp::WezTerm | TerminalApp::GnomeTerminal | TerminalApp::Ptyxis => {
+                cmd.arg("--");
+            }
+            TerminalApp::Xfce => {
+                cmd.arg("-x");
+            }
+            _ => {
+                cmd.arg("-e");
+            }
+        }
+        cmd.arg(&shell)
+            .arg("-lic")
+            .arg(format!("{c}; exec {shell} -l"));
+    }
+    spawn(&mut cmd).with_context(|| format!("is {} installed? Set SUPERGIT_TERMINAL", app.name()))
 }
 
 fn osascript(script: &str) -> Result<()> {
@@ -136,24 +298,42 @@ pub fn agent_resume(
     open_terminal(app, dir, Some(&resume_command(provider, session_id)))
 }
 
-/// `SUPERGIT_EDITOR` (a CLI like `code`, `zed`, `cursor`), else VS Code.
+/// `SUPERGIT_EDITOR` (a CLI like `code`, `zed`, `cursor`), else VS Code
+/// (on Linux the first of VS Code, VSCodium, Zed, Cursor on `PATH`).
 pub fn open_in_editor(dir: &Path) -> Result<()> {
     if let Ok(editor) = std::env::var("SUPERGIT_EDITOR") {
         return spawn(Command::new(editor).arg(dir));
     }
-    spawn(
-        Command::new("open")
-            .args(["-a", "Visual Studio Code"])
-            .arg(dir),
-    )
+    if cfg!(target_os = "macos") {
+        return spawn(
+            Command::new("open")
+                .args(["-a", "Visual Studio Code"])
+                .arg(dir),
+        );
+    }
+    // Arch packages Zed as `zeditor`.
+    let editor = ["code", "codium", "zed", "zeditor", "cursor"]
+        .into_iter()
+        .find(|e| on_path(e))
+        .context("no editor found (VS Code, VSCodium, Zed, Cursor): set SUPERGIT_EDITOR")?;
+    spawn(Command::new(editor).arg(dir))
+}
+
+/// The platform's "open with the default app": `open` / `xdg-open`.
+fn opener() -> Command {
+    Command::new(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    })
 }
 
 pub fn reveal_in_finder(dir: &Path) -> Result<()> {
-    spawn(Command::new("open").arg(dir))
+    spawn(opener().arg(dir))
 }
 
 pub fn open_url(url: &str) -> Result<()> {
-    spawn(Command::new("open").arg(url))
+    spawn(opener().arg(url))
 }
 
 /// `file:///Users/me/My%20Repo/` → `/Users/me/My Repo/`.
