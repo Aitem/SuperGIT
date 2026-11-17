@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use sg_git::{FileState, Staging, change_staging, git, status};
+use sg_git::{ChangeScope, FileState, Staging, change_staging, git, scoped_worktree_patch, status};
 
 fn repository() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
@@ -69,7 +69,38 @@ fn changes_only_the_linked_worktree_index_and_keeps_working_edits() {
     file_action(&worktree, "pick.txt", Staging::Stage).unwrap();
     assert!(status(root).unwrap().is_clean());
     std::fs::write(worktree.join("pick.txt"), "working version\n").unwrap();
-    let mixed = &status(&worktree).unwrap().files[0];
+    std::fs::write(worktree.join("new.txt"), "untracked contents\n").unwrap();
+    let mixed_status = status(&worktree).unwrap();
+    let mixed = mixed_status
+        .files
+        .iter()
+        .find(|file| file.path == "pick.txt")
+        .unwrap();
+    let staged = scoped_worktree_patch(&worktree, &mixed_status, ChangeScope::Staged).unwrap();
+    assert!(staged.text.contains("+staged version"));
+    assert!(!staged.text.contains("working version") && !staged.text.contains("new.txt"));
+    let unstaged = scoped_worktree_patch(&worktree, &mixed_status, ChangeScope::Unstaged).unwrap();
+    assert!(
+        unstaged.text.contains("-staged version") && unstaged.text.contains("+working version")
+    );
+    assert!(unstaged.text.contains("+untracked contents"));
+    let staged_pair = sg_git::difftastic::read_pairs(
+        &worktree,
+        &sg_git::difftastic::Source::Revision("HEAD".into()),
+        &sg_git::difftastic::Source::Index,
+        &[sg_git::difftastic::FileRequest {
+            path: "pick.txt".into(),
+            old_path: None,
+            added: false,
+            deleted: false,
+            submodule: false,
+        }],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        matches!(&staged_pair[0].new, sg_git::difftastic::Content::Bytes(bytes) if bytes == b"staged version\n")
+    );
     assert_eq!(mixed.staged, Some(FileState::Modified));
     assert_eq!(mixed.unstaged, Some(FileState::Modified));
     file_action(&worktree, "pick.txt", Staging::Unstage).unwrap();

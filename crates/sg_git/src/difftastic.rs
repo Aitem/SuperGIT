@@ -65,6 +65,8 @@ pub enum Source {
     Revision(String),
     /// The files on disk in the worktree.
     WorkTree,
+    /// Stage-zero blobs in the selected worktree’s index.
+    Index,
 }
 
 /// One file of a patch to compare structurally.
@@ -262,7 +264,9 @@ pub fn read_pairs(
                 submodule.old.clone().map(Source::Revision),
                 match new {
                     Source::WorkTree => Some(Source::WorkTree),
-                    Source::Revision(_) => submodule.new.clone().map(Source::Revision),
+                    Source::Index | Source::Revision(_) => {
+                        submodule.new.clone().map(Source::Revision)
+                    }
                 },
                 submodule.path.len() + 1,
             ),
@@ -308,6 +312,7 @@ fn read_side(worktree: &Path, source: &Source, paths: &[Option<String>]) -> Resu
                 None => Content::Absent,
             })
             .collect()),
+        Source::Index => read_blobs(worktree, "", paths),
         Source::Revision(revision) => read_blobs(worktree, revision, paths),
     }
 }

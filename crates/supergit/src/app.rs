@@ -30,8 +30,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_agents::{AgentState, Provider, Session};
 use sg_git::{
-    Commit, CommitDetails, FileChange, FileState, RefKind, RefLabel, Repo, SubmoduleChange,
-    relative_time,
+    ChangeScope, Commit, CommitDetails, FileChange, FileState, RefKind, RefLabel, Repo,
+    SubmoduleChange, relative_time,
 };
 use sg_github::{PrState, PullRequest};
 
@@ -1546,12 +1546,13 @@ impl SuperGitApp {
         let path = info.wt.path.clone();
         let status = info.status.clone();
         let base = self.comparison_base();
+        let scope = self.change_scope();
         self.details_generation += 1;
         let generation = self.details_generation;
         self.details_task = Some(cx.spawn(async move |this, cx| {
             let details = cx
                 .background_executor()
-                .spawn(async move { model::load_details(&path, status, base) })
+                .spawn(async move { model::load_details(&path, status, base, scope) })
                 .await;
             this.update(cx, |this, cx| {
                 if generation == this.details_generation {
@@ -1564,7 +1565,10 @@ impl SuperGitApp {
     }
 
     fn apply_details(&mut self, mut details: Details, cx: &mut Context<Self>) {
-        if self.selected.as_ref() != Some(&details.path) || self.comparison_base() != details.base {
+        if self.selected.as_ref() != Some(&details.path)
+            || self.comparison_base() != details.base
+            || self.change_scope() != details.scope
+        {
             return;
         }
         let mut patch_changed = false;
@@ -2919,7 +2923,7 @@ impl SuperGitApp {
                                 .unwrap_or("unavailable")
                         )
                     })
-                    .unwrap_or_else(|| "Uncommitted changes vs HEAD".into()),
+                    .unwrap_or_else(|| scope_description(self.details.scope).into()),
                 self.repository_view()
                     .worktrees
                     .get(&path)
@@ -3287,6 +3291,14 @@ impl SuperGitApp {
             .map(|file| file_request(file, &submodules))
             .collect();
         let sources = match list {
+            FileList::Changes if self.details.scope == ChangeScope::Staged => Some((
+                sg_git::difftastic::Source::Revision("HEAD".into()),
+                sg_git::difftastic::Source::Index,
+            )),
+            FileList::Changes if self.details.scope == ChangeScope::Unstaged => Some((
+                sg_git::difftastic::Source::Index,
+                sg_git::difftastic::Source::WorkTree,
+            )),
             FileList::Changes => Some((
                 match (&self.details.base, &self.details.merge_base) {
                     (Some(_), Some(merge_base)) => {
@@ -3454,7 +3466,21 @@ impl SuperGitApp {
         view.branch_changes.then(|| view.base.clone())
     }
 
-    fn change_comparison(&mut self, branch: bool, base: Option<String>, cx: &mut Context<Self>) {
+    fn change_scope(&self) -> ChangeScope {
+        self.selected
+            .as_ref()
+            .and_then(|path| self.repository_view().worktrees.get(path))
+            .filter(|view| !view.branch_changes)
+            .map_or(ChangeScope::All, |view| view.change_scope)
+    }
+
+    fn change_comparison(
+        &mut self,
+        branch: bool,
+        base: Option<String>,
+        scope: ChangeScope,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(root), Some(path)) = (
             self.repo.as_ref().map(|repo| repo.root.clone()),
             self.selected.clone(),
@@ -3476,6 +3502,10 @@ impl SuperGitApp {
             .entry(path)
             .or_default();
         view.branch_changes = branch;
+        if !branch {
+            view.change_scope = scope;
+        }
+        view.changes_position = None;
         if let Some(base) = base {
             view.base = base;
         } else if view.base.is_empty() {
@@ -3484,6 +3514,7 @@ impl SuperGitApp {
         self.details_generation += 1;
         self.details_task = None;
         self.details.base = self.comparison_base();
+        self.details.scope = self.change_scope();
         self.details.patch = LoadState::Loading;
         self.details.files = LoadState::Loading;
         self.details.merge_base = None;
@@ -3506,15 +3537,22 @@ impl SuperGitApp {
             .gap_1()
             .px_2()
             .py_1()
-            .child(
-                Button::new("compare-uncommitted")
-                    .label("Uncommitted")
-                    .xsmall()
-                    .ghost()
-                    .selected(base.is_none())
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.change_comparison(false, None, cx)),
-                    ),
+            .children(
+                [
+                    (ChangeScope::All, "compare-uncommitted", "Uncommitted"),
+                    (ChangeScope::Staged, "compare-staged", "Staged"),
+                    (ChangeScope::Unstaged, "compare-unstaged", "Unstaged"),
+                ]
+                .map(|(scope, id, label)| {
+                    Button::new(id)
+                        .label(label)
+                        .xsmall()
+                        .ghost()
+                        .selected(base.is_none() && self.change_scope() == scope)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.change_comparison(false, None, scope, cx)
+                        }))
+                }),
             )
             .child(
                 Button::new("compare-branch")
@@ -3522,7 +3560,9 @@ impl SuperGitApp {
                     .xsmall()
                     .ghost()
                     .selected(base.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.change_comparison(true, None, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.change_comparison(true, None, ChangeScope::All, cx)
+                    })),
             );
         if let Some(base) = base {
             if !self.base_inputs.contains_key(&path) {
@@ -3534,7 +3574,7 @@ impl SuperGitApp {
                 cx.subscribe(&input, |this, input, event, cx| {
                     if matches!(event, InputEvent::PressEnter { .. }) {
                         let base = input.read(cx).value().trim().to_string();
-                        this.change_comparison(true, Some(base), cx);
+                        this.change_comparison(true, Some(base), ChangeScope::All, cx);
                     }
                 })
                 .detach();
@@ -3561,7 +3601,7 @@ impl SuperGitApp {
                         .ghost()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let base = input.read(cx).value().trim().to_string();
-                            this.change_comparison(true, Some(base), cx);
+                            this.change_comparison(true, Some(base), ChangeScope::All, cx);
                         })),
                 );
         }
@@ -3578,7 +3618,7 @@ impl SuperGitApp {
                 .child(if let Some(base) = &self.details.base {
                     format!("Working tree vs merge base of {base}{} · includes committed and uncommitted work",
                         self.details.merge_base.as_ref().map(|oid| format!(" ({})", &oid[..oid.len().min(8)])).unwrap_or_default())
-                } else { "Working tree vs HEAD · staged, unstaged and untracked changes".into() }))
+                } else { scope_description(self.change_scope()).into() }))
             .into_any_element()
     }
 
@@ -3629,7 +3669,11 @@ impl SuperGitApp {
                             if self.comparison_base().is_some() {
                                 "No branch changes against this merge base"
                             } else {
-                                "Working tree clean"
+                                match self.change_scope() {
+                                    ChangeScope::All => "Working tree clean",
+                                    ChangeScope::Staged => "No staged changes",
+                                    ChangeScope::Unstaged => "No unstaged changes",
+                                }
                             }
                         }),
                 )
@@ -4868,6 +4912,14 @@ impl Render for SuperGitApp {
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
             })
+    }
+}
+
+fn scope_description(scope: ChangeScope) -> &'static str {
+    match scope {
+        ChangeScope::All => "Working tree vs HEAD · staged, unstaged and untracked changes",
+        ChangeScope::Staged => "Index vs HEAD · contents prepared for commit",
+        ChangeScope::Unstaged => "Working tree vs index · unstaged and untracked changes",
     }
 }
 

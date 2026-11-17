@@ -34,7 +34,10 @@ pub use log::{
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
 pub use staging::{Staging, change_staging};
-pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};
+pub use status::{
+    ChangeScope, FileChange, FileState, WorktreeStatus, scoped_worktree_patch, status,
+    worktree_patch,
+};
 pub use submodule::{
     Inline, MAX_COMMITS, Patch, SubmoduleChange, SubmoduleCommit, SubmoduleFlags,
     inline_submodules, submodule_of, with_submodule_files,

@@ -205,24 +205,61 @@ pub(crate) const PATCH_OPTIONS: [&str; 6] = [
 const MAX_UNTRACKED_FILES: usize = 100;
 const MAX_UNTRACKED_BYTES: u64 = 256 * 1024;
 
-/// Unified patch of everything that differs from HEAD in the worktree:
-/// staged and unstaged changes, plus untracked files as new-file patches;
-/// changed submodules with their own changes inlined.
+/// Which side of the index to show for local changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeScope {
+    #[default]
+    All,
+    Staged,
+    Unstaged,
+}
+
+impl ChangeScope {
+    pub fn project(self, file: &FileChange) -> Option<FileChange> {
+        let mut file = file.clone();
+        match self {
+            Self::All => {}
+            Self::Staged => {
+                file.staged?;
+                file.unstaged = None;
+            }
+            Self::Unstaged => {
+                file.unstaged?;
+                file.staged = None;
+            }
+        }
+        Some(file)
+    }
+}
+
+/// Working tree versus HEAD, including untracked files.
 pub fn worktree_patch(worktree: &Path, status: &WorktreeStatus) -> Result<Patch> {
+    scoped_worktree_patch(worktree, status, ChangeScope::All)
+}
+
+pub fn scoped_worktree_patch(
+    worktree: &Path,
+    status: &WorktreeStatus,
+    scope: ChangeScope,
+) -> Result<Patch> {
     let diff = |args: &[&str]| {
         let mut all = vec!["diff"];
         all.extend(PATCH_OPTIONS);
         all.extend(args);
+        all.push("--");
         git(worktree, all)
     };
-    let mut patch = if status.is_unborn() {
-        let mut p = diff(&["--cached"])?;
-        p.push_str(&diff(&[])?);
-        p
-    } else {
-        diff(&["HEAD", "--"])?
+    let mut patch = match scope {
+        ChangeScope::Staged => return Ok(inline_submodules(worktree, &diff(&["--cached"])?, None)),
+        ChangeScope::Unstaged => diff(&[])?,
+        ChangeScope::All if status.is_unborn() => {
+            let mut staged = diff(&["--cached"])?;
+            staged.push_str(&diff(&[])?);
+            staged
+        }
+        ChangeScope::All => diff(&["HEAD"])?,
     };
-
     for file in status
         .files
         .iter()
@@ -231,6 +268,14 @@ pub fn worktree_patch(worktree: &Path, status: &WorktreeStatus) -> Result<Patch>
     {
         append_new_file_patch(&mut patch, worktree, &file.path);
     }
+    let mut unstaged;
+    let status = if scope == ChangeScope::Unstaged {
+        unstaged = status.clone();
+        unstaged.files.retain(|file| file.unstaged.is_some());
+        &unstaged
+    } else {
+        status
+    };
     Ok(inline_submodules(worktree, &patch, Some(status)))
 }
 
