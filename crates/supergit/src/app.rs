@@ -14,7 +14,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable as _, Selectable as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{
-    Diff, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffSide, DiffState,
+    Diff, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffMode, DiffSide, DiffState,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
@@ -34,12 +34,13 @@ use crate::agent_context::{self, Attachment};
 use crate::attention::Kind;
 use crate::avatars;
 use crate::chat::ChatSession;
+use crate::difft_view::{self, DifftView};
 use crate::file_tree::{self, TreeRow};
 use crate::graph;
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::notifications;
-use crate::settings::Appearance;
+use crate::settings::{Appearance, DiffLayout};
 use crate::switcher::{self, Destination, Entry};
 use crate::workspace::{self, RepositoryView, ReviewPosition, WindowRect};
 
@@ -121,6 +122,8 @@ struct ReviewView {
     commit_patch: LoadState<String>,
     changes_diff: Entity<DiffState>,
     commit_diff: Entity<DiffState>,
+    changes_difft: Entity<DifftView>,
+    commit_difft: Entity<DifftView>,
 }
 
 struct Switcher {
@@ -188,6 +191,15 @@ pub struct SuperGitApp {
     history_layout: Entity<ResizableState>,
     selected_commit: Option<String>,
     commit_diff: Entity<DiffState>,
+    /// The same diffs through difftastic, loaded only while it is on.
+    changes_difft: Entity<DifftView>,
+    commit_difft: Entity<DifftView>,
+    /// Unified or Split, for every diff (Settings).
+    diff_layout: DiffLayout,
+    /// Show diffs through difftastic (Settings); needs `difft` on PATH.
+    difftastic: bool,
+    /// `None` until looked up; then the installed version, if any.
+    difft_version: Option<Option<String>>,
     commit_patch: LoadState<String>,
     /// The selected commit's card (full message, dates); matched by sha.
     commit_details: Option<CommitDetails>,
@@ -277,8 +289,12 @@ impl SuperGitApp {
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
             crate::appearance::system_appearance_changed(window, cx);
         });
-        let changes_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
-        let commit_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
+        let settings = crate::settings::load();
+        let diff_layout = settings.diff_layout;
+        let changes_diff = new_diff_state(diff_layout, cx);
+        let commit_diff = new_diff_state(diff_layout, cx);
+        let changes_difft = cx.new(|_| DifftView::new(diff_mode(diff_layout)));
+        let commit_difft = cx.new(|_| DifftView::new(diff_mode(diff_layout)));
         let pulls = pulls::Pulls::new(window, cx);
 
         let mut persisted = workspace::load();
@@ -353,6 +369,11 @@ impl SuperGitApp {
             history_layout: cx.new(|_| ResizableState::default()),
             selected_commit: None,
             commit_diff,
+            changes_difft,
+            commit_difft,
+            diff_layout,
+            difftastic: settings.difftastic,
+            difft_version: None,
             commit_patch: LoadState::Loading,
             commit_details: None,
             details_generation: 0,
@@ -392,6 +413,7 @@ impl SuperGitApp {
             ],
         };
         this._subscriptions.extend(filter_subscriptions);
+        this.detect_difftastic(cx);
         this.focus_handle.focus(window, cx);
         this.start_polling(cx);
         this
@@ -539,6 +561,8 @@ impl SuperGitApp {
                     commit_patch: self.commit_patch.clone(),
                     changes_diff: self.changes_diff.clone(),
                     commit_diff: self.commit_diff.clone(),
+                    changes_difft: self.changes_difft.clone(),
+                    commit_difft: self.commit_difft.clone(),
                 },
             );
         }
@@ -557,6 +581,8 @@ impl SuperGitApp {
             self.commit_patch = cached.commit_patch;
             self.changes_diff = cached.changes_diff;
             self.commit_diff = cached.commit_diff;
+            self.changes_difft = cached.changes_difft;
+            self.commit_difft = cached.commit_difft;
             return;
         }
         let saved = self
@@ -686,6 +712,12 @@ impl SuperGitApp {
                 &this.changes_diff
             };
             diff.update(cx, |state, cx| state.scroll_to_file(&path, cx));
+            let difft = if commit {
+                &this.commit_difft
+            } else {
+                &this.changes_difft
+            };
+            difft.update(cx, |view, cx| view.scroll_to_file(&path, cx));
         }))
     }
 
@@ -1156,6 +1188,7 @@ impl SuperGitApp {
                             .on_click(cx.listener(move |this,_,_,cx| this.toggle_notification(approval,cx))))))
                 .child(div().text_sm().text_color(theme.muted_foreground).child(
                     "Only exact events from native conversations are notified. The visible conversation stays quiet. If macOS blocks alerts, enable SuperGIT in System Settings → Notifications."))
+                .child(self.render_diff_settings(cx))
                 .child(self.render_cleanup_settings(cx)))
             .into_any_element()
     }
@@ -1496,14 +1529,16 @@ impl SuperGitApp {
         if self.selected.as_ref() != Some(&details.path) || self.comparison_base() != details.base {
             return;
         }
+        let mut patch_changed = false;
         if let LoadState::Ready(patch) = &details.patch
             && (self.details.patch.value() != Some(patch) || details.path != self.details.path)
         {
-            match DiffFile::parse(patch) {
+            match crate::syntax::parse_patch(patch) {
                 Ok(files) => {
                     self.changes_diff
                         .update(cx, |state, cx| state.set_files(files, cx));
                     self.restore_position(false, cx);
+                    patch_changed = true;
                 }
                 Err(error) => {
                     details.patch =
@@ -1522,8 +1557,12 @@ impl SuperGitApp {
             self.commit_patch = LoadState::Loading;
             self.commit_diff
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+            self.commit_difft.update(cx, |view, cx| view.clear(cx));
         }
         self.details.update(details);
+        if patch_changed {
+            self.refresh_difft(FileList::Changes, cx);
+        }
         #[cfg(feature = "screenshot")]
         if std::env::var_os("SUPERGIT_DEBUG_CONTEXT").is_some()
             && std::env::var_os("SUPERGIT_DEBUG_CONTEXT_DONE").is_none()
@@ -1563,8 +1602,11 @@ impl SuperGitApp {
         self.details = Details::default();
         self.selected_commit = None;
         self.commit_patch = LoadState::Loading;
-        self.changes_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
-        self.commit_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
+        self.changes_diff = new_diff_state(self.diff_layout, cx);
+        self.commit_diff = new_diff_state(self.diff_layout, cx);
+        let mode = diff_mode(self.diff_layout);
+        self.changes_difft = cx.new(|_| DifftView::new(mode));
+        self.commit_difft = cx.new(|_| DifftView::new(mode));
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1588,6 +1630,9 @@ impl SuperGitApp {
         self.selected = Some(path);
         self.reset_details(cx);
         self.restore_review(cx);
+        // A restored review may predate turning difftastic on.
+        self.refresh_difft(FileList::Changes, cx);
+        self.refresh_difft(FileList::Commit, cx);
         self.reload_details(cx);
         self.queue_persist(cx);
         cx.notify();
@@ -1612,6 +1657,7 @@ impl SuperGitApp {
             self.commit_patch = LoadState::Loading;
             self.commit_diff
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+            self.commit_difft.update(cx, |view, cx| view.clear(cx));
         }
         self.selected_commit = Some(sha.clone());
         self.commit_generation += 1;
@@ -1637,7 +1683,7 @@ impl SuperGitApp {
                     return;
                 }
                 let patch = patch.and_then(|patch| {
-                    let files = DiffFile::parse(&patch)
+                    let files = crate::syntax::parse_patch(&patch)
                         .map_err(|e| format!("Cannot display commit diff: {e}"))?;
                     this.commit_diff
                         .update(cx, |state, cx| state.set_files(files, cx));
@@ -1646,6 +1692,7 @@ impl SuperGitApp {
                 this.commit_patch.update(LoadState::from_result(patch));
                 this.commit_details = details;
                 this.commit_task = None;
+                this.refresh_difft(FileList::Commit, cx);
                 this.restore_position(true, cx);
                 this.queue_persist(cx);
                 cx.notify();
@@ -3390,18 +3437,290 @@ impl SuperGitApp {
         menu
     }
 
-    fn render_review_diff(&self, state: &Entity<DiffState>, cx: &mut Context<Self>) -> AnyElement {
+    /// The diff beside a file list (Changes, or the selected commit): a
+    /// toolbar with the layout and difftastic toggles above the diff itself.
+    fn render_review_diff(&self, list: FileList, cx: &mut Context<Self>) -> AnyElement {
         let owner = cx.entity().downgrade();
-        div()
+        let content = if self.difftastic_active() {
+            match list {
+                FileList::Changes => self.changes_difft.clone().into_any_element(),
+                FileList::Commit => self.commit_difft.clone().into_any_element(),
+            }
+        } else {
+            let state = match list {
+                FileList::Changes => &self.changes_diff,
+                FileList::Commit => &self.commit_diff,
+            };
+            // Split wraps long lines so each side keeps half the width, as
+            // on GitHub; Unified scrolls sideways instead.
+            Diff::new(state)
+                .line_number(true)
+                .soft_wrap(self.diff_layout == DiffLayout::Split)
+                .into_any_element()
+        };
+        v_flex()
             .size_full()
-            .child(Diff::new(state).line_number(true))
-            .context_menu(move |menu, _, cx| {
-                let Some(owner) = owner.upgrade() else {
-                    return menu;
-                };
-                owner.update(cx, |this, cx| this.context_menu(menu, None, cx))
-            })
+            .min_w_0()
+            .child(self.render_diff_toolbar(list, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(content)
+                    .context_menu(move |menu, _, cx| {
+                        let Some(owner) = owner.upgrade() else {
+                            return menu;
+                        };
+                        owner.update(cx, |this, cx| this.context_menu(menu, None, cx))
+                    }),
+            )
             .into_any_element()
+    }
+
+    /// Unified/Split and the difftastic switch (also in Settings).
+    fn render_diff_toolbar(&self, list: FileList, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let key = list as usize;
+        let layouts = [
+            (
+                DiffLayout::Unified,
+                IconName::Rows2,
+                "Unified",
+                "diff-unified",
+            ),
+            (DiffLayout::Split, IconName::Columns2, "Split", "diff-split"),
+        ]
+        .map(|(layout, icon, label, id)| {
+            Button::new((id, key))
+                .icon(icon)
+                .label(label)
+                .xsmall()
+                .ghost()
+                .selected(self.diff_layout == layout)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_diff_layout(layout, cx)))
+        });
+        let available = self.difft_available();
+        let tooltip = match &self.difft_version {
+            None => "Looking for difftastic…".to_string(),
+            Some(None) => "difftastic is not installed: brew install difftastic".to_string(),
+            Some(Some(version)) => format!(
+                "Structural diff by difftastic {version}: only changed syntax is highlighted, reformatting is ignored"
+            ),
+        };
+        h_flex()
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .children(layouts)
+            .child(div().flex_1())
+            .child(
+                Button::new(("diff-difftastic", key))
+                    .icon(IconName::FileDiff)
+                    .label("Difftastic")
+                    .xsmall()
+                    .ghost()
+                    .selected(self.difftastic_active())
+                    .disabled(!available)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let on = !this.difftastic;
+                        this.set_difftastic(on, cx);
+                    })),
+            )
+    }
+
+    fn difft_available(&self) -> bool {
+        matches!(self.difft_version, Some(Some(_)))
+    }
+
+    fn difftastic_active(&self) -> bool {
+        self.difftastic && self.difft_available()
+    }
+
+    /// Looks for `difft` once, off the main thread.
+    fn detect_difftastic(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async { sg_git::difftastic::version() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.difft_version = Some(version);
+                this.refresh_difft(FileList::Changes, cx);
+                this.refresh_difft(FileList::Commit, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Compares `list`'s files with difftastic when it is on; a no-op when
+    /// the shown result is already for this patch.
+    fn refresh_difft(&mut self, list: FileList, cx: &mut Context<Self>) {
+        if !self.difftastic_active() {
+            return;
+        }
+        let Some(worktree) = self.selected.clone() else {
+            return;
+        };
+        let (state, view, patch) = match list {
+            FileList::Changes => (
+                &self.changes_diff,
+                self.changes_difft.clone(),
+                self.details.patch.value(),
+            ),
+            FileList::Commit => (
+                &self.commit_diff,
+                self.commit_difft.clone(),
+                self.commit_patch.value(),
+            ),
+        };
+        let files: Vec<_> = state.read(cx).files().iter().map(file_request).collect();
+        let sources = match list {
+            FileList::Changes => Some((
+                match (&self.details.base, &self.details.merge_base) {
+                    (Some(_), Some(merge_base)) => {
+                        sg_git::difftastic::Source::Revision(merge_base.clone())
+                    }
+                    _ => sg_git::difftastic::Source::Revision("HEAD".into()),
+                },
+                sg_git::difftastic::Source::WorkTree,
+            )),
+            // The first parent, as `git show --first-parent`; a root
+            // commit's missing parent reads as empty files.
+            FileList::Commit => self.selected_commit.clone().map(|sha| {
+                (
+                    sg_git::difftastic::Source::Revision(format!("{sha}^")),
+                    sg_git::difftastic::Source::Revision(sha),
+                )
+            }),
+        };
+        let (Some((old, new)), Some(patch), false) = (sources, patch, files.is_empty()) else {
+            view.update(cx, |view, cx| view.clear(cx));
+            return;
+        };
+        let revision = {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::hash::DefaultHasher::new();
+            patch.hash(&mut hasher);
+            hasher.finish()
+        };
+        let request = difft_view::Request {
+            worktree,
+            old,
+            new,
+            files,
+            revision,
+        };
+        view.update(cx, |view, cx| view.load(request, cx));
+    }
+
+    fn set_diff_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
+        self.diff_layout = layout;
+        let mut settings = crate::settings::load();
+        settings.diff_layout = layout;
+        crate::settings::save(&settings);
+        let mode = diff_mode(layout);
+        let cached = self.review_views.values();
+        let states: Vec<_> = [self.changes_diff.clone(), self.commit_diff.clone()]
+            .into_iter()
+            .chain(
+                cached
+                    .clone()
+                    .flat_map(|view| [view.changes_diff.clone(), view.commit_diff.clone()]),
+            )
+            .collect();
+        let views: Vec<_> = [self.changes_difft.clone(), self.commit_difft.clone()]
+            .into_iter()
+            .chain(cached.flat_map(|view| [view.changes_difft.clone(), view.commit_difft.clone()]))
+            .collect();
+        for state in states {
+            state.update(cx, |state, cx| state.set_mode(mode, cx));
+        }
+        for view in views {
+            view.update(cx, |view, cx| view.set_mode(mode, cx));
+        }
+        cx.notify();
+    }
+
+    fn set_difftastic(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.difftastic = on;
+        let mut settings = crate::settings::load();
+        settings.difftastic = on;
+        crate::settings::save(&settings);
+        self.refresh_difft(FileList::Changes, cx);
+        self.refresh_difft(FileList::Commit, cx);
+        cx.notify();
+    }
+
+    /// The Settings section for diffs.
+    fn render_diff_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let available = self.difft_available();
+        let status = match &self.difft_version {
+            None => "Looking for difftastic…".to_string(),
+            Some(None) => "difft was not found on PATH. Install it with `brew install difftastic`, then reopen SuperGIT.".to_string(),
+            Some(Some(version)) => format!(
+                "difftastic {version}: compares syntax trees, so only changed tokens are highlighted and reformatting shows as no change."
+            ),
+        };
+        v_flex()
+            .gap_2()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("Diffs"))
+            .child(
+                h_flex().justify_between().child("Layout").child(
+                    h_flex().gap_1().children(
+                        [
+                            (DiffLayout::Unified, "Unified"),
+                            (DiffLayout::Split, "Split"),
+                        ]
+                        .map(|(layout, label)| {
+                            Button::new(SharedString::from(format!("settings-layout-{label}")))
+                                .label(label)
+                                .small()
+                                .ghost()
+                                .selected(self.diff_layout == layout)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_diff_layout(layout, cx)
+                                }))
+                        }),
+                    ),
+                ),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child("Show diffs with difftastic")
+                    .child(
+                        Button::new("settings-difftastic")
+                            .label(if self.difftastic_active() {
+                                "On"
+                            } else {
+                                "Off"
+                            })
+                            .small()
+                            .ghost()
+                            .disabled(!available)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let on = !this.difftastic;
+                                this.set_difftastic(on, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(status),
+            )
     }
 
     fn comparison_base(&self) -> Option<String> {
@@ -3447,6 +3766,7 @@ impl SuperGitApp {
         self.details.merge_base = None;
         self.changes_diff
             .update(cx, |diff, cx| diff.set_files(Vec::new(), cx));
+        self.changes_difft.update(cx, |view, cx| view.clear(cx));
         self.reload_details(cx);
         self.queue_persist(cx);
         cx.notify();
@@ -3610,7 +3930,7 @@ impl SuperGitApp {
             .child(
                 resizable_panel()
                     .size_range(px(180.)..Pixels::MAX)
-                    .child(elastic(self.render_review_diff(&self.changes_diff, cx))),
+                    .child(elastic(self.render_review_diff(FileList::Changes, cx))),
             )
             .into_any_element();
         v_flex()
@@ -4148,7 +4468,7 @@ impl SuperGitApp {
             .child(
                 resizable_panel()
                     .size_range(px(180.)..Pixels::MAX)
-                    .child(elastic(self.render_review_diff(&self.commit_diff, cx))),
+                    .child(elastic(self.render_review_diff(FileList::Commit, cx))),
             )
             .into_any_element()
     }
@@ -4530,7 +4850,14 @@ impl SuperGitApp {
                 .flex_1()
                 .min_h_0()
                 .child(self.render_projects_rail(cx))
-                .child(div().flex_1().min_w_0().h_full().flex().child(project))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .child(elastic(project)),
+                )
                 .into_any_element();
         }
         // What the active project needs at its narrowest.
@@ -4599,9 +4926,11 @@ impl SuperGitApp {
                     .into_any_element()
             } else if self.selected.is_some() {
                 let rail = self.render_chat_rail(window, cx);
+                // Elastic like the panels above: wide content (a long commit
+                // message, a diff line) must not push the rail off-screen.
                 h_flex()
                     .size_full()
-                    .child(div().flex_1().min_w_0().h_full().child(main))
+                    .child(div().flex_1().min_w_0().h_full().child(elastic(main)))
                     .child(rail)
                     .into_any_element()
             } else {
@@ -4612,7 +4941,7 @@ impl SuperGitApp {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar_rail(cx))
-                    .child(div().flex_1().min_w_0().h_full().child(workspace))
+                    .child(div().flex_1().min_w_0().h_full().child(elastic(workspace)))
                     .into_any_element()
             } else {
                 div()
@@ -4804,6 +5133,32 @@ impl Render for SuperGitApp {
 /// content never widens the panel and pushes the chat or sidebar away. A
 /// column, so the content is exactly as wide as the panel and `flex_1` /
 /// `h_full` children fill its height.
+/// An empty diff in the user's layout.
+fn new_diff_state(layout: DiffLayout, cx: &mut App) -> Entity<DiffState> {
+    cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx).with_mode(diff_mode(layout)))
+}
+
+fn diff_mode(layout: DiffLayout) -> DiffMode {
+    match layout {
+        DiffLayout::Unified => DiffMode::Unified,
+        DiffLayout::Split => DiffMode::Split,
+    }
+}
+
+/// A file of a parsed patch, as difftastic should compare it.
+fn file_request(file: &DiffFile) -> sg_git::difftastic::FileRequest {
+    let old_path = match (file.original_path(), file.modified_path()) {
+        (Some(old), Some(new)) if old != new => Some(old.to_string()),
+        _ => None,
+    };
+    sg_git::difftastic::FileRequest {
+        path: file.path().to_string(),
+        old_path,
+        added: file.status() == DiffFileStatus::Added,
+        deleted: file.status() == DiffFileStatus::Deleted,
+    }
+}
+
 fn elastic(content: impl IntoElement) -> Div {
     v_flex()
         .size_full()

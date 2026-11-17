@@ -4,6 +4,7 @@ mod appearance;
 mod attention;
 mod avatars;
 mod chat;
+mod difft_view;
 mod dump;
 mod file_tree;
 mod graph;
@@ -18,6 +19,7 @@ mod screenshot;
 mod settings;
 mod shell_env;
 mod switcher;
+mod syntax;
 mod workspace;
 
 use std::path::PathBuf;

@@ -50,6 +50,17 @@ impl Appearance {
     }
 }
 
+/// How a diff shows the two sides of a file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffLayout {
+    /// One column: removed lines above added ones.
+    #[default]
+    Unified,
+    /// Old and new side by side.
+    Split,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -59,6 +70,10 @@ pub struct Settings {
     /// The agent new conversations start with (`claude`, `codex`): the one
     /// picked last.
     pub agent: String,
+    pub diff_layout: DiffLayout,
+    /// Show Changes and History diffs through difftastic (`difft`), when it
+    /// is installed.
+    pub difftastic: bool,
 }
 
 fn file() -> Option<PathBuf> {
@@ -127,6 +142,12 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.appearance, Appearance::System);
         assert!(!s.notify_approvals && !s.notify_completions);
+        assert_eq!(s.diff_layout, DiffLayout::Unified);
+        assert!(!s.difftastic);
+        let s: Settings =
+            serde_json::from_str(r#"{"diff_layout":"split","difftastic":true}"#).unwrap();
+        assert_eq!(s.diff_layout, DiffLayout::Split);
+        assert!(s.difftastic);
         assert_eq!(Appearance::System.next().next().next(), Appearance::System);
     }
 
