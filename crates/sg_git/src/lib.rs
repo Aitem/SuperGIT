@@ -10,6 +10,7 @@ mod base;
 mod cleanup;
 mod comparison;
 pub mod difftastic;
+mod edit;
 mod log;
 mod rebase;
 mod runner;
@@ -25,6 +26,9 @@ pub use cleanup::{
 };
 pub use comparison::{
     BranchChanges, branch_changes, pr_merge_base, range_patch, resolve_branch, suggested_base,
+};
+pub use edit::{
+    IndexEdit, IndexHunk, commit, edit_file, edit_hunk, fetch, index_hunks, pull, squash,
 };
 pub use log::{
     Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
