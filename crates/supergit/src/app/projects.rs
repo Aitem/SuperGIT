@@ -1,11 +1,14 @@
-//! The Projects panel: several repositories in one window. Only the active
-//! project polls Git and GitHub; the others keep their last snapshot, so
-//! switching back is instant, and their native conversations keep running.
+//! Projects: several repositories in one window, the top level of the
+//! sidebar's tree. Only the active project polls Git and GitHub; the others
+//! keep their last snapshot (read once in the background when there is none
+//! yet), so their worktrees stay listed, switching back is instant, and their
+//! native conversations keep running.
 
 use super::*;
 use gpui_kit::component::menu::DropdownMenu as _;
 
-/// What a project showed when it was last active.
+/// What a project showed when it was last active, or what a background read
+/// found (see [`SuperGitApp::load_project`]).
 pub(super) struct ProjectSnapshot {
     worktrees: Vec<WorktreeInfo>,
     prs: Vec<PullRequest>,
@@ -17,30 +20,53 @@ pub(super) struct ProjectSnapshot {
     creation_base: LoadState<sg_git::BaseInfo>,
 }
 
-/// Native conversation activity across one project's worktrees.
-#[derive(Default)]
-struct Activity {
-    agent: Option<AgentState>,
-    /// The most urgent attention, how many conversations have it, and one
-    /// of them to open: `(worktree, conversation id, its agent)`.
-    attention: Option<(Kind, usize, PathBuf, String, Provider)>,
+impl ProjectSnapshot {
+    fn loaded(worktrees: Vec<WorktreeInfo>) -> Self {
+        Self {
+            worktrees,
+            prs: Vec::new(),
+            prs_error: None,
+            prs_loaded: false,
+            prs_fetched_at: None,
+            observed_open_prs: HashMap::new(),
+            cleanup_attempted: HashSet::new(),
+            creation_base: LoadState::Loading,
+        }
+    }
 }
 
-const ATTENTION_ORDER: [Kind; 4] = [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running];
+/// A background read of an inactive project for the sidebar.
+pub(super) enum ProjectLoad {
+    Loading { _task: Task<()> },
+    Failed(String),
+}
+
+/// Native conversation activity across one project's worktrees.
+#[derive(Default)]
+pub(super) struct Activity {
+    pub(super) agent: Option<AgentState>,
+    /// The most urgent attention, how many conversations have it, and one
+    /// of them to open: `(worktree, conversation id, its agent)`.
+    pub(super) attention: Option<(Kind, usize, PathBuf, String, Provider)>,
+}
+
+/// The title bar's order: the first needs the user most.
+pub(super) const ATTENTION_ORDER: [Kind; 4] =
+    [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running];
 
 fn wants_attention(kind: Kind, state: &crate::attention::Attention) -> bool {
     state.kind == kind && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
 }
 
 /// The repository's folder name.
-fn project_name(root: &Path) -> String {
+pub(super) fn project_name(root: &Path) -> String {
     root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.display().to_string())
 }
 
 /// `root` with the home directory shortened to `~`.
-fn short_path(root: &Path) -> String {
+pub(super) fn short_path(root: &Path) -> String {
     match std::env::var_os("HOME").map(PathBuf::from) {
         Some(home) if root.starts_with(&home) => match root.strip_prefix(&home) {
             Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
@@ -106,6 +132,159 @@ impl SuperGitApp {
         self.apply_worktrees(Ok(snapshot.worktrees), cx);
     }
 
+    /// An inactive project's last snapshot, as the sidebar's rows see it.
+    pub(super) fn snapshot_scope(&self, root: &Path) -> Option<(Scope<'_>, &[WorktreeInfo])> {
+        let snapshot = self.project_cache.get(root)?;
+        Some((
+            Scope {
+                view: self.view_of(root),
+                prs: &snapshot.prs,
+                prs_fresh: snapshot.prs_error.is_none() && snapshot.prs_fetched_at.is_some(),
+                active: false,
+            },
+            &snapshot.worktrees,
+        ))
+    }
+
+    /// Why an inactive project without a snapshot lists no worktrees.
+    pub(super) fn project_load_error(&self, root: &Path) -> Option<&str> {
+        match self.project_loads.get(root)? {
+            ProjectLoad::Failed(error) => Some(error),
+            ProjectLoad::Loading { .. } => None,
+        }
+    }
+
+    /// Read the unfolded inactive projects that have no snapshot yet.
+    pub(super) fn load_inactive_projects(&mut self, cx: &mut Context<Self>) {
+        let roots: Vec<PathBuf> = self
+            .persisted
+            .projects
+            .roots
+            .iter()
+            .filter(|root| {
+                self.active_root() != Some(root.as_path())
+                    && !self.persisted.projects.is_folded(root)
+                    && !self.project_cache.contains_key(*root)
+                    && !self.project_loads.contains_key(*root)
+            })
+            .cloned()
+            .collect();
+        for root in roots {
+            self.load_project(root, cx);
+        }
+    }
+
+    /// Read an inactive project's worktrees, then its pull requests, in the
+    /// background so the sidebar can list them: once when it has no snapshot
+    /// yet and again each time it is unfolded. It does not poll.
+    pub(super) fn load_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.active_root() == Some(root.as_path())
+            || matches!(
+                self.project_loads.get(&root),
+                Some(ProjectLoad::Loading { .. })
+            )
+        {
+            return;
+        }
+        let index = self.index.clone();
+        let request = root.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let worktrees = cx.background_executor().spawn({
+                let root = request.clone();
+                async move {
+                    let repo = Repo::discover(&root)?;
+                    model::load_worktrees(&repo, &index)
+                }
+            });
+            let prs = cx.background_executor().spawn({
+                let root = request.clone();
+                async move {
+                    if sg_github::gh_available() {
+                        sg_github::list_prs(&root, 100, 30).map_err(|e| e.to_string())
+                    } else {
+                        Err("gh CLI not found — install it for pull requests".to_string())
+                    }
+                }
+            });
+            let worktrees = worktrees.await;
+            let listed = this
+                .update(cx, |this, cx| {
+                    this.apply_project_worktrees(&request, worktrees, cx)
+                })
+                .unwrap_or(false);
+            if !listed {
+                return;
+            }
+            let prs = prs.await;
+            this.update(cx, |this, cx| this.apply_project_prs(&request, prs, cx))
+                .ok();
+        });
+        self.project_loads
+            .insert(root, ProjectLoad::Loading { _task: task });
+    }
+
+    /// Whether the read goes on to pull requests.
+    fn apply_project_worktrees(
+        &mut self,
+        root: &Path,
+        result: anyhow::Result<Vec<WorktreeInfo>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Opened meanwhile (it polls itself now) or removed.
+        if self.active_root() == Some(root)
+            || !self.persisted.projects.roots.iter().any(|r| r == root)
+        {
+            self.project_loads.remove(root);
+            return false;
+        }
+        match result {
+            Ok(worktrees) => {
+                match self.project_cache.get_mut(root) {
+                    Some(snapshot) => snapshot.worktrees = worktrees,
+                    None => {
+                        self.project_cache
+                            .insert(root.to_path_buf(), ProjectSnapshot::loaded(worktrees));
+                    }
+                }
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.project_loads.insert(
+                    root.to_path_buf(),
+                    ProjectLoad::Failed(model::git_error_message(error)),
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn apply_project_prs(
+        &mut self,
+        root: &Path,
+        result: Result<Vec<PullRequest>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_loads.remove(root);
+        if self.active_root() == Some(root) {
+            return;
+        }
+        let Some(snapshot) = self.project_cache.get_mut(root) else {
+            return;
+        };
+        snapshot.prs_loaded = true;
+        match result {
+            Ok(prs) => {
+                snapshot.prs = prs;
+                snapshot.prs_error = None;
+                snapshot.prs_fetched_at = Some(std::time::Instant::now());
+            }
+            Err(error) => snapshot.prs_error = Some(error),
+        }
+        cx.notify();
+    }
+
     pub(super) fn switch_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         if self.active_root() == Some(root.as_path()) {
             return;
@@ -158,6 +337,8 @@ impl SuperGitApp {
                 self.review_views.remove(info.path());
             }
         }
+        self.project_loads.remove(&root);
+        self.persisted.projects.set_folded(&root, false);
         let roots = &mut self.persisted.projects.roots;
         let ix = roots.iter().position(|known| *known == root);
         roots.retain(|known| *known != root);
@@ -187,7 +368,7 @@ impl SuperGitApp {
 
     /// Exact activity of the project's native conversations: live ones, and
     /// saved ones (unread results) for worktrees not opened this run.
-    fn project_activity(&self, root: &Path, cx: &App) -> Activity {
+    pub(super) fn project_activity(&self, root: &Path, cx: &App) -> Activity {
         let mut states: Vec<(PathBuf, String, crate::attention::Attention, Provider)> = self
             .project_chats(root)
             .map(|(path, chat)| {
@@ -242,7 +423,7 @@ impl SuperGitApp {
     }
 
     /// Open the conversation behind a project's attention badge.
-    fn open_project_attention(
+    pub(super) fn open_project_attention(
         &mut self,
         root: PathBuf,
         worktree: PathBuf,
@@ -263,56 +444,17 @@ impl SuperGitApp {
         );
     }
 
-    /// The panel is shown once there is a project to list.
+    /// The sidebar is shown once there is a project to list.
     pub(super) fn projects_visible(&self) -> bool {
         self.repo.is_some() || !self.persisted.projects.roots.is_empty()
     }
 
-    /// Width the Projects panel takes from the window.
-    pub(super) fn projects_width(&self, cx: &App) -> f32 {
-        if !self.projects_visible() {
-            0.
-        } else if self.persisted.projects.collapsed {
-            RAIL_WIDTH
-        } else {
-            self.projects_layout
-                .read(cx)
-                .sizes()
-                .first()
-                .map(|width| width.as_f32())
-                .unwrap_or(self.persisted.projects.width)
-                .clamp(160., 360.)
-        }
-    }
-
-    pub(super) fn remember_projects_width(
-        &mut self,
-        state: &Entity<ResizableState>,
+    /// "+": recent repositories not in the sidebar yet, and the folder dialog.
+    pub(super) fn add_project_button(
+        &self,
+        id: &'static str,
         cx: &mut Context<Self>,
-    ) {
-        let Some(width) = state.read(cx).sizes().first().map(|width| width.as_f32()) else {
-            return;
-        };
-        self.persisted.projects.width = width;
-        self.persisted.projects.sanitize();
-        self.queue_persist(cx);
-    }
-
-    /// Collapse the Projects panel to a rail of initials, or expand it.
-    pub(super) fn toggle_projects(
-        &mut self,
-        _: &ToggleProjects,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let projects = &mut self.persisted.projects;
-        projects.collapsed = !projects.collapsed;
-        self.queue_persist(cx);
-        cx.notify();
-    }
-
-    /// "+": recent repositories not in the panel yet, and the folder dialog.
-    fn add_project_button(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    ) -> impl IntoElement {
         let owner = cx.entity().downgrade();
         let recent: Vec<PathBuf> = self
             .recent
@@ -351,7 +493,7 @@ impl SuperGitApp {
             })
     }
 
-    fn project_menu(
+    pub(super) fn project_menu(
         &self,
         row: Stateful<Div>,
         root: PathBuf,
@@ -375,228 +517,6 @@ impl SuperGitApp {
             )
         })
         .into_any_element()
-    }
-
-    pub(super) fn render_projects(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let roots = self.persisted.projects.roots.clone();
-        let rows: Vec<AnyElement> = roots
-            .iter()
-            .enumerate()
-            .map(|(ix, root)| {
-                let active = self.active_root() == Some(root.as_path());
-                let activity = self.project_activity(root, cx);
-                let target = root.clone();
-                let mut row = v_flex()
-                    .id(("project", ix))
-                    .px_3()
-                    .py_2()
-                    .gap_0p5()
-                    .cursor_pointer()
-                    .border_l_2()
-                    .border_color(if active {
-                        theme.primary
-                    } else {
-                        transparent_black()
-                    })
-                    .when(active, |el| el.bg(theme.sidebar_accent))
-                    .hover(|el| el.bg(theme.sidebar_accent))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.switch_project(target.clone(), cx)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(agent_dot(activity.agent, &theme))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(project_name(root)),
-                            )
-                            .when(active && !self.worktrees.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(self.worktrees.len().to_string()),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .pl_4()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(short_path(root)),
-                    );
-                if let Some((kind, count, worktree, conversation, provider)) = activity.attention {
-                    let root = root.clone();
-                    row = row.child(
-                        h_flex().pl_3().child(
-                            Button::new(("project-attention", ix))
-                                .label(if count > 1 {
-                                    format!("{count} {}", kind.label())
-                                } else {
-                                    format!("{} {}", provider.label(), kind.label())
-                                })
-                                .text_color(attention_color(kind, &theme))
-                                .xsmall()
-                                .ghost()
-                                .tooltip("Open the conversation")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.open_project_attention(
-                                        root.clone(),
-                                        worktree.clone(),
-                                        conversation.clone(),
-                                        provider,
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        ),
-                    );
-                }
-                self.project_menu(row, root.clone(), cx)
-            })
-            .collect();
-
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .h_full()
-            .flex_none()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .justify_between()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("PROJECTS · {}", roots.len()))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(self.add_project_button("add-project", cx))
-                            .child(
-                                Button::new("collapse-projects")
-                                    .icon(IconName::PanelLeftClose)
-                                    .xsmall()
-                                    .ghost()
-                                    .tooltip("Collapse the project list (cmd-shift-b)")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_projects(&ToggleProjects, window, cx)
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .id("projects")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
-            .into_any_element()
-    }
-
-    /// The collapsed project list: initials and a status dot per project.
-    pub(super) fn render_projects_rail(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let roots = self.persisted.projects.roots.clone();
-        let cells: Vec<AnyElement> = roots
-            .iter()
-            .enumerate()
-            .map(|(ix, root)| {
-                let active = self.active_root() == Some(root.as_path());
-                let activity = self.project_activity(root, cx);
-                let name = project_name(root);
-                let tooltip = match &activity.attention {
-                    Some((kind, count, ..)) => {
-                        format!("{name} · {count} {}\n{}", kind.label(), short_path(root))
-                    }
-                    None => format!("{name}\n{}", short_path(root)),
-                };
-                let dot = match &activity.attention {
-                    Some((kind, ..)) => div()
-                        .size(px(8.))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(attention_color(*kind, &theme))
-                        .into_any_element(),
-                    None => agent_dot(activity.agent, &theme).into_any_element(),
-                };
-                let target = root.clone();
-                let cell = v_flex()
-                    .id(("rail-project", ix))
-                    .w_full()
-                    .py_1p5()
-                    .gap_1()
-                    .items_center()
-                    .cursor_pointer()
-                    .border_l_2()
-                    .border_color(if active {
-                        theme.primary
-                    } else {
-                        transparent_black()
-                    })
-                    .when(active, |el| el.bg(theme.sidebar_accent))
-                    .hover(|el| el.bg(theme.sidebar_accent))
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.switch_project(target.clone(), cx)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(initials(&name)),
-                    )
-                    .child(dot);
-                self.project_menu(cell, root.clone(), cx)
-            })
-            .collect();
-        v_flex()
-            .w(px(RAIL_WIDTH))
-            .flex_none()
-            .h_full()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex().justify_center().py_1().child(
-                    Button::new("expand-projects")
-                        .icon(IconName::PanelLeftOpen)
-                        .xsmall()
-                        .ghost()
-                        .tooltip("Expand the project list (cmd-shift-b)")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_projects(&ToggleProjects, window, cx)
-                        })),
-                ),
-            )
-            .child(
-                v_flex()
-                    .id("project-rail")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(cells),
-            )
-            .child(
-                h_flex()
-                    .justify_center()
-                    .py_1()
-                    .child(self.add_project_button("add-project-rail", cx)),
-            )
-            .into_any_element()
     }
 }
 

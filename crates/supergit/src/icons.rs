@@ -16,7 +16,8 @@ gpui_kit::assets::icon_assets!(
         Rows2,
         Columns2,
         FileDiff,
-        ChevronsUpDown
+        ChevronsUpDown,
+        FolderGit2
     ]
 );
 
@@ -53,6 +54,7 @@ mod tests {
             IconName::Columns2,
             IconName::FileDiff,
             IconName::ChevronsUpDown,
+            IconName::FolderGit2,
             IconName::ChevronRight,
             IconName::ChevronDown,
             IconName::Folder,
