@@ -5,6 +5,7 @@ mod base;
 mod projects;
 mod pulls;
 mod sidebar;
+mod staged_commit;
 mod staging;
 mod worktrees;
 
@@ -240,6 +241,8 @@ pub struct SuperGitApp {
 
     branch_input: Entity<InputState>,
     /// Filters the Changes tab's file list by path.
+    staged_commit: Option<staged_commit::StagedCommit>,
+    staged_commit_handle: FocusHandle,
     changes_filter: Entity<InputState>,
     /// Folders collapsed in the Changes tab's tree view.
     changes_collapsed: HashSet<String>,
@@ -413,6 +416,8 @@ impl SuperGitApp {
             details_generation: 0,
             commit_generation: 0,
             branch_input,
+            staged_commit: None,
+            staged_commit_handle: cx.focus_handle(),
             changes_filter,
             changes_collapsed: HashSet::new(),
             commit_filter,
@@ -1851,6 +1856,7 @@ impl SuperGitApp {
         self.prs_error = None;
         self.prs_loaded = false;
         self.pulls.reset(cx);
+        self.staged_commit = None;
         self.selected = None;
         self.reset_details(cx);
     }
@@ -3573,6 +3579,9 @@ impl SuperGitApp {
                 .tooltip(format!("Attach selected lines or a file ({MOD}-shift-a)"))
                 .on_click(cx.listener(|this, _, window, cx| this.ask_agent(&AskAgent, window, cx))),
         );
+        if let Some(commit) = self.commit_staged_button(cx) {
+            bar = bar.child(commit);
+        }
         v_flex().w_full().border_b_1().border_color(theme.border).child(bar)
             .child(div().px_3().pb_1().text_xs().text_color(theme.muted_foreground)
                 .child(if let Some(base) = &self.details.base {
@@ -4867,6 +4876,9 @@ impl Render for SuperGitApp {
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
+            })
+            .when(self.staged_commit.is_some(), |el| {
+                el.child(self.render_staged_commit(cx))
             })
     }
 }
