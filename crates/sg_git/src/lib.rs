@@ -11,7 +11,6 @@ mod cleanup;
 mod comparison;
 pub mod difftastic;
 mod log;
-mod publish;
 mod rebase;
 mod runner;
 mod status;
@@ -31,6 +30,8 @@ pub use log::{
     Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
     commit_patch, fork, history, log,
 };
+mod publish;
+
 pub use publish::{BranchPublication, branch_publication, publication_commits, publish_branch};
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
