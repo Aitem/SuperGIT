@@ -11,7 +11,7 @@
 //! `{"response": "<method>", "result" | "error": …}` (see
 //! [`crate::conversation`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -204,6 +204,15 @@ impl CodexProcess {
         })
     }
 
+    /// Send a response to an interactive question using its original request ID.
+    pub fn respond_to_questions(
+        &self,
+        request_id: &str,
+        answers: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.respond(request_id, crate::questions::response(answers))
+    }
+
     fn input(&self, input: Input) -> Result<()> {
         self.inbox
             .send(input)
@@ -382,7 +391,7 @@ impl Driver {
             }
             drop(done);
         });
-        self.request("initialize", initialize_params());
+        self.request("initialize", initialize_params(true));
         Ok(())
     }
 
@@ -596,14 +605,14 @@ impl Driver {
     }
 }
 
-fn initialize_params() -> Value {
+fn initialize_params(experimental_api: bool) -> Value {
     json!({
         "clientInfo": {
             "name": "supergit",
             "title": "SuperGIT",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "capabilities": { "experimentalApi": false, "requestAttestation": false },
+        "capabilities": { "experimentalApi": experimental_api, "requestAttestation": false },
     })
 }
 
@@ -702,7 +711,7 @@ pub fn read_history(program: Option<&Path>, cwd: &Path, thread_id: &str) -> Resu
         None => install::locate()?.program,
     };
     let mut client = Client::start(&program, cwd)?;
-    client.call("initialize", initialize_params())?;
+    client.call("initialize", initialize_params(false))?;
     client.notify(&json!({ "method": "initialized" }))?;
     let thread = client
         .call(

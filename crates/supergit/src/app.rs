@@ -1217,7 +1217,7 @@ impl SuperGitApp {
                     .child(Button::new("close-settings").label("Done").small().ghost()
                         .on_click(cx.listener(|this,_,window,cx| this.close_settings(window,cx)))))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Background notifications"))
-                .children([(true,"Approval requests",settings.notify_approvals),(false,"Completion and failures",settings.notify_completions)]
+                .children([(true,"Approvals and questions",settings.notify_approvals),(false,"Completion and failures",settings.notify_completions)]
                     .into_iter().map(|(approval,label,enabled)| h_flex().justify_between().child(label)
                         .child(Button::new(if approval {"notify-approval"} else {"notify-completion"})
                             .label(if enabled {"On"} else {"Off"}).small().ghost()
@@ -1964,6 +1964,7 @@ impl SuperGitApp {
                         state.revision,
                         &match state.kind {
                             Kind::Approval => format!("{} needs your approval", provider.label()),
+                            Kind::Question => format!("{} has a question", provider.label()),
                             Kind::Failed => format!("{} task failed", provider.label()),
                             _ => format!("{} task completed", provider.label()),
                         },
@@ -1997,10 +1998,7 @@ impl SuperGitApp {
                             .and_then(|chats| chats.iter().find(|chat| chat.local_id == *id))
                             .map(|chat| &chat.attention)
                     });
-                state.is_some_and(|state| {
-                    state.kind == kind
-                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
-                })
+                state.is_some_and(|state| state.kind == kind && (kind.is_live() || state.unread))
             })
             .collect()
     }
@@ -2014,8 +2012,7 @@ impl SuperGitApp {
                         .iter()
                         .filter(|chat| {
                             let state = chat.read(cx).attention();
-                            state.kind == kind
-                                && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+                            state.kind == kind && (kind.is_live() || state.unread)
                         })
                         .count()
                 } else {
@@ -2026,9 +2023,7 @@ impl SuperGitApp {
                         .flatten()
                         .filter(|chat| native_provider(&chat.provider))
                         .filter(|chat| {
-                            chat.attention.kind == kind
-                                && (matches!(kind, Kind::Running | Kind::Approval)
-                                    || chat.attention.unread)
+                            chat.attention.kind == kind && (kind.is_live() || chat.attention.unread)
                         })
                         .count()
                 }
@@ -2227,7 +2222,9 @@ impl SuperGitApp {
             .get(path)?
             .iter()
             .filter_map(|c| match c.read(cx).status() {
-                sg_agents::chat::Status::NeedsPermission => Some(AgentState::NeedsAttention),
+                sg_agents::chat::Status::NeedsPermission | sg_agents::chat::Status::NeedsInput => {
+                    Some(AgentState::NeedsAttention)
+                }
                 sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
                     Some(AgentState::Working)
                 }
@@ -2304,15 +2301,12 @@ impl SuperGitApp {
                     })
                     .collect()
             };
-        [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
-            .into_iter()
-            .find_map(|kind| {
-                states.iter().find_map(|(state, provider, id)| {
-                    (state.kind == kind
-                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread))
-                        .then(|| (kind, *provider, (*id).to_string()))
-                })
+        projects::ATTENTION_ORDER.into_iter().find_map(|kind| {
+            states.iter().find_map(|(state, provider, id)| {
+                (state.kind == kind && (kind.is_live() || state.unread))
+                    .then(|| (kind, *provider, (*id).to_string()))
             })
+        })
     }
 
     /// Exact native activity and explicitly labeled external estimates.
@@ -2471,35 +2465,33 @@ impl SuperGitApp {
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu_bar = crate::menu_bar(cx);
-        let indicators =
-            [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
-                .into_iter()
-                .filter_map(|kind| {
-                    let count = self.attention_count(kind, cx);
-                    (count > 0).then(|| {
-                        Button::new(match kind {
-                            Kind::Approval => "attention-approval",
-                            Kind::Failed => "attention-failed",
-                            Kind::Completed => "attention-completed",
-                            _ => "attention-running",
-                        })
-                        .label(format!("{count} {}", kind.label()))
-                        .text_color(attention_color(kind, cx.theme()))
-                        .xsmall()
-                        .ghost()
-                        .tooltip(format!(
-                            "{} · Open the exact conversation; repeat to cycle",
-                            if kind == Kind::Completed {
-                                "Completed and unread"
-                            } else {
-                                kind.label()
-                            }
-                        ))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| this.open_attention(kind, window, cx),
-                        ))
-                    })
-                });
+        let indicators = projects::ATTENTION_ORDER.into_iter().filter_map(|kind| {
+            let count = self.attention_count(kind, cx);
+            (count > 0).then(|| {
+                Button::new(match kind {
+                    Kind::Approval => "attention-approval",
+                    Kind::Question => "attention-question",
+                    Kind::Failed => "attention-failed",
+                    Kind::Completed => "attention-completed",
+                    _ => "attention-running",
+                })
+                .label(format!("{count} {}", kind.label()))
+                .text_color(attention_color(kind, cx.theme()))
+                .xsmall()
+                .ghost()
+                .tooltip(format!(
+                    "{} · Open the exact conversation; repeat to cycle",
+                    if kind == Kind::Completed {
+                        "Completed and unread"
+                    } else {
+                        kind.label()
+                    }
+                ))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.open_attention(kind, window, cx)),
+                )
+            })
+        });
         let theme = cx.theme();
         TitleBar::new().child(
             h_flex()
@@ -4536,7 +4528,9 @@ impl SuperGitApp {
                 sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
                     Some(theme.blue)
                 }
-                sg_agents::chat::Status::NeedsPermission => Some(theme.warning),
+                sg_agents::chat::Status::NeedsPermission | sg_agents::chat::Status::NeedsInput => {
+                    Some(theme.warning)
+                }
                 _ => None,
             };
             let path = path.clone();
@@ -4560,11 +4554,9 @@ impl SuperGitApp {
                     el.child(div().size(px(6.)).rounded_full().bg(color))
                 })
                 .child(title)
-                .when(
-                    c.attention().unread
-                        || matches!(c.attention().kind, Kind::Running | Kind::Approval),
-                    |el| el.child(div().text_xs().child(c.attention().kind.label())),
-                )
+                .when(c.attention().unread || c.attention().kind.is_live(), |el| {
+                    el.child(div().text_xs().child(c.attention().kind.label()))
+                })
                 .when(chats.len() > 1, |el| {
                     el.child(
                         div()
@@ -5003,7 +4995,7 @@ fn agent_color(state: AgentState, theme: &gpui_kit::component::Theme) -> Hsla {
 
 fn attention_color(kind: Kind, theme: &gpui_kit::component::Theme) -> Hsla {
     match kind {
-        Kind::Approval => theme.warning,
+        Kind::Approval | Kind::Question => theme.warning,
         Kind::Failed => theme.danger,
         Kind::Completed => theme.success,
         Kind::Running => theme.blue,

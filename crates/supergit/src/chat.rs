@@ -25,11 +25,15 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::Value;
 use sg_agents::Provider;
-use sg_agents::chat::{Conversation, Decision, Item, PermissionRequest, Status, ToolCall};
+use sg_agents::chat::{
+    Conversation, Decision, InputResolution, Item, PermissionRequest, Status, ToolCall,
+};
 use sg_agents::process::{AgentProcess, ProcessEvent};
 use sg_claude::conversation::Reply;
 use sg_claude::{ClaudeEvents as _, ClaudeProcess, PermissionMode, SpawnOptions};
 use sg_codex::{CodexFold, CodexProcess, Policy};
+
+mod questions;
 
 /// Max lines of tool output shown when a tool row is expanded.
 const OUTPUT_LINES: usize = 40;
@@ -130,6 +134,7 @@ pub struct ChatSession {
     input: Entity<TextareaState>,
     scroller: Entity<MessageScrollerState>,
     diffs: HashMap<String, (Entity<DiffState>, usize)>,
+    question_forms: HashMap<String, Vec<questions::AnswerDraft>>,
     expanded: HashSet<usize>,
     stderr_tail: Vec<String>,
     reader: Option<Task<()>>,
@@ -311,6 +316,7 @@ impl ChatSession {
             input,
             scroller,
             diffs: HashMap::new(),
+            question_forms: HashMap::new(),
             expanded: HashSet::new(),
             stderr_tail: Vec::new(),
             reader: None,
@@ -396,12 +402,15 @@ impl ChatSession {
 
     pub fn focus_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mark_seen(cx);
-        if let Some(ix) = self
-            .convo
-            .items
-            .iter()
-            .rposition(|item| matches!(item, Item::Permission(p) if p.decision.is_none()))
-        {
+        let approval = self.convo.items.iter().rposition(
+            |item| matches!(item, Item::Permission(request) if request.decision.is_none()),
+        );
+        let question = || {
+            self.convo.items.iter().rposition(|item| {
+            matches!(item, Item::UserInput(request) if request.resolution == InputResolution::Pending)
+        })
+        };
+        if let Some(ix) = approval.or_else(question) {
             self.scroller.update(cx, |scroller, cx| {
                 scroller.scroll_to_item(ix, cx);
             });
@@ -647,11 +656,8 @@ impl ChatSession {
                         },
                         None,
                     );
-                } else if let Some(request) = self.convo.pending_permission() {
-                    self.attention
-                        .set(Kind::Approval, Some(request.request_id.clone()));
-                } else if self.convo.status.is_busy() {
-                    self.attention.set(Kind::Running, None);
+                } else {
+                    self.sync_pending_attention();
                 }
             }
             ProcessEvent::Stderr(line) => {
@@ -668,12 +674,34 @@ impl ChatSession {
                 let label = self.provider().label();
                 self.convo.on_exit(self.stderr_tail.last().cloned(), label);
                 self.backend.clear_process();
+                if !was_busy {
+                    self.sync_pending_attention();
+                }
             }
         }
         self.items_changed(before, cx);
     }
 
+    fn sync_pending_attention(&mut self) {
+        if let Some(request) = self.convo.pending_permission() {
+            self.attention
+                .set(Kind::Approval, Some(request.request_id.clone()));
+        } else if let Some(request) = self.convo.pending_user_input() {
+            self.attention
+                .set(Kind::Question, Some(request.request_id.clone()));
+        } else if self.convo.status.is_busy() {
+            self.attention.set(Kind::Running, None);
+        } else if matches!(self.attention.kind, Kind::Approval | Kind::Question) {
+            self.attention.set(Kind::Idle, None);
+        }
+    }
+
     fn items_changed(&mut self, before: usize, cx: &mut Context<Self>) {
+        self.question_forms.retain(|id, _| {
+            self.convo
+                .user_input(id)
+                .is_some_and(|request| request.resolution == InputResolution::Pending)
+        });
         let after = self.convo.items.len();
         self.scroller.update(cx, |s, cx| {
             if after > before {
@@ -808,9 +836,7 @@ impl ChatSession {
         match process.answer(&request, decision) {
             Ok(()) => {
                 self.convo.resolve_permission(&request_id, decision);
-                if self.convo.pending_permission().is_none() {
-                    self.attention.set(Kind::Running, None);
-                }
+                self.sync_pending_attention();
             }
             Err(e) => self.convo.push_notice(format!("{e:#}"), true),
         }
@@ -966,7 +992,7 @@ impl ChatSession {
     fn render_item(
         &mut self,
         ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(item) = self.convo.items.get(ix).cloned() else {
@@ -1047,6 +1073,7 @@ impl ChatSession {
                 .into_any_element(),
             Item::Tool(tool) => self.render_tool(ix, &tool, &theme, cx).into_any_element(),
             Item::Permission(p) => self.render_permission(&p, &theme, cx).into_any_element(),
+            Item::UserInput(request) => self.render_user_input(&request, window, cx),
             Item::Notice { text, is_error } => div()
                 .text_xs()
                 .text_color(if is_error {
@@ -1463,6 +1490,7 @@ impl Render for ChatSession {
             Status::Starting => Some(("starting…", theme.muted_foreground)),
             Status::Working => Some(("working…", theme.blue)),
             Status::NeedsPermission => Some(("needs your approval", theme.warning)),
+            Status::NeedsInput => Some(("needs your answer", theme.warning)),
             Status::Exited => Some((
                 "stopped — your next message resumes",
                 theme.muted_foreground,
