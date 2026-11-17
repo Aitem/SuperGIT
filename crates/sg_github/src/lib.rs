@@ -5,7 +5,6 @@
 
 mod check_inspection;
 mod details;
-mod publish;
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -19,6 +18,8 @@ pub use details::{
     AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrCommit, PrDetails, Review,
     ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_commits, pr_details,
 };
+
+mod publish;
 
 pub use publish::{
     DraftPullRequest, PublishBase, PublishRepository, create_draft_pr, open_pr_from_branch,
