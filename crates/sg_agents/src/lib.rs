@@ -1,9 +1,19 @@
-//! Claude Code sessions, read from the transcripts Claude Code already writes
-//! to `~/.claude/projects/<encoded cwd>/<session-id>.jsonl`. Nothing in the
-//! user's Claude configuration has to change for this to work.
+//! Coding agents, independent of any one provider and of the UI.
+//!
+//! - [`Provider`]: which agent (Claude Code, Codex); sessions are identified
+//!   by `(provider, session id)`.
+//! - [`chat`]: the conversation model every adapter folds its events into.
+//! - [`process`]: what the UI needs from a running agent.
+//! - Claude Code session discovery (this module), read from the transcripts
+//!   Claude Code already writes to `~/.claude/projects/<encoded
+//!   cwd>/<session-id>.jsonl`. Codex discovery lives in `sg_codex`. Nothing in
+//!   the user's agent configuration has to change for this to work.
 //!
 //! Status is a heuristic over the last conversational entry and the file's
 //! modification time; precise state (hooks over a socket) is a later step.
+
+pub mod chat;
+pub mod process;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,6 +22,51 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
+
+/// A coding agent SuperGIT can drive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Provider {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Provider {
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+
+    /// Stable name for persisted state (`claude`, `codex`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Parse a persisted name; empty means Claude (state written before
+    /// providers existed).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "" | "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+
+    /// Marks the provider on tabs, rails and lists.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Claude => "✦",
+            Self::Codex => "◆",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AgentState {
@@ -44,7 +99,10 @@ impl AgentState {
 
 #[derive(Clone, Debug)]
 pub struct Session {
+    pub provider: Provider,
     pub id: String,
+    /// Where the provider keeps the conversation (Claude transcript, Codex
+    /// rollout).
     pub transcript: PathBuf,
     /// AI title, else the last prompt, else the session id.
     pub title: String,
@@ -52,10 +110,28 @@ pub struct Session {
     pub git_branch: Option<String>,
     /// Where the agent works now (the last `cwd` in the transcript).
     pub cwd: Option<PathBuf>,
-    /// Where Claude was started: `claude --resume` must run from here.
+    /// Where the agent was started: resume must run from here.
     pub start_cwd: Option<PathBuf>,
     pub modified: SystemTime,
     pub state: AgentState,
+}
+
+impl Session {
+    /// Session ids are unique per provider only.
+    pub fn is(&self, provider: Provider, id: &str) -> bool {
+        self.provider == provider && self.id == id
+    }
+}
+
+/// Assign sessions to the worktree that contains their `cwd` (longest match
+/// wins: worktrees may nest).
+pub fn owning_worktree(worktrees: &[PathBuf], cwd: &Path) -> Option<usize> {
+    worktrees
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| cwd.starts_with(w))
+        .max_by_key(|(_, w)| w.as_os_str().len())
+        .map(|(ix, _)| ix)
 }
 
 /// `~/.claude`, honouring `CLAUDE_CONFIG_DIR`.
@@ -157,12 +233,7 @@ impl SessionIndex {
                 continue;
             };
             let owner = match &session.cwd {
-                Some(cwd) => worktrees
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, w)| cwd.starts_with(w))
-                    .max_by_key(|(_, w)| w.as_os_str().len())
-                    .map(|(ix, _)| ix),
+                Some(cwd) => owning_worktree(worktrees, cwd),
                 None => home_ix,
             };
             if let Some(ix) = owner {
@@ -201,16 +272,17 @@ impl SessionIndex {
     }
 }
 
-fn age(now: SystemTime, mtime: SystemTime) -> Duration {
-    now.duration_since(mtime).unwrap_or_default()
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LastKind {
     AssistantEndTurn,
     AssistantToolUse,
     UserOrToolResult,
     Unknown,
+}
+
+/// How long ago a transcript was written.
+pub fn age(now: SystemTime, mtime: SystemTime) -> Duration {
+    now.duration_since(mtime).unwrap_or_default()
 }
 
 fn classify(last: LastKind, age: Duration) -> AgentState {
@@ -308,6 +380,7 @@ fn parse_session(path: &Path, mtime: SystemTime, now: SystemTime) -> Option<(Ses
         .or_else(|| last_prompt.clone())
         .unwrap_or_else(|| id.clone());
     let session = Session {
+        provider: Provider::Claude,
         id,
         transcript: path.to_path_buf(),
         title,
@@ -356,7 +429,8 @@ fn prompt_text(v: &Value) -> Option<String> {
     (!text.is_empty() && !text.starts_with('<')).then_some(text)
 }
 
-fn clean(s: &str) -> String {
+/// One line of at most 140 characters, for titles and prompts in lists.
+pub fn clean(s: &str) -> String {
     let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() > 140 {
         let cut: String = one_line.chars().take(140).collect();

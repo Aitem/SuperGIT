@@ -35,7 +35,7 @@ SuperGIT — Git GUI for agent-driven development
 USAGE:
     supergit [PATH]          open the repository containing PATH (default: cwd,
                              else the last opened repository)
-    supergit --dump [PATH]   print worktrees, Claude sessions and PRs as text
+    supergit --dump [PATH]   print worktrees, agent sessions and PRs as text
 
 ENV:
     SUPERGIT_TERMINAL   ghostty | iterm | terminal (default: first installed)
@@ -235,8 +235,8 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Toggle Projects Panel", app::ToggleProjects),
             MenuItem::action("Toggle Worktree Sidebar", app::ToggleSidebar),
-            MenuItem::action("Toggle Claude Panel", app::ToggleClaude),
-            MenuItem::action("New Claude Conversation", app::NewClaudeChat),
+            MenuItem::action("Toggle Agent Panel", app::ToggleClaude),
+            MenuItem::action("New Agent Conversation", app::NewClaudeChat),
             MenuItem::separator(),
             MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),
         ]),

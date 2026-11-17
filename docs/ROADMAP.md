@@ -21,6 +21,22 @@ while Claude works, copy buttons.
 
 ## 1a. Codex alongside Claude
 
+Done (v0.3): `sg_agents` holds the provider-neutral chat model and
+`AgentProcess`; `sg_codex` drives `codex app-server` (version + login check,
+thread start/resume, queued turns, approvals, interrupt), folds its events,
+reads history via `thread/turns/list` and discovers rollouts. The panel picks
+the agent per new conversation (switchable until the first message), labels
+tabs, rails, sidebar and project activity by provider, and shows Codex's
+policies (Read only / Auto / Full access) instead of Claude's modes. Tested
+with recorded events, a fake app server and opt-in live tests.
+
+Next: Codex plan/todo updates (`turn/plan/updated`), streamed command output
+(`item/commandExecution/outputDelta`), model and reasoning-effort picker
+(`model/list`), answering `item/tool/requestUserInput` questions, token usage
+in the header (`thread/tokenUsage/updated`).
+
+Original plan:
+
 Make the native coding-agent panel support both Claude Code and Codex, with
 an agent picker for each new conversation and independent sessions per
 worktree. Keep existing Claude conversations working throughout the change.

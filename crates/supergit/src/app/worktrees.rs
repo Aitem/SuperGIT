@@ -649,14 +649,14 @@ impl SuperGitApp {
                 saved
                     .into_iter()
                     .flatten()
-                    .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
+                    .filter(|chat| native_provider(&chat.provider))
                     .any(|chat| !chat.draft.is_empty() || !chat.attachments.is_empty())
             });
         native
             || saved
                 .into_iter()
                 .flatten()
-                .filter(|chat| !chat.provider.is_empty() && chat.provider != "claude")
+                .filter(|chat| !native_provider(&chat.provider))
                 .any(|chat| !chat.draft.is_empty() || !chat.attachments.is_empty())
     }
 

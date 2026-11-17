@@ -22,8 +22,8 @@ pub(super) struct ProjectSnapshot {
 struct Activity {
     agent: Option<AgentState>,
     /// The most urgent attention, how many conversations have it, and one
-    /// of them to open: `(worktree, conversation id)`.
-    attention: Option<(Kind, usize, PathBuf, String)>,
+    /// of them to open: `(worktree, conversation id, its agent)`.
+    attention: Option<(Kind, usize, PathBuf, String, Provider)>,
 }
 
 const ATTENTION_ORDER: [Kind; 4] = [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running];
@@ -119,15 +119,15 @@ impl SuperGitApp {
         let busy = self.project_chats(&root).any(|(_, chat)| {
             matches!(
                 chat.read(cx).status(),
-                sg_claude::Status::Working
-                    | sg_claude::Status::Starting
-                    | sg_claude::Status::NeedsPermission
+                sg_agents::chat::Status::Working
+                    | sg_agents::chat::Status::Starting
+                    | sg_agents::chat::Status::NeedsPermission
             )
         });
         if busy {
             self.flash(
                 format!(
-                    "Claude is working in {} — stop it first",
+                    "An agent is working in {} — stop it first",
                     project_name(&root)
                 ),
                 true,
@@ -188,7 +188,7 @@ impl SuperGitApp {
     /// Exact activity of the project's native conversations: live ones, and
     /// saved ones (unread results) for worktrees not opened this run.
     fn project_activity(&self, root: &Path, cx: &App) -> Activity {
-        let mut states: Vec<(PathBuf, String, crate::attention::Attention)> = self
+        let mut states: Vec<(PathBuf, String, crate::attention::Attention, Provider)> = self
             .project_chats(root)
             .map(|(path, chat)| {
                 let chat = chat.read(cx);
@@ -196,6 +196,7 @@ impl SuperGitApp {
                     path.clone(),
                     chat.local_id().to_string(),
                     chat.attention().clone(),
+                    chat.provider(),
                 )
             })
             .collect();
@@ -204,19 +205,21 @@ impl SuperGitApp {
                 if self.chats.contains_key(path) {
                     continue;
                 }
-                states.extend(
-                    saved
-                        .iter()
-                        .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
-                        .map(|chat| (path.clone(), chat.local_id.clone(), chat.attention.clone())),
-                );
+                states.extend(saved.iter().filter_map(|chat| {
+                    Some((
+                        path.clone(),
+                        chat.local_id.clone(),
+                        chat.attention.clone(),
+                        Provider::parse(&chat.provider)?,
+                    ))
+                }));
             }
         }
         let agent = self
             .project_chats(root)
             .filter_map(|(_, chat)| match chat.read(cx).status() {
-                sg_claude::Status::NeedsPermission => Some(AgentState::NeedsAttention),
-                sg_claude::Status::Working | sg_claude::Status::Starting => {
+                sg_agents::chat::Status::NeedsPermission => Some(AgentState::NeedsAttention),
+                sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
                     Some(AgentState::Working)
                 }
                 _ => None,
@@ -225,9 +228,15 @@ impl SuperGitApp {
         let attention = ATTENTION_ORDER.into_iter().find_map(|kind| {
             let mut matching = states
                 .iter()
-                .filter(|(_, _, state)| wants_attention(kind, state));
-            let (path, id, _) = matching.next()?;
-            Some((kind, matching.count() + 1, path.clone(), id.clone()))
+                .filter(|(_, _, state, _)| wants_attention(kind, state));
+            let (path, id, _, provider) = matching.next()?;
+            Some((
+                kind,
+                matching.count() + 1,
+                path.clone(),
+                id.clone(),
+                *provider,
+            ))
         });
         Activity { agent, attention }
     }
@@ -238,6 +247,7 @@ impl SuperGitApp {
         root: PathBuf,
         worktree: PathBuf,
         conversation: String,
+        provider: Provider,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -245,7 +255,7 @@ impl SuperGitApp {
             notifications::Target {
                 repository: root,
                 worktree,
-                provider: "claude".into(),
+                provider: provider.as_str().into(),
                 conversation,
             },
             window,
@@ -423,7 +433,7 @@ impl SuperGitApp {
                             .truncate()
                             .child(short_path(root)),
                     );
-                if let Some((kind, count, worktree, conversation)) = activity.attention {
+                if let Some((kind, count, worktree, conversation, provider)) = activity.attention {
                     let root = root.clone();
                     row = row.child(
                         h_flex().pl_3().child(
@@ -431,7 +441,7 @@ impl SuperGitApp {
                                 .label(if count > 1 {
                                     format!("{count} {}", kind.label())
                                 } else {
-                                    format!("Claude {}", kind.label())
+                                    format!("{} {}", provider.label(), kind.label())
                                 })
                                 .text_color(attention_color(kind, &theme))
                                 .xsmall()
@@ -443,6 +453,7 @@ impl SuperGitApp {
                                         root.clone(),
                                         worktree.clone(),
                                         conversation.clone(),
+                                        provider,
                                         window,
                                         cx,
                                     );
@@ -508,7 +519,7 @@ impl SuperGitApp {
                 let activity = self.project_activity(root, cx);
                 let name = project_name(root);
                 let tooltip = match &activity.attention {
-                    Some((kind, count, _, _)) => {
+                    Some((kind, count, ..)) => {
                         format!("{name} · {count} {}\n{}", kind.label(), short_path(root))
                     }
                     None => format!("{name}\n{}", short_path(root)),

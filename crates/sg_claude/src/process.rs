@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use serde_json::{Value, json};
+pub use sg_agents::process::ProcessEvent;
+use sg_agents::{
+    chat::{Decision, PermissionRequest},
+    process::AgentProcess,
+};
 
 /// How Claude asks before using tools (`--permission-mode`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,16 +82,6 @@ pub struct SpawnOptions {
     pub model: Option<String>,
     /// The CLI binary, `claude` from PATH by default.
     pub program: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-pub enum ProcessEvent {
-    /// One JSON line from stdout.
-    Message(Value),
-    /// A line on stderr (kept for error reporting).
-    Stderr(String),
-    /// stdout closed: the process ended.
-    Exited,
 }
 
 /// A running `claude` in stream-json mode. Dropping it kills the process.
@@ -235,6 +230,38 @@ impl ClaudeProcess {
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+impl AgentProcess for ClaudeProcess {
+    fn send_user(&self, text: &str) -> Result<()> {
+        ClaudeProcess::send_user(self, text)
+    }
+
+    fn interrupt(&self) -> Result<()> {
+        ClaudeProcess::interrupt(self)
+    }
+
+    fn answer(&self, request: &PermissionRequest, decision: Decision) -> Result<()> {
+        match decision {
+            Decision::Allowed => self.allow(&request.request_id, &request.input, None),
+            Decision::AllowedForSession => self.allow(
+                &request.request_id,
+                &request.input,
+                Some(request.suggestions.clone()),
+            ),
+            Decision::Denied | Decision::Expired => {
+                self.deny(&request.request_id, "The user denied this action.")
+            }
+        }
+    }
+
+    fn reject(&self, request_id: &str, error: &str) -> Result<()> {
+        self.control_error(request_id, error)
+    }
+
+    fn kill(&self) {
+        ClaudeProcess::kill(self)
     }
 }
 

@@ -4,7 +4,8 @@
 use futures::StreamExt as _;
 use sg_claude::conversation::Reply;
 use sg_claude::{
-    ClaudeProcess, Conversation, Decision, Item, PermissionMode, ProcessEvent, SpawnOptions, Status,
+    ClaudeEvents as _, ClaudeProcess, Conversation, Decision, Item, PermissionMode, ProcessEvent,
+    SpawnOptions, Status,
 };
 
 /// Switches modes on a live session without sending a turn (no model call).

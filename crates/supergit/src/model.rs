@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use sg_agents::{AgentState, Session, SessionIndex};
+use sg_codex::CodexSessionIndex;
 use sg_git::{Commit, Fork, Repo, Worktree, WorktreeStatus};
 
 #[derive(Clone, Debug)]
@@ -30,7 +31,31 @@ impl WorktreeInfo {
     }
 }
 
-pub type SharedSessionIndex = Arc<Mutex<SessionIndex>>;
+/// Sessions of every agent, discovered from the transcripts each one writes.
+#[derive(Default)]
+pub struct AgentSessions {
+    claude: SessionIndex,
+    codex: CodexSessionIndex,
+}
+
+impl AgentSessions {
+    /// Sessions for each of `worktrees` (same order), most recent first.
+    pub fn sessions_by_worktree(&mut self, worktrees: &[PathBuf]) -> Vec<Vec<Session>> {
+        let claude = self.claude.sessions_by_worktree(worktrees);
+        let codex = self.codex.sessions_by_worktree(worktrees);
+        claude
+            .into_iter()
+            .zip(codex)
+            .map(|(mut list, codex)| {
+                list.extend(codex);
+                list.sort_by_key(|s| std::cmp::Reverse(s.modified));
+                list
+            })
+            .collect()
+    }
+}
+
+pub type SharedSessionIndex = Arc<Mutex<AgentSessions>>;
 
 /// The view already names the operation; Git's stderr explains what failed.
 pub fn git_error_message(error: anyhow::Error) -> String {
@@ -42,7 +67,7 @@ pub fn git_error_message(error: anyhow::Error) -> String {
     error.to_string()
 }
 
-/// Every worktree with its status and Claude sessions. Status runs in
+/// Every worktree with its status and agent sessions. Status runs in
 /// parallel: with dozens of worktrees this is the hot path of each refresh.
 pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<WorktreeInfo>> {
     let worktrees = sg_git::list_worktrees(&repo.root)?;

@@ -9,7 +9,8 @@
 //! sessions: the same transcripts, resumable here or in a terminal.
 //!
 //! This crate is UI-agnostic: [`process`] owns the child process and the wire
-//! protocol, [`conversation`] folds events into displayable [`Item`]s.
+//! protocol, [`conversation`] folds events into the shared chat model
+//! (`sg_agents::chat`), [`tools`] summarizes Claude's tool calls.
 #![forbid(unsafe_code)]
 
 pub mod conversation;
@@ -17,6 +18,8 @@ pub mod process;
 pub mod tools;
 
 pub use conversation::{
-    Conversation, Decision, Item, PermissionRequest, Status, ToolCall, ToolResult,
+    ClaudeEvents, Conversation, Decision, Item, PermissionRequest, Status, ToolCall, ToolResult,
+    from_transcript,
 };
-pub use process::{ClaudeProcess, PermissionMode, ProcessEvent, SpawnOptions};
+pub use process::{ClaudeProcess, PermissionMode, SpawnOptions};
+pub use sg_agents::process::{AgentProcess, ProcessEvent};
