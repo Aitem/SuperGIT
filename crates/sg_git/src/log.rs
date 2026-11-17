@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::status::PATCH_OPTIONS;
 use crate::submodule::{Patch, inline_submodules};
-use crate::{GitError, git};
+use crate::{GitError, git, git_bytes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
@@ -103,6 +103,23 @@ pub fn history(path: &Path, limit: usize) -> Result<Vec<Commit>> {
         revs.insert(0, "HEAD");
     }
     log(path, &revs, limit)
+}
+
+/// The refs that supply history, decorations and replacement history. Include
+/// symbolic targets and the checked out branch even when their OIDs agree.
+pub fn history_refs(path: &Path) -> Result<Vec<u8>> {
+    git_bytes(
+        path,
+        [
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(HEAD)%00%(refname)%00%(objectname)%00%(symref)",
+            "refs/heads/",
+            "refs/remotes/",
+            "refs/tags/",
+            "refs/replace/",
+        ],
+    )
 }
 
 /// Commits reachable from `revs` (e.g. `["HEAD"]`, a branch, `["--all"]`).

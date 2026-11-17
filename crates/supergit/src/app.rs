@@ -1638,13 +1638,18 @@ impl SuperGitApp {
         let Some(path) = self.selected.clone() else {
             return;
         };
+        let source = self.repo.as_ref().and_then(|repo| {
+            let status = self.selected_info()?.status.as_ref().ok()?;
+            Some(model::HistorySource::new(&repo.common_dir, status))
+        });
+        let previous = self.history.clone();
         self.history_generation += 1;
         let generation = self.history_generation;
         self.history_task = Some(cx.spawn(async move |this, cx| {
             let selected = path.clone();
             let history = cx
                 .background_executor()
-                .spawn(async move { model::load_history(&path) })
+                .spawn(async move { previous.load(&path, source.as_ref()) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if generation == this.history_generation
@@ -2381,6 +2386,12 @@ impl SuperGitApp {
 
     pub fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
         self.flash("Refreshing…", false, cx);
+        self.history.invalidate();
+        for review in self.review_views.values_mut() {
+            review.history.invalidate();
+        }
+        self.history_generation += 1;
+        self.history_task = None;
         self.start_polling(cx);
     }
 
