@@ -1,6 +1,9 @@
-//! The native Claude chat: one `ChatSession` per conversation, shown in the
-//! right-hand panel. Drives `claude` through `sg_claude` (stream-json), renders
-//! messages, tool calls with inline diffs, and permission prompts as cards.
+//! The native agent chat: one `ChatSession` per conversation, shown in the
+//! right-hand panel. Drives Claude Code (`sg_claude`, stream-json) or Codex
+//! (`sg_codex`, app-server) and renders the shared chat model
+//! (`sg_agents::chat`): messages, tool calls with inline diffs, and
+//! permission prompts as cards. Each provider keeps its own controls: Claude's
+//! permission modes, Codex's approval + sandbox policies.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,19 +21,95 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use serde_json::Value;
+use sg_agents::Provider;
+use sg_agents::chat::{Conversation, Decision, Item, PermissionRequest, Status, ToolCall};
+use sg_agents::process::{AgentProcess, ProcessEvent};
 use sg_claude::conversation::Reply;
-use sg_claude::{
-    ClaudeProcess, Conversation, Decision, Item, PermissionMode, PermissionRequest, ProcessEvent,
-    SpawnOptions, Status, ToolCall, tools,
-};
+use sg_claude::{ClaudeEvents as _, ClaudeProcess, PermissionMode, SpawnOptions};
+use sg_codex::{CodexFold, CodexProcess, Policy};
 
 /// Max lines of tool output shown when a tool row is expanded.
 const OUTPUT_LINES: usize = 40;
 
-/// Chats start in auto mode unless the user picks another. Where auto mode is
-/// unavailable (plan, model, settings) the CLI starts in `default` and says so
-/// in `system/init`, which the switcher follows.
+/// Claude chats start in auto mode unless the user picks another. Where auto
+/// mode is unavailable (plan, model, settings) the CLI starts in `default`
+/// and says so in `system/init`, which the switcher follows.
 const DEFAULT_MODE: PermissionMode = PermissionMode::Auto;
+
+/// The provider-specific half of a conversation.
+enum Backend {
+    Claude {
+        process: Option<Arc<ClaudeProcess>>,
+        /// Picked by the user or last reported by the CLI; always passed
+        /// when the process starts.
+        mode: PermissionMode,
+        /// A `set_permission_mode` awaiting the CLI's answer, with the mode
+        /// to show again if it refuses.
+        mode_request: Option<(String, PermissionMode)>,
+    },
+    Codex {
+        process: Option<Arc<CodexProcess>>,
+        fold: CodexFold,
+        /// Sent with every turn: Codex applies policies per turn.
+        policy: Policy,
+        /// History is being read; sending waits for it so new turns land
+        /// after it.
+        loading: bool,
+        history: Option<Task<()>>,
+    },
+}
+
+impl Backend {
+    fn new(provider: Provider, convo: &Conversation) -> Self {
+        match provider {
+            Provider::Claude => Self::Claude {
+                process: None,
+                mode: convo
+                    .permission_mode
+                    .as_deref()
+                    .and_then(PermissionMode::from_wire)
+                    .unwrap_or(DEFAULT_MODE),
+                mode_request: None,
+            },
+            Provider::Codex => Self::Codex {
+                process: None,
+                fold: CodexFold::new(),
+                policy: Policy::default(),
+                loading: false,
+                history: None,
+            },
+        }
+    }
+
+    fn provider(&self) -> Provider {
+        match self {
+            Self::Claude { .. } => Provider::Claude,
+            Self::Codex { .. } => Provider::Codex,
+        }
+    }
+
+    fn agent(&self) -> Option<Arc<dyn AgentProcess>> {
+        match self {
+            Self::Claude { process, .. } => process.clone().map(|p| p as Arc<dyn AgentProcess>),
+            Self::Codex { process, .. } => process.clone().map(|p| p as Arc<dyn AgentProcess>),
+        }
+    }
+
+    fn clear_process(&mut self) -> Option<Arc<dyn AgentProcess>> {
+        match self {
+            Self::Claude { process, .. } => process.take().map(|p| p as Arc<dyn AgentProcess>),
+            Self::Codex { process, .. } => process.take().map(|p| p as Arc<dyn AgentProcess>),
+        }
+    }
+}
+
+fn placeholder(provider: Provider) -> String {
+    format!(
+        "Ask {}…  (Enter to send, Shift+Enter for a new line)",
+        provider.label()
+    )
+}
 
 pub struct ChatSession {
     git_busy: bool,
@@ -39,18 +118,12 @@ pub struct ChatSession {
     context_preview: Option<usize>,
     attention: Attention,
     permission_focus: FocusHandle,
-    /// Where `claude` runs (a resumed session must run where it started).
+    /// Where the agent runs (a resumed session must run where it started).
     cwd: PathBuf,
     local_id: String,
     transcript: Option<PathBuf>,
     convo: Conversation,
-    process: Option<Arc<ClaudeProcess>>,
-    /// Picked by the user or last reported by the CLI; always passed when
-    /// the process starts.
-    mode: PermissionMode,
-    /// A `set_permission_mode` awaiting the CLI's answer, with the mode to
-    /// show again if it refuses.
-    mode_request: Option<(String, PermissionMode)>,
+    backend: Backend,
     input: Entity<TextareaState>,
     scroller: Entity<MessageScrollerState>,
     diffs: HashMap<String, (Entity<DiffState>, usize)>,
@@ -62,18 +135,33 @@ pub struct ChatSession {
 
 impl ChatSession {
     /// A fresh conversation in `worktree`.
-    pub fn new(worktree: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(worktree.clone(), worktree, Conversation::new(), window, cx)
+    pub fn new(
+        worktree: PathBuf,
+        provider: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            worktree.clone(),
+            worktree,
+            provider,
+            Conversation::new(),
+            window,
+            cx,
+        )
     }
 
-    /// Continue an existing Claude Code session, showing its history.
+    /// Continue an existing session, showing its history.
     pub fn resume(
         worktree: PathBuf,
         session: &sg_agents::Session,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut convo = Conversation::from_transcript(&session.transcript).unwrap_or_default();
+        let mut convo = match session.provider {
+            Provider::Claude => sg_claude::from_transcript(&session.transcript).unwrap_or_default(),
+            Provider::Codex => Conversation::new(),
+        };
         convo.session_id = Some(session.id.clone());
         if convo.title.is_none() {
             convo.title = Some(session.title.clone());
@@ -82,24 +170,31 @@ impl ChatSession {
             .start_cwd
             .clone()
             .unwrap_or_else(|| worktree.clone());
-        let mut chat = Self::build(worktree, cwd, convo, window, cx);
+        let mut chat = Self::build(worktree, cwd, session.provider, convo, window, cx);
         chat.transcript = Some(session.transcript.clone());
+        chat.load_history(cx);
         chat
     }
 
-    /// Restore visible history and an unsent draft, without starting a process.
+    /// Restore visible history and an unsent draft, without starting an agent.
     pub fn restore(
         worktree: PathBuf,
         saved: &crate::workspace::SavedConversation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let history = saved
-            .transcript
-            .as_ref()
-            .and_then(|path| Conversation::from_transcript(path).ok());
-        let mut convo = history.unwrap_or_default();
-        if saved.transcript.as_ref().is_some_and(|p| p.is_file()) {
+        let provider = Provider::parse(&saved.provider).unwrap_or_default();
+        let transcript_exists = saved.transcript.as_ref().is_some_and(|p| p.is_file());
+        let mut convo = match provider {
+            Provider::Claude => saved
+                .transcript
+                .as_ref()
+                .and_then(|path| sg_claude::from_transcript(path).ok())
+                .unwrap_or_default(),
+            Provider::Codex => Conversation::new(),
+        };
+        // Codex keeps threads it has not written a rollout for yet.
+        if transcript_exists || (provider == Provider::Codex && saved.transcript.is_none()) {
             convo.session_id = saved.session_id.clone();
         }
         if convo.title.is_none() && !saved.title.is_empty() && saved.title != "New conversation" {
@@ -110,11 +205,16 @@ impl ChatSession {
         } else {
             worktree.clone()
         };
-        let mut chat = Self::build(worktree, cwd, convo, window, cx);
+        let mut chat = Self::build(worktree, cwd, provider, convo, window, cx);
         if !saved.local_id.is_empty() {
             chat.local_id = saved.local_id.clone();
         }
         chat.transcript = saved.transcript.clone().filter(|p| p.is_file());
+        if let (Backend::Codex { policy, .. }, Some(saved_policy)) =
+            (&mut chat.backend, Policy::parse(&saved.policy))
+        {
+            *policy = saved_policy;
+        }
         chat.attention = saved.attention.clone().restored();
         chat.attachments = saved
             .attachments
@@ -127,31 +227,41 @@ impl ChatSession {
         chat.input.update(cx, |input, cx| {
             input.set_value(saved.draft.clone(), window, cx)
         });
+        chat.load_history(cx);
         chat
     }
 
     pub fn snapshot(&self, cx: &App) -> crate::workspace::SavedConversation {
-        crate::workspace::SavedConversation {
-            attachments: self.attachments.clone(),
-            attention: self.attention.clone(),
-            local_id: self.local_id.clone(),
-            provider: "claude".into(),
-            session_id: self.convo.session_id.clone(),
-            transcript: self.transcript.clone().or_else(|| {
+        let transcript = match self.provider() {
+            Provider::Claude => self.transcript.clone().or_else(|| {
                 Some(
                     sg_agents::project_dir(&self.cwd)?
                         .join(format!("{}.jsonl", self.convo.session_id.as_ref()?)),
                 )
             }),
+            Provider::Codex => self.transcript.clone(),
+        };
+        crate::workspace::SavedConversation {
+            attachments: self.attachments.clone(),
+            attention: self.attention.clone(),
+            local_id: self.local_id.clone(),
+            provider: self.provider().as_str().into(),
+            session_id: self.convo.session_id.clone(),
+            transcript,
             cwd: self.cwd.clone(),
             title: self.title(),
             draft: self.input.read(cx).value().to_string(),
+            policy: match &self.backend {
+                Backend::Codex { policy, .. } => policy.as_str().into(),
+                Backend::Claude { .. } => String::new(),
+            },
         }
     }
 
     fn build(
         worktree: PathBuf,
         cwd: PathBuf,
+        provider: Provider,
         convo: Conversation,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -160,7 +270,7 @@ impl ChatSession {
             TextareaState::new(window, cx)
                 .auto_grow(2, 12)
                 .submit_on_enter(true)
-                .placeholder("Ask Claude…  (Enter to send, Shift+Enter for a new line)")
+                .placeholder(placeholder(provider))
         });
         let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = event {
@@ -171,11 +281,7 @@ impl ChatSession {
         });
         let count = convo.items.len();
         let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
-        let mode = convo
-            .permission_mode
-            .as_deref()
-            .and_then(PermissionMode::from_wire)
-            .unwrap_or(DEFAULT_MODE);
+        let backend = Backend::new(provider, &convo);
         Self {
             git_busy: false,
             worktree,
@@ -193,9 +299,7 @@ impl ChatSession {
             ),
             transcript: None,
             convo,
-            process: None,
-            mode,
-            mode_request: None,
+            backend,
             input,
             scroller,
             diffs: HashMap::new(),
@@ -204,6 +308,37 @@ impl ChatSession {
             reader: None,
             _subscriptions: vec![sub],
         }
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.backend.provider()
+    }
+
+    /// Switch an untouched conversation to another agent.
+    pub fn set_provider(
+        &mut self,
+        provider: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if provider == self.provider() || !self.is_fresh() {
+            return;
+        }
+        self.backend = Backend::new(provider, &self.convo);
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(placeholder(provider), window, cx)
+        });
+        let mut settings = crate::settings::load();
+        settings.agent = provider.as_str().into();
+        crate::settings::save(&settings);
+        cx.notify();
+    }
+
+    /// Nothing sent yet and no session behind it: the agent can still change.
+    pub fn is_fresh(&self) -> bool {
+        self.convo.items.is_empty()
+            && self.convo.session_id.is_none()
+            && self.backend.agent().is_none()
     }
 
     pub fn status(&self) -> Status {
@@ -221,13 +356,13 @@ impl ChatSession {
     pub fn take_idle_process(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<Option<Arc<ClaudeProcess>>> {
+    ) -> anyhow::Result<Option<Arc<dyn AgentProcess>>> {
         anyhow::ensure!(
             !self.convo.status.is_busy(),
             "An agent is still running or waiting for approval"
         );
         self.reader = None;
-        let process = self.process.take();
+        let process = self.backend.clear_process();
         if process.is_some() {
             self.convo.status = Status::Exited;
             cx.notify();
@@ -284,10 +419,6 @@ impl ChatSession {
         self.input.clone()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.convo.items.is_empty()
-    }
-
     pub fn follows_tail(&self, cx: &App) -> bool {
         self.scroller.read(cx).is_following_tail()
     }
@@ -314,23 +445,105 @@ impl ChatSession {
         Ok(())
     }
 
+    // ---- history ---------------------------------------------------------
+
+    /// Codex history comes from Codex itself (`thread/turns/list` through a
+    /// short-lived app server); Claude's was read from its transcript.
+    fn load_history(&mut self, cx: &mut Context<Self>) {
+        let Backend::Codex {
+            loading, history, ..
+        } = &mut self.backend
+        else {
+            return;
+        };
+        let Some(thread_id) = self.convo.session_id.clone() else {
+            return;
+        };
+        let cwd = self.cwd.clone();
+        *loading = true;
+        // A thread of its own: the shared background pool may be busy with
+        // slow Git and GitHub calls, and history should appear at once.
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(sg_codex::read_history(None, &cwd, &thread_id));
+        });
+        *history = Some(cx.spawn(async move |this, cx| {
+            let result = rx
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the history reader stopped")));
+            let _ = this.update(cx, |this, cx| this.on_history(result, cx));
+        }));
+    }
+
+    fn on_history(&mut self, result: anyhow::Result<sg_codex::History>, cx: &mut Context<Self>) {
+        let Backend::Codex {
+            loading, history, ..
+        } = &mut self.backend
+        else {
+            return;
+        };
+        *loading = false;
+        *history = None;
+        let before = self.convo.items.len();
+        match result {
+            Ok(h) => {
+                let title = self.convo.title.take();
+                CodexFold::new().apply_history(&mut self.convo, &h);
+                if self.convo.title.is_none() {
+                    self.convo.title = title;
+                }
+                if self.transcript.is_none() {
+                    self.transcript = h
+                        .thread
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from);
+                }
+            }
+            Err(e) => self
+                .convo
+                .push_notice(format!("Couldn't load the Codex history: {e:#}"), true),
+        }
+        self.items_changed(before, cx);
+    }
+
+    fn history_loading(&self) -> bool {
+        matches!(self.backend, Backend::Codex { loading: true, .. })
+    }
+
     // ---- process ---------------------------------------------------------
 
-    fn ensure_process(&mut self, cx: &mut Context<Self>) -> anyhow::Result<Arc<ClaudeProcess>> {
-        if let Some(p) = &self.process
+    fn ensure_process(&mut self, cx: &mut Context<Self>) -> anyhow::Result<Arc<dyn AgentProcess>> {
+        if let Some(p) = self.backend.agent()
             && self.convo.status != Status::Exited
         {
-            return Ok(p.clone());
+            return Ok(p);
         }
-        let opts = SpawnOptions {
-            cwd: self.cwd.clone(),
-            resume: self.convo.session_id.clone(),
-            permission_mode: Some(self.mode),
-            ..Default::default()
+        let resume = self.convo.session_id.clone();
+        let mut events = match &mut self.backend {
+            Backend::Claude { process, mode, .. } => {
+                let (p, events) = ClaudeProcess::spawn(&SpawnOptions {
+                    cwd: self.cwd.clone(),
+                    resume,
+                    permission_mode: Some(*mode),
+                    ..Default::default()
+                })?;
+                *process = Some(Arc::new(p));
+                events
+            }
+            Backend::Codex {
+                process, policy, ..
+            } => {
+                let (p, events) = CodexProcess::spawn(&sg_codex::SpawnOptions {
+                    cwd: self.cwd.clone(),
+                    resume,
+                    policy: *policy,
+                    ..Default::default()
+                });
+                *process = Some(Arc::new(p));
+                events
+            }
         };
-        let (process, mut events) = ClaudeProcess::spawn(&opts)?;
-        let process = Arc::new(process);
-        self.process = Some(process.clone());
         self.stderr_tail.clear();
         self.reader = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -342,7 +555,9 @@ impl ChatSession {
                 }
             }
         }));
-        Ok(process)
+        self.backend
+            .agent()
+            .ok_or_else(|| anyhow::anyhow!("the agent did not start"))
     }
 
     fn on_event(&mut self, event: ProcessEvent, cx: &mut Context<Self>) {
@@ -350,30 +565,71 @@ impl ChatSession {
         let was_busy = self.convo.status.is_busy();
         match event {
             ProcessEvent::Message(v) => {
-                let reported = self.convo.permission_mode.clone();
-                match self.convo.apply(&v) {
-                    Some(Reply::Unsupported {
-                        request_id,
-                        subtype,
-                    }) => {
-                        if let Some(p) = &self.process {
-                            let _ = p.control_error(
+                let outcome = match &mut self.backend {
+                    Backend::Claude {
+                        process,
+                        mode,
+                        mode_request,
+                    } => {
+                        let reported = self.convo.permission_mode.clone();
+                        match self.convo.apply(&v) {
+                            Some(Reply::Unsupported {
+                                request_id,
+                                subtype,
+                            }) => {
+                                if let Some(p) = process {
+                                    let _ = p.control_error(
+                                        &request_id,
+                                        &format!("SuperGIT does not handle {subtype}"),
+                                    );
+                                }
+                            }
+                            Some(Reply::ControlResponse { request_id, error }) => on_mode_response(
+                                &mut self.convo,
+                                mode,
+                                mode_request,
                                 &request_id,
-                                &format!("SuperGIT does not handle {subtype}"),
-                            );
+                                error,
+                            ),
+                            None => {}
                         }
-                    }
-                    Some(Reply::ControlResponse { request_id, error }) => {
-                        self.on_control_response(&request_id, error)
-                    }
-                    None => {}
-                }
-                if v.get("type").and_then(|value| value.as_str()) == Some("result") {
-                    self.attention.set(
-                        if v.get("is_error")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false)
+                        // The CLI changed modes (our request, a settings
+                        // default at start, an approved plan): follow it.
+                        if self.convo.permission_mode != reported
+                            && let Some(reported) = self
+                                .convo
+                                .permission_mode
+                                .as_deref()
+                                .and_then(PermissionMode::from_wire)
                         {
+                            *mode = reported;
+                        }
+                        (v.get("type").and_then(Value::as_str) == Some("result"))
+                            .then(|| v.get("is_error").and_then(Value::as_bool).unwrap_or(false))
+                    }
+                    Backend::Codex { process, fold, .. } => {
+                        match fold.apply(&mut self.convo, &v) {
+                            Some(sg_codex::Reply::Unsupported { request_id, method }) => {
+                                if let Some(p) = process {
+                                    let _ = p.reject(
+                                        &request_id,
+                                        &format!("SuperGIT does not handle {method}"),
+                                    );
+                                }
+                            }
+                            Some(sg_codex::Reply::Respond { request_id, result }) => {
+                                if let Some(p) = process {
+                                    let _ = p.respond(&request_id, result);
+                                }
+                            }
+                            None => {}
+                        }
+                        codex_outcome(&v)
+                    }
+                };
+                if let Some(is_error) = outcome {
+                    self.attention.set(
+                        if is_error {
                             Kind::Failed
                         } else {
                             Kind::Completed
@@ -385,17 +641,6 @@ impl ChatSession {
                         .set(Kind::Approval, Some(request.request_id.clone()));
                 } else if self.convo.status.is_busy() {
                     self.attention.set(Kind::Running, None);
-                }
-                // The CLI changed modes (our request, a settings default at
-                // start, an approved plan): follow it.
-                if self.convo.permission_mode != reported
-                    && let Some(mode) = self
-                        .convo
-                        .permission_mode
-                        .as_deref()
-                        .and_then(PermissionMode::from_wire)
-                {
-                    self.mode = mode;
                 }
             }
             ProcessEvent::Stderr(line) => {
@@ -409,34 +654,12 @@ impl ChatSession {
                 if was_busy {
                     self.attention.set(Kind::Failed, None);
                 }
-                self.convo.on_exit(self.stderr_tail.last().cloned());
-                self.process = None;
+                let label = self.provider().label();
+                self.convo.on_exit(self.stderr_tail.last().cloned(), label);
+                self.backend.clear_process();
             }
         }
         self.items_changed(before, cx);
-    }
-
-    fn on_control_response(&mut self, request_id: &str, error: Option<String>) {
-        let Some((pending, previous)) = self.mode_request.take() else {
-            return;
-        };
-        if pending != request_id {
-            self.mode_request = Some((pending, previous));
-            return;
-        }
-        let Some(error) = error else { return };
-        let wanted = self.mode.label();
-        // Show the mode the CLI is actually in.
-        self.mode = self
-            .convo
-            .permission_mode
-            .as_deref()
-            .and_then(PermissionMode::from_wire)
-            .unwrap_or(previous);
-        self.convo.items.push(Item::Notice {
-            text: format!("Can't switch to {wanted}: {error}"),
-            is_error: true,
-        });
     }
 
     fn items_changed(&mut self, before: usize, cx: &mut Context<Self>) {
@@ -463,10 +686,7 @@ impl ChatSession {
             .iter()
             .find_map(|item| item.validate_destination(&self.worktree, &self.cwd).err())
         {
-            self.convo.items.push(Item::Notice {
-                text: error.to_string(),
-                is_error: true,
-            });
+            self.convo.push_notice(error.to_string(), true);
             self.items_changed(self.convo.items.len().saturating_sub(1), cx);
             return;
         }
@@ -491,7 +711,7 @@ impl ChatSession {
 
     /// Send a turn (also used by automation in screenshot builds).
     pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
-        if self.git_busy {
+        if self.git_busy || self.history_loading() {
             return false;
         }
         self.attention.set(Kind::Running, None);
@@ -500,10 +720,7 @@ impl ChatSession {
         self.convo.push_user(&text);
         let result = self.ensure_process(cx).and_then(|p| p.send_user(&text));
         if let Err(e) = &result {
-            self.convo.items.push(Item::Notice {
-                text: format!("{e:#}"),
-                is_error: true,
-            });
+            self.convo.push_notice(format!("{e:#}"), true);
             self.convo.status = Status::Idle;
             self.attention.set(Kind::Failed, None);
         }
@@ -512,57 +729,69 @@ impl ChatSession {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(p) = &self.process {
+        if let Some(p) = self.backend.agent() {
             let _ = p.interrupt();
         }
         cx.notify();
     }
 
-    /// Applies at once to a running session (reverted with a notice if the
-    /// CLI refuses), otherwise when the next turn starts the process.
-    fn set_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
-        let previous = std::mem::replace(&mut self.mode, mode);
-        if let Some(p) = &self.process
-            && let Ok(request_id) = p.set_permission_mode(mode)
+    /// Claude: applies at once to a running session (reverted with a notice
+    /// if the CLI refuses), otherwise when the next turn starts the process.
+    fn set_mode(&mut self, wanted: PermissionMode, cx: &mut Context<Self>) {
+        if let Backend::Claude {
+            process,
+            mode,
+            mode_request,
+        } = &mut self.backend
         {
-            self.mode_request = Some((request_id, previous));
+            let previous = std::mem::replace(mode, wanted);
+            if let Some(p) = process
+                && let Ok(request_id) = p.set_permission_mode(wanted)
+            {
+                *mode_request = Some((request_id, previous));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Codex: applies from the next turn on.
+    pub fn set_policy(&mut self, wanted: Policy, cx: &mut Context<Self>) {
+        if let Backend::Codex {
+            process, policy, ..
+        } = &mut self.backend
+        {
+            *policy = wanted;
+            if let Some(p) = process {
+                p.set_policy(wanted);
+            }
         }
         cx.notify();
     }
 
     fn decide(&mut self, request_id: String, decision: Decision, cx: &mut Context<Self>) {
-        let Some(request) = self.convo.items.iter().find_map(|i| match i {
-            Item::Permission(p) if p.request_id == request_id => Some(p.clone()),
-            _ => None,
-        }) else {
+        let Some(request) = self.convo.permission(&request_id).cloned() else {
             return;
         };
-        let Some(process) = self.process.clone() else {
+        let Some(process) = self.backend.agent() else {
             return;
         };
-        let sent = match decision {
-            Decision::Allowed => process.allow(&request_id, &request.input, None),
-            Decision::AllowedForSession => {
-                if request
-                    .suggestions
-                    .iter()
-                    .any(|s| s.get("mode").and_then(|m| m.as_str()) == Some("acceptEdits"))
-                {
-                    self.mode = PermissionMode::AcceptEdits;
+        if decision == Decision::AllowedForSession
+            && let Backend::Claude { mode, .. } = &mut self.backend
+            && request
+                .suggestions
+                .iter()
+                .any(|s| s.get("mode").and_then(|m| m.as_str()) == Some("acceptEdits"))
+        {
+            *mode = PermissionMode::AcceptEdits;
+        }
+        match process.answer(&request, decision) {
+            Ok(()) => {
+                self.convo.resolve_permission(&request_id, decision);
+                if self.convo.pending_permission().is_none() {
+                    self.attention.set(Kind::Running, None);
                 }
-                process.allow(
-                    &request_id,
-                    &request.input,
-                    Some(request.suggestions.clone()),
-                )
             }
-            Decision::Denied => process.deny(&request_id, "The user denied this action."),
-        };
-        if sent.is_ok() {
-            self.convo.resolve_permission(&request_id, decision);
-            if self.convo.pending_permission().is_none() {
-                self.attention.set(Kind::Running, None);
-            }
+            Err(e) => self.convo.push_notice(format!("{e:#}"), true),
         }
         let len = self.convo.items.len();
         self.items_changed(len, cx);
@@ -596,6 +825,62 @@ impl ChatSession {
         let state = cx.new(|cx| DiffState::new(files, cx));
         self.diffs.insert(key.to_string(), (state.clone(), lines));
         Some((state, lines))
+    }
+
+    // ---- provider presentation -------------------------------------------
+
+    fn tool_summary(&self, tool: &ToolCall) -> String {
+        match self.provider() {
+            Provider::Claude => sg_claude::tools::summary(&tool.name, &tool.input, Some(&self.cwd)),
+            Provider::Codex => sg_codex::tools::summary(tool, Some(&self.cwd)),
+        }
+    }
+
+    /// The diff of an applied edit.
+    fn tool_patch(&self, tool: &ToolCall) -> Option<String> {
+        if tool.result.as_ref().is_none_or(|r| r.is_error) {
+            return None;
+        }
+        match self.provider() {
+            Provider::Claude => sg_claude::tools::is_edit(&tool.name)
+                .then(|| {
+                    sg_claude::tools::edit_patch(
+                        &tool.name,
+                        &tool.input,
+                        tool.result.as_ref().and_then(|r| r.meta.as_ref()),
+                        Some(&self.cwd),
+                    )
+                })
+                .flatten(),
+            Provider::Codex => sg_codex::tools::is_edit(tool)
+                .then(|| sg_codex::tools::edit_patch(tool, Some(&self.cwd)))
+                .flatten(),
+        }
+    }
+
+    /// What an approval card shows: a diff for edits, else text.
+    fn permission_preview(&self, p: &PermissionRequest) -> (Option<String>, Option<String>) {
+        match self.provider() {
+            Provider::Claude if sg_claude::tools::is_edit(&p.tool_name) => (
+                sg_claude::tools::edit_patch(&p.tool_name, &p.input, None, Some(&self.cwd)),
+                None,
+            ),
+            Provider::Claude => (
+                None,
+                match p.tool_name.as_str() {
+                    "Bash" => p
+                        .input
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map(String::from),
+                    _ => serde_json::to_string_pretty(&p.input).ok(),
+                },
+            ),
+            Provider::Codex => (
+                sg_codex::tools::permission_patch(p, Some(&self.cwd)),
+                sg_codex::tools::permission_text(p),
+            ),
+        }
     }
 
     // ---- rendering -------------------------------------------------------
@@ -711,7 +996,7 @@ impl ChatSession {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let summary = tools::summary(&tool.name, &tool.input, Some(&self.cwd));
+        let summary = self.tool_summary(tool);
         let (dot, label_color) = match &tool.result {
             None if tool.checking => (theme.warning, theme.foreground),
             None => (theme.blue, theme.foreground),
@@ -720,18 +1005,9 @@ impl ChatSession {
         };
         let expanded = self.expanded.contains(&ix);
         // While the edit awaits approval the permission card shows the diff.
-        let diff =
-            if tools::is_edit(&tool.name) && tool.result.as_ref().is_some_and(|r| !r.is_error) {
-                tools::edit_patch(
-                    &tool.name,
-                    &tool.input,
-                    tool.result.as_ref().and_then(|r| r.meta.as_ref()),
-                    Some(&self.cwd),
-                )
-                .and_then(|patch| self.diff_for(&tool.id, &patch, cx))
-            } else {
-                None
-            };
+        let diff = self
+            .tool_patch(tool)
+            .and_then(|patch| self.diff_for(&tool.id, &patch, cx));
         let output = tool
             .result
             .as_ref()
@@ -805,20 +1081,12 @@ impl ChatSession {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let pending = p.decision.is_none();
-        let preview: Option<AnyElement> = if tools::is_edit(&p.tool_name) {
-            tools::edit_patch(&p.tool_name, &p.input, None, Some(&self.cwd))
-                .and_then(|patch| self.diff_for(&format!("perm:{}", p.request_id), &patch, cx))
-                .map(|(state, lines)| diff_box(&state, lines, theme).into_any_element())
-        } else {
-            let text = match p.tool_name.as_str() {
-                "Bash" => p
-                    .input
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(String::from),
-                _ => serde_json::to_string_pretty(&p.input).ok(),
-            };
-            text.map(|t| {
+        let (patch, text) = self.permission_preview(p);
+        let preview: Option<AnyElement> = match patch
+            .and_then(|patch| self.diff_for(&format!("perm:{}", p.request_id), &patch, cx))
+        {
+            Some((state, lines)) => Some(diff_box(&state, lines, theme).into_any_element()),
+            None => text.map(|t| {
                 let t: String = t.lines().take(20).collect::<Vec<_>>().join("\n");
                 div()
                     .p_2()
@@ -828,12 +1096,12 @@ impl ChatSession {
                     .font_family(theme.mono_font_family.clone())
                     .child(t)
                     .into_any_element()
-            })
+            }),
         };
         let rid = p.request_id.clone();
         let rid2 = p.request_id.clone();
         let rid3 = p.request_id.clone();
-        let session_label = p.session_allow_label();
+        let session_label = p.session_label.clone();
 
         v_flex()
             .p_3()
@@ -907,6 +1175,7 @@ impl ChatSession {
                     .child(match p.decision {
                         Some(Decision::Denied) => "Denied",
                         Some(Decision::AllowedForSession) => "Allowed for this session",
+                        Some(Decision::Expired) => "No longer needed",
                         _ => "Allowed",
                     })
                     .into_any_element()
@@ -916,27 +1185,54 @@ impl ChatSession {
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let busy = self.convo.status.is_busy();
-        let modes = PermissionMode::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(i, mode)| {
-                let active = mode == self.mode;
-                Button::new(("mode", i))
-                    .label(mode.label())
-                    .xsmall()
-                    .when(active, |b| b.secondary())
-                    .when(!active, |b| b.ghost())
-                    .tooltip(match mode {
-                        PermissionMode::Default => "Ask before edits and commands",
-                        PermissionMode::AcceptEdits => "Auto-accept file edits",
-                        PermissionMode::Plan => "Plan only, no changes",
-                        PermissionMode::Auto => {
-                            "Claude decides; a safety check blocks risky actions"
-                        }
-                        PermissionMode::BypassPermissions => "Never ask (careful)",
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
-            });
+        let modes: Vec<AnyElement> = match &self.backend {
+            Backend::Claude { mode: current, .. } => PermissionMode::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, mode)| {
+                    let active = mode == *current;
+                    Button::new(("mode", i))
+                        .label(mode.label())
+                        .xsmall()
+                        .when(active, |b| b.secondary())
+                        .when(!active, |b| b.ghost())
+                        .tooltip(match mode {
+                            PermissionMode::Default => "Ask before edits and commands",
+                            PermissionMode::AcceptEdits => "Auto-accept file edits",
+                            PermissionMode::Plan => "Plan only, no changes",
+                            PermissionMode::Auto => {
+                                "Claude decides; a safety check blocks risky actions"
+                            }
+                            PermissionMode::BypassPermissions => "Never ask (careful)",
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
+                        .into_any_element()
+                })
+                .collect(),
+            Backend::Codex {
+                policy: current, ..
+            } => Policy::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, policy)| {
+                    let active = policy == *current;
+                    Button::new(("policy", i))
+                        .label(policy.label())
+                        .xsmall()
+                        .when(active, |b| b.secondary())
+                        .when(!active, |b| b.ghost())
+                        .tooltip(format!(
+                            "{} · approvals {}, sandbox {} · applies from the next turn",
+                            policy.description(),
+                            policy.approval_policy(),
+                            policy.sandbox_mode()
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_policy(policy, cx)))
+                        .into_any_element()
+                })
+                .collect(),
+        };
+        let loading = self.history_loading();
         v_flex()
             .p_2()
             .gap_2()
@@ -1048,10 +1344,12 @@ impl ChatSession {
                         Button::new("send")
                             .label(if self.git_busy {
                                 "Updating base…"
+                            } else if loading {
+                                "Loading history…"
                             } else {
                                 "Send"
                             })
-                            .disabled(self.git_busy)
+                            .disabled(self.git_busy || loading)
                             .small()
                             .primary()
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
@@ -1074,6 +1372,7 @@ impl Render for ChatSession {
             )),
         };
         let info = [
+            Some(self.provider().label().to_string()),
             self.convo.model.clone(),
             self.convo.total_cost_usd.map(|c| format!("${c:.2}")),
         ]
@@ -1097,19 +1396,50 @@ impl Render for ChatSession {
                     }),
             )
             .child(if self.convo.items.is_empty() {
+                let provider = self.provider();
+                let fresh = self.is_fresh();
                 v_flex()
                     .flex_1()
                     .items_center()
                     .justify_center()
-                    .gap_1()
+                    .gap_2()
                     .px_6()
                     .text_color(theme.muted_foreground)
-                    .child(div().text_lg().child("✦ Claude"))
+                    .child(div().text_lg().child(format!(
+                        "{} {}",
+                        provider.glyph(),
+                        provider.label()
+                    )))
+                    .when(fresh, |el| {
+                        el.child(h_flex().gap_1().children(Provider::ALL.into_iter().map(
+                            |choice| {
+                                let active = choice == provider;
+                                Button::new(("agent-choice", choice as usize))
+                                    .label(format!("{} {}", choice.glyph(), choice.label()))
+                                    .small()
+                                    .when(active, |b| b.secondary())
+                                    .when(!active, |b| b.ghost())
+                                    .tooltip(format!(
+                                        "Talk to {} in this conversation",
+                                        choice.label()
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_provider(choice, window, cx);
+                                        let input = this.input.clone();
+                                        input.update(cx, |input, cx| input.focus(window, cx));
+                                    }))
+                            },
+                        )))
+                    })
                     .child(
                         div()
                             .text_sm()
                             .text_center()
-                            .child(format!("Working in {}", self.cwd.display())),
+                            .child(if self.history_loading() {
+                                "Loading the conversation…".to_string()
+                            } else {
+                                format!("Working in {}", self.cwd.display())
+                            }),
                     )
                     .into_any_element()
             } else {
@@ -1139,4 +1469,42 @@ fn diff_box(state: &Entity<DiffState>, lines: usize, theme: &Theme) -> impl Into
         .border_color(theme.border)
         .overflow_hidden()
         .child(Diff::new(state).line_number(true))
+}
+
+/// The CLI answered a `set_permission_mode`; on refusal show the mode it is
+/// actually in.
+fn on_mode_response(
+    convo: &mut Conversation,
+    mode: &mut PermissionMode,
+    mode_request: &mut Option<(String, PermissionMode)>,
+    request_id: &str,
+    error: Option<String>,
+) {
+    let Some((pending, previous)) = mode_request.take() else {
+        return;
+    };
+    if pending != request_id {
+        *mode_request = Some((pending, previous));
+        return;
+    }
+    let Some(error) = error else { return };
+    let wanted = mode.label();
+    *mode = convo
+        .permission_mode
+        .as_deref()
+        .and_then(PermissionMode::from_wire)
+        .unwrap_or(previous);
+    convo.push_notice(format!("Can't switch to {wanted}: {error}"), true);
+}
+
+/// Whether a Codex event ended the turn, and if so whether it failed.
+fn codex_outcome(v: &Value) -> Option<bool> {
+    if v.get("method").and_then(Value::as_str) == Some("turn/completed") {
+        return Some(v.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed"));
+    }
+    let startup = matches!(
+        v.get("response").and_then(Value::as_str),
+        Some("initialize" | "account/read" | "thread/start" | "thread/resume" | "turn/start")
+    );
+    (startup && v.get("error").is_some()).then_some(true)
 }

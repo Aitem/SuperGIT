@@ -6,13 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::Result;
-use sg_agents::SessionIndex;
 use sg_git::{Repo, relative_time};
 
 use crate::model;
 
 pub fn run(repo: &Repo) -> Result<()> {
-    let index = Arc::new(Mutex::new(SessionIndex::new()));
+    let index = Arc::new(Mutex::new(crate::model::AgentSessions::default()));
     let worktrees = model::load_worktrees(repo, &index)?;
     let prs = if sg_github::gh_available() {
         sg_github::list_prs(&repo.root, 100, 20).map_err(|e| e.to_string())
@@ -38,7 +37,7 @@ pub fn run(repo: &Repo) -> Result<()> {
         };
         let agent = info
             .agent_state()
-            .map(|a| format!("  claude: {}", a.label()))
+            .map(|a| format!("  agents: {}", a.label()))
             .unwrap_or_default();
         println!(
             "  {}{}  {}  ({}){agent}",
@@ -64,7 +63,8 @@ pub fn run(repo: &Repo) -> Result<()> {
                 .map(|d| relative_time(d.as_secs() as i64))
                 .unwrap_or_default();
             println!(
-                "      · [{:9}] {age:>4}  {}  ({})",
+                "      · {} [{:9}] {age:>4}  {}  ({})",
+                s.provider.glyph(),
                 s.state.label(),
                 s.title,
                 s.id

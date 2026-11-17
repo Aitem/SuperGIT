@@ -1,4 +1,4 @@
-//! Folding Claude Code events into a list of chat items.
+//! Folding Claude Code events into the shared chat model.
 //!
 //! The same fold handles live stream-json events and transcript lines from
 //! `~/.claude/projects/…/<session>.jsonl` (used to show history on resume):
@@ -8,128 +8,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::Value;
+pub use sg_agents::chat::{
+    Conversation, Decision, Item, PermissionRequest, Status, ToolCall, ToolResult, strip_ansi,
+};
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolResult {
-    pub text: String,
-    pub is_error: bool,
-    /// The CLI's structured result (`structuredPatch` for edits, …).
-    pub meta: Option<Value>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub input: Value,
-    pub result: Option<ToolResult>,
-    /// Set when a subagent (Task) made the call.
-    pub parent: Option<String>,
-    /// Auto mode's safety check is taking a while to judge this call
-    /// (`system/permission_check_status`).
-    pub checking: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision {
-    Allowed,
-    /// Allowed and the CLI's suggested rule applied (e.g. auto-accept edits).
-    AllowedForSession,
-    Denied,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PermissionRequest {
-    pub request_id: String,
-    pub tool_name: String,
-    pub display_name: String,
-    pub description: Option<String>,
-    /// Why the CLI asks instead of deciding itself (`decision_reason`), e.g.
-    /// auto mode's safety check could not review the action.
-    pub reason: Option<String>,
-    pub input: Value,
-    /// `permission_suggestions` from the CLI, sent back as `updatedPermissions`
-    /// for "allow for this session".
-    pub suggestions: Vec<Value>,
-    pub tool_use_id: Option<String>,
-    pub decision: Option<Decision>,
-}
-
-impl PermissionRequest {
-    /// Label for the "allow and remember" button, if the CLI offered a rule.
-    pub fn session_allow_label(&self) -> Option<String> {
-        let s = self.suggestions.first()?;
-        match s.get("type").and_then(Value::as_str)? {
-            "setMode" => match s.get("mode").and_then(Value::as_str)? {
-                "acceptEdits" => Some("Allow all edits this session".into()),
-                mode => Some(format!(
-                    "Allow · switch to {}",
-                    crate::PermissionMode::from_wire(mode).map_or(mode, |m| m.label())
-                )),
-            },
-            "addRules" => Some(format!("Always allow {}", self.display_name)),
-            _ => Some("Allow for this session".into()),
-        }
+/// Label for the "allow and remember" button, if the CLI offered a rule.
+fn session_allow_label(display_name: &str, suggestions: &[Value]) -> Option<String> {
+    let s = suggestions.first()?;
+    match s.get("type").and_then(Value::as_str)? {
+        "setMode" => match s.get("mode").and_then(Value::as_str)? {
+            "acceptEdits" => Some("Allow all edits this session".into()),
+            mode => Some(format!(
+                "Allow · switch to {}",
+                crate::PermissionMode::from_wire(mode).map_or(mode, |m| m.label())
+            )),
+        },
+        "addRules" => Some(format!("Always allow {display_name}")),
+        _ => Some("Allow for this session".into()),
     }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Item {
-    User {
-        text: String,
-    },
-    Text {
-        text: String,
-        streaming: bool,
-    },
-    Thinking {
-        streaming: bool,
-    },
-    Tool(ToolCall),
-    Permission(PermissionRequest),
-    Notice {
-        text: String,
-        is_error: bool,
-    },
-    TurnEnd {
-        duration_ms: Option<u64>,
-        is_error: bool,
-        message: Option<String>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Status {
-    /// No turn running.
-    #[default]
-    Idle,
-    /// Process starting / turn submitted, nothing streamed yet.
-    Starting,
-    Working,
-    /// A tool permission prompt is waiting for the user.
-    NeedsPermission,
-    /// The process ended (it is restarted with `--resume` on the next turn).
-    Exited,
-}
-
-impl Status {
-    pub fn is_busy(self) -> bool {
-        matches!(self, Self::Starting | Self::Working | Self::NeedsPermission)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Conversation {
-    pub items: Vec<Item>,
-    pub session_id: Option<String>,
-    pub title: Option<String>,
-    pub model: Option<String>,
-    pub cwd: Option<PathBuf>,
-    pub permission_mode: Option<String>,
-    pub status: Status,
-    pub total_cost_usd: Option<f64>,
-    streaming_text: Option<usize>,
-    streaming_thinking: Option<usize>,
 }
 
 /// What the host must do after an event.
@@ -146,442 +42,307 @@ pub enum Reply {
     },
 }
 
-impl Conversation {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Local echo of a turn the user just sent.
-    pub fn push_user(&mut self, text: &str) {
-        if self.title.is_none() {
-            self.title = Some(short_title(text));
-        }
-        self.items.push(Item::User {
-            text: text.to_string(),
-        });
-        if !self.status.is_busy() {
-            self.status = Status::Starting;
-        }
-    }
-
-    pub fn pending_permission(&self) -> Option<&PermissionRequest> {
-        self.items.iter().rev().find_map(|i| match i {
-            Item::Permission(p) if p.decision.is_none() => Some(p),
-            _ => None,
-        })
-    }
-
-    pub fn resolve_permission(&mut self, request_id: &str, decision: Decision) {
-        for item in self.items.iter_mut().rev() {
-            if let Item::Permission(p) = item
-                && p.request_id == request_id
-            {
-                p.decision = Some(decision);
-                break;
-            }
-        }
-        if self.pending_permission().is_none() && self.status == Status::NeedsPermission {
-            self.status = Status::Working;
-        }
-    }
-
-    pub fn tool(&self, id: &str) -> Option<&ToolCall> {
-        self.items.iter().find_map(|i| match i {
-            Item::Tool(t) if t.id == id => Some(t),
-            _ => None,
-        })
-    }
-
-    /// The process exited (crash, `/exit`, killed).
-    pub fn on_exit(&mut self, stderr_tail: Option<String>) {
-        self.finish_streaming();
-        if self.status.is_busy() {
-            self.items.push(Item::Notice {
-                text: stderr_tail.unwrap_or_else(|| "Claude exited".into()),
-                is_error: true,
-            });
-        }
-        self.status = Status::Exited;
-    }
-
-    fn finish_streaming(&mut self) {
-        for ix in [self.streaming_text.take(), self.streaming_thinking.take()]
-            .into_iter()
-            .flatten()
-        {
-            if let Some(Item::Text { streaming, .. } | Item::Thinking { streaming }) =
-                self.items.get_mut(ix)
-            {
-                *streaming = false
-            }
-        }
-    }
-
+/// Claude Code's events folded into a [`Conversation`].
+pub trait ClaudeEvents {
     /// Apply one live stream-json event.
-    pub fn apply(&mut self, v: &Value) -> Option<Reply> {
-        self.apply_inner(v, true)
-    }
+    fn apply(&mut self, v: &Value) -> Option<Reply>;
+}
 
-    fn apply_inner(&mut self, v: &Value, live: bool) -> Option<Reply> {
-        let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
-        match ty {
-            "system" => self.on_system(v),
-            "stream_event" => self.on_stream_event(v),
-            "assistant" => self.on_assistant(v),
-            "user" => self.on_user(v, live),
-            "control_request" => return self.on_control_request(v),
-            "control_response" => return control_response(v),
-            "result" => self.on_result(v),
-            _ => {}
-        }
-        None
+impl ClaudeEvents for Conversation {
+    fn apply(&mut self, v: &Value) -> Option<Reply> {
+        apply_inner(self, v, true)
     }
+}
 
-    fn on_system(&mut self, v: &Value) {
-        let s = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
-        match v.get("subtype").and_then(Value::as_str).unwrap_or_default() {
-            "init" => {
-                self.session_id = s("session_id").or(self.session_id.take());
-                self.model = s("model");
-                self.cwd = s("cwd").map(PathBuf::from);
-                self.permission_mode = s("permissionMode");
-            }
-            // Mode changes: our `set_permission_mode`, a plan approved, …
-            "status" => {
-                if let Some(mode) = s("permissionMode") {
-                    self.permission_mode = Some(mode);
-                }
-            }
-            "compact_boundary" => self.items.push(Item::Notice {
-                text: "Conversation compacted".into(),
-                is_error: false,
-            }),
-            "permission_check_status" => {
-                let checking = v.get("status").and_then(Value::as_str) == Some("checking");
-                if let Some(id) = s("tool_use_id") {
-                    self.set_checking(&id, checking);
-                }
-            }
-            // A call refused without asking: auto mode's safety check, a deny
-            // rule, dontAsk mode. The tool's error result follows.
-            "permission_denied" => {
-                if let Some(id) = s("tool_use_id") {
-                    self.set_checking(&id, false);
-                }
-                let tool = s("tool_name").unwrap_or_else(|| "tool".into());
-                let head = if s("decision_reason_type").as_deref() == Some("classifier") {
-                    format!("Auto mode blocked {tool}")
-                } else {
-                    format!("{tool} was denied")
-                };
-                let why = s("decision_reason")
-                    .or_else(|| s("message"))
-                    .map(|r| strip_ansi(&r))
-                    .filter(|r| !r.trim().is_empty());
-                self.items.push(Item::Notice {
-                    text: match why {
-                        Some(why) => format!("{head}: {}", why.trim()),
-                        None => head,
-                    },
-                    is_error: true,
-                });
-            }
-            _ => {}
-        }
+fn apply_inner(c: &mut Conversation, v: &Value, live: bool) -> Option<Reply> {
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
+    match ty {
+        "system" => on_system(c, v),
+        "stream_event" => on_stream_event(c, v),
+        "assistant" => on_assistant(c, v),
+        "user" => on_user(c, v, live),
+        "control_request" => return on_control_request(c, v),
+        "control_response" => return control_response(v),
+        "result" => on_result(c, v),
+        _ => {}
     }
+    None
+}
 
-    fn set_checking(&mut self, tool_use_id: &str, checking: bool) {
-        for item in self.items.iter_mut().rev() {
-            if let Item::Tool(t) = item
-                && t.id == tool_use_id
-            {
-                t.checking = checking;
-                break;
+fn on_system(c: &mut Conversation, v: &Value) {
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
+    match v.get("subtype").and_then(Value::as_str).unwrap_or_default() {
+        "init" => {
+            c.session_id = s("session_id").or(c.session_id.take());
+            c.model = s("model");
+            c.cwd = s("cwd").map(PathBuf::from);
+            c.permission_mode = s("permissionMode");
+        }
+        // Mode changes: our `set_permission_mode`, a plan approved, …
+        "status" => {
+            if let Some(mode) = s("permissionMode") {
+                c.permission_mode = Some(mode);
             }
         }
-    }
-
-    fn on_stream_event(&mut self, v: &Value) {
-        if !v.get("parent_tool_use_id").is_none_or(Value::is_null) {
-            return; // subagent internals stay folded into their Task call
-        }
-        let Some(ev) = v.get("event") else { return };
-        match ev.get("type").and_then(Value::as_str).unwrap_or_default() {
-            "content_block_start" => {
-                self.status = Status::Working;
-                match ev.pointer("/content_block/type").and_then(Value::as_str) {
-                    Some("text") => {
-                        self.items.push(Item::Text {
-                            text: String::new(),
-                            streaming: true,
-                        });
-                        self.streaming_text = Some(self.items.len() - 1);
-                    }
-                    Some("thinking") => {
-                        self.items.push(Item::Thinking { streaming: true });
-                        self.streaming_thinking = Some(self.items.len() - 1);
-                    }
-                    _ => {}
-                }
-            }
-            "content_block_delta" => {
-                if ev.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
-                    && let Some(ix) = self.streaming_text
-                    && let Some(Item::Text { text, .. }) = self.items.get_mut(ix)
-                    && let Some(delta) = ev.pointer("/delta/text").and_then(Value::as_str)
-                {
-                    text.push_str(delta);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn on_assistant(&mut self, v: &Value) {
-        let parent = v
-            .get("parent_tool_use_id")
-            .and_then(Value::as_str)
-            .map(String::from);
-        let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
-            return;
-        };
-        if self.status != Status::NeedsPermission {
-            self.status = Status::Working;
-        }
-        for block in blocks {
-            match block
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-            {
-                "text" if parent.is_none() => {
-                    let full = block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    match self.streaming_text.take() {
-                        Some(ix) => {
-                            if let Some(Item::Text { text, streaming }) = self.items.get_mut(ix) {
-                                *text = full.to_string();
-                                *streaming = false;
-                            }
-                        }
-                        None if !full.trim().is_empty() => self.items.push(Item::Text {
-                            text: full.to_string(),
-                            streaming: false,
-                        }),
-                        None => {}
-                    }
-                }
-                "thinking" | "redacted_thinking" if parent.is_none() => {
-                    match self.streaming_thinking.take() {
-                        Some(ix) => {
-                            if let Some(Item::Thinking { streaming }) = self.items.get_mut(ix) {
-                                *streaming = false;
-                            }
-                        }
-                        None => self.items.push(Item::Thinking { streaming: false }),
-                    }
-                }
-                "tool_use" => {
-                    let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-                    if self.tool(id).is_none() {
-                        self.items.push(Item::Tool(ToolCall {
-                            id: id.to_string(),
-                            name: block
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("tool")
-                                .to_string(),
-                            input: block.get("input").cloned().unwrap_or(Value::Null),
-                            result: None,
-                            parent: parent.clone(),
-                            checking: false,
-                        }));
-                    }
-                }
-                _ => {}
+        "compact_boundary" => c.push_notice("Conversation compacted", false),
+        "permission_check_status" => {
+            let checking = v.get("status").and_then(Value::as_str) == Some("checking");
+            if let Some(id) = s("tool_use_id") {
+                c.set_checking(&id, checking);
             }
         }
-    }
-
-    fn on_user(&mut self, v: &Value, live: bool) {
-        let Some(content) = v.pointer("/message/content") else {
-            return;
-        };
-        // Live mode echoes the user's own turns locally; transcripts replay them.
-        if let Some(text) = content.as_str() {
-            if !live {
-                self.push_history_prompt(text);
+        // A call refused without asking: auto mode's safety check, a deny
+        // rule, dontAsk mode. The tool's error result follows.
+        "permission_denied" => {
+            if let Some(id) = s("tool_use_id") {
+                c.set_checking(&id, false);
             }
-            return;
-        }
-        let meta = v.get("tool_use_result").or_else(|| v.get("toolUseResult"));
-        for block in content.as_array().into_iter().flatten() {
-            match block
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-            {
-                "tool_result" => {
-                    let id = block
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let result = ToolResult {
-                        text: crate::tools::result_text(
-                            block.get("content").unwrap_or(&Value::Null),
-                        ),
-                        is_error: block
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        meta: meta.filter(|m| m.is_object()).cloned(),
-                    };
-                    for item in self.items.iter_mut().rev() {
-                        if let Item::Tool(t) = item
-                            && t.id == id
-                        {
-                            t.result = Some(result);
-                            t.checking = false;
-                            break;
-                        }
-                    }
-                }
-                "text" if !live => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        self.push_history_prompt(text);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn push_history_prompt(&mut self, text: &str) {
-        let trimmed = text.trim();
-        if trimmed.starts_with("[Request interrupted") {
-            self.items.push(Item::Notice {
-                text: "Interrupted".into(),
-                is_error: false,
-            });
-        } else if !trimmed.is_empty() && !trimmed.starts_with('<') {
-            if self.title.is_none() {
-                self.title = Some(short_title(trimmed));
-            }
-            self.items.push(Item::User {
-                text: trimmed.to_string(),
-            });
-        }
-    }
-
-    fn on_control_request(&mut self, v: &Value) -> Option<Reply> {
-        let request_id = v.get("request_id").and_then(Value::as_str)?.to_string();
-        let req = v.get("request")?;
-        let subtype = req
-            .get("subtype")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if subtype != "can_use_tool" {
-            return Some(Reply::Unsupported {
-                request_id,
-                subtype: subtype.to_string(),
-            });
-        }
-        let s = |k: &str| req.get(k).and_then(Value::as_str).map(String::from);
-        let tool_name = s("tool_name").unwrap_or_else(|| "tool".into());
-        if let Some(id) = s("tool_use_id") {
-            self.set_checking(&id, false);
-        }
-        self.items.push(Item::Permission(PermissionRequest {
-            request_id,
-            display_name: s("display_name").unwrap_or_else(|| tool_name.clone()),
-            tool_name,
-            description: s("description").or_else(|| s("title")),
-            reason: s("decision_reason")
-                .map(|r| strip_ansi(&r).trim().to_string())
-                .filter(|r| !r.is_empty()),
-            input: req.get("input").cloned().unwrap_or(Value::Null),
-            suggestions: req
-                .get("permission_suggestions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            tool_use_id: s("tool_use_id"),
-            decision: None,
-        }));
-        self.status = Status::NeedsPermission;
-        None
-    }
-
-    fn on_result(&mut self, v: &Value) {
-        self.finish_streaming();
-        let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-        let message = is_error.then(|| {
-            v.get("result")
-                .and_then(Value::as_str)
-                .map(String::from)
-                .or_else(|| v.get("subtype").and_then(Value::as_str).map(String::from))
-                .unwrap_or_else(|| "error".into())
-        });
-        if let Some(cost) = v.get("total_cost_usd").and_then(Value::as_f64) {
-            self.total_cost_usd = Some(cost);
-        }
-        self.items.push(Item::TurnEnd {
-            duration_ms: v.get("duration_ms").and_then(Value::as_u64),
-            is_error,
-            message,
-        });
-        // Unanswered prompts and pending safety checks of a finished turn are moot.
-        for item in &mut self.items {
-            match item {
-                Item::Permission(p) if p.decision.is_none() => p.decision = Some(Decision::Denied),
-                Item::Tool(t) => t.checking = false,
-                _ => {}
-            }
-        }
-        self.status = Status::Idle;
-    }
-
-    /// Rebuild a conversation from a session transcript (for resume).
-    pub fn from_transcript(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let mut convo = Self::new();
-        convo.session_id = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-        let mut ai_title = None;
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
+            let tool = s("tool_name").unwrap_or_else(|| "tool".into());
+            let head = if s("decision_reason_type").as_deref() == Some("classifier") {
+                format!("Auto mode blocked {tool}")
+            } else {
+                format!("{tool} was denied")
             };
-            let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
-            if ty == "ai-title" {
-                ai_title = v.get("aiTitle").and_then(Value::as_str).map(String::from);
-                continue;
-            }
-            let skip = ["isSidechain", "isMeta", "isCompactSummary"]
-                .iter()
-                .any(|k| v.get(*k).and_then(Value::as_bool) == Some(true));
-            if skip || !matches!(ty, "user" | "assistant") {
-                continue;
-            }
-            if convo.cwd.is_none() {
-                convo.cwd = v.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-            }
-            if ty == "assistant" && convo.model.is_none() {
-                convo.model = v
-                    .pointer("/message/model")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-            }
-            convo.apply_inner(&v, false);
+            let why = s("decision_reason")
+                .or_else(|| s("message"))
+                .map(|r| strip_ansi(&r))
+                .filter(|r| !r.trim().is_empty());
+            c.push_notice(
+                match why {
+                    Some(why) => format!("{head}: {}", why.trim()),
+                    None => head,
+                },
+                true,
+            );
         }
-        if ai_title.is_some() {
-            convo.title = ai_title;
-        }
-        convo.finish_streaming();
-        convo.status = Status::Idle;
-        Ok(convo)
+        _ => {}
     }
+}
+
+fn on_stream_event(c: &mut Conversation, v: &Value) {
+    if !v.get("parent_tool_use_id").is_none_or(Value::is_null) {
+        return; // subagent internals stay folded into their Task call
+    }
+    let Some(ev) = v.get("event") else { return };
+    match ev.get("type").and_then(Value::as_str).unwrap_or_default() {
+        "content_block_start" => {
+            c.status = Status::Working;
+            match ev.pointer("/content_block/type").and_then(Value::as_str) {
+                Some("text") => c.start_text(),
+                Some("thinking") => c.start_thinking(),
+                _ => {}
+            }
+        }
+        "content_block_delta" => {
+            if ev.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                && let Some(delta) = ev.pointer("/delta/text").and_then(Value::as_str)
+            {
+                c.append_text(delta);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn on_assistant(c: &mut Conversation, v: &Value) {
+    let parent = v
+        .get("parent_tool_use_id")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
+        return;
+    };
+    if c.status != Status::NeedsPermission {
+        c.status = Status::Working;
+    }
+    for block in blocks {
+        match block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" if parent.is_none() => c.complete_text(
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            "thinking" | "redacted_thinking" if parent.is_none() => c.complete_thinking(),
+            "tool_use" => {
+                let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                if c.tool(id).is_none() {
+                    c.items.push(Item::Tool(ToolCall {
+                        id: id.to_string(),
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string(),
+                        input: block.get("input").cloned().unwrap_or(Value::Null),
+                        result: None,
+                        parent: parent.clone(),
+                        checking: false,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn on_user(c: &mut Conversation, v: &Value, live: bool) {
+    let Some(content) = v.pointer("/message/content") else {
+        return;
+    };
+    // Live mode echoes the user's own turns locally; transcripts replay them.
+    if let Some(text) = content.as_str() {
+        if !live {
+            push_history_prompt(c, text);
+        }
+        return;
+    }
+    let meta = v.get("tool_use_result").or_else(|| v.get("toolUseResult"));
+    for block in content.as_array().into_iter().flatten() {
+        match block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "tool_result" => {
+                let id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let result = ToolResult {
+                    text: crate::tools::result_text(block.get("content").unwrap_or(&Value::Null)),
+                    is_error: block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    meta: meta.filter(|m| m.is_object()).cloned(),
+                };
+                if let Some(t) = c.tool_mut(id) {
+                    t.result = Some(result);
+                    t.checking = false;
+                }
+            }
+            "text" if !live => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    push_history_prompt(c, text);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_history_prompt(c: &mut Conversation, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.starts_with("[Request interrupted") {
+        c.push_notice("Interrupted", false);
+    } else if !trimmed.is_empty() && !trimmed.starts_with('<') {
+        c.push_history_user(trimmed);
+    }
+}
+
+fn on_control_request(c: &mut Conversation, v: &Value) -> Option<Reply> {
+    let request_id = v.get("request_id").and_then(Value::as_str)?.to_string();
+    let req = v.get("request")?;
+    let subtype = req
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if subtype != "can_use_tool" {
+        return Some(Reply::Unsupported {
+            request_id,
+            subtype: subtype.to_string(),
+        });
+    }
+    let s = |k: &str| req.get(k).and_then(Value::as_str).map(String::from);
+    let tool_name = s("tool_name").unwrap_or_else(|| "tool".into());
+    if let Some(id) = s("tool_use_id") {
+        c.set_checking(&id, false);
+    }
+    let display_name = s("display_name").unwrap_or_else(|| tool_name.clone());
+    let suggestions = req
+        .get("permission_suggestions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    c.push_permission(PermissionRequest {
+        request_id,
+        session_label: session_allow_label(&display_name, &suggestions),
+        display_name,
+        tool_name,
+        description: s("description").or_else(|| s("title")),
+        reason: s("decision_reason")
+            .map(|r| strip_ansi(&r).trim().to_string())
+            .filter(|r| !r.is_empty()),
+        input: req.get("input").cloned().unwrap_or(Value::Null),
+        suggestions,
+        tool_use_id: s("tool_use_id"),
+        decision: None,
+    });
+    None
+}
+
+fn on_result(c: &mut Conversation, v: &Value) {
+    let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    let message = is_error.then(|| {
+        v.get("result")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| v.get("subtype").and_then(Value::as_str).map(String::from))
+            .unwrap_or_else(|| "error".into())
+    });
+    if let Some(cost) = v.get("total_cost_usd").and_then(Value::as_f64) {
+        c.total_cost_usd = Some(cost);
+    }
+    c.end_turn(
+        v.get("duration_ms").and_then(Value::as_u64),
+        is_error,
+        message,
+    );
+}
+
+/// Rebuild a conversation from a session transcript (for resume).
+pub fn from_transcript(path: &Path) -> Result<Conversation> {
+    let text = std::fs::read_to_string(path)?;
+    let mut convo = Conversation::new();
+    convo.session_id = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let mut ai_title = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
+        if ty == "ai-title" {
+            ai_title = v.get("aiTitle").and_then(Value::as_str).map(String::from);
+            continue;
+        }
+        let skip = ["isSidechain", "isMeta", "isCompactSummary"]
+            .iter()
+            .any(|k| v.get(*k).and_then(Value::as_bool) == Some(true));
+        if skip || !matches!(ty, "user" | "assistant") {
+            continue;
+        }
+        if convo.cwd.is_none() {
+            convo.cwd = v.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+        }
+        if ty == "assistant" && convo.model.is_none() {
+            convo.model = v
+                .pointer("/message/model")
+                .and_then(Value::as_str)
+                .map(String::from);
+        }
+        apply_inner(&mut convo, &v, false);
+    }
+    if ai_title.is_some() {
+        convo.title = ai_title;
+    }
+    convo.finish_streaming();
+    convo.status = Status::Idle;
+    Ok(convo)
 }
 
 fn control_response(v: &Value) -> Option<Reply> {
@@ -596,53 +357,6 @@ fn control_response(v: &Value) -> Option<Reply> {
         request_id: r.get("request_id")?.as_str()?.to_string(),
         error,
     })
-}
-
-/// Drop ANSI escape sequences and other control characters: reason texts are
-/// written for the CLI's terminal UI and may be coloured.
-pub fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                // CSI: parameters up to a final byte in `@`..=`~`.
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                // OSC (hyperlinks, titles): up to BEL or ESC `\`.
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' {
-                            break;
-                        }
-                        if c == '\u{1b}' {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\n' | '\t' => out.push(c),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn short_title(text: &str) -> String {
-    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if line.chars().count() > 48 {
-        format!("{}…", line.chars().take(47).collect::<String>())
-    } else {
-        line
-    }
 }
 
 #[cfg(test)]
@@ -728,7 +442,7 @@ mod tests {
         let p = c.pending_permission().unwrap();
         assert_eq!(p.description.as_deref(), Some("a.txt"));
         assert_eq!(
-            p.session_allow_label().as_deref(),
+            p.session_label.as_deref(),
             Some("Allow all edits this session")
         );
 
@@ -762,7 +476,7 @@ mod tests {
         ];
         let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
         std::fs::write(&path, text).unwrap();
-        let c = Conversation::from_transcript(&path).unwrap();
+        let c = from_transcript(&path).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(c.session_id.as_deref(), Some("sess-1"));
@@ -846,27 +560,5 @@ mod tests {
                 error: Some("Auto mode is unavailable".into())
             })
         );
-    }
-
-    #[test]
-    fn strips_terminal_escapes() {
-        assert_eq!(
-            strip_ansi(
-                "\u{1b}[31mred\u{1b}[0m \u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{1b}\\ ok\u{7}\n"
-            ),
-            "red link ok\n"
-        );
-    }
-
-    #[test]
-    fn exit_while_busy_reports() {
-        let mut c = Conversation::new();
-        c.push_user("go");
-        c.on_exit(Some("boom".into()));
-        assert_eq!(c.status, Status::Exited);
-        assert!(matches!(
-            c.items.last(),
-            Some(Item::Notice { is_error: true, .. })
-        ));
     }
 }

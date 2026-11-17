@@ -1,7 +1,7 @@
 # SuperGIT — notes for agents
 
-Native macOS Git GUI for agent-driven development (worktrees + Claude Code
-sessions + commits + PRs). Rust 2024, GPUI through `gpui-kit`. Personal tool
+Native macOS Git GUI for agent-driven development (worktrees + Claude Code and
+Codex sessions + commits + PRs). Rust 2024, GPUI through `gpui-kit`. Personal tool
 for the author and colleagues: macOS only, GitHub only (via `gh`).
 
 ## Layout
@@ -10,10 +10,15 @@ for the author and colleagues: macOS only, GitHub only (via `gh`).
 crates/
   sg_git/      git core: worktrees, status, log, diffs (git CLI, porcelain -z)
   sg_github/   pull requests through the `gh` CLI
-  sg_agents/   Claude Code sessions from ~/.claude/projects transcripts
+  sg_agents/   provider-neutral agent layer: `Provider`, chat model
+               (chat.rs: Conversation/Item/PermissionRequest), `AgentProcess`
+               trait (process.rs); Claude Code session discovery (lib.rs)
   sg_claude/   native Claude chat: `claude` stream-json process + protocol
                (process.rs), event → chat items fold (conversation.rs),
                tool summaries/diffs (tools.rs)
+  sg_codex/    native Codex chat: CLI discovery + version check (install.rs),
+               `codex app-server` driver (process.rs), fold (conversation.rs),
+               item summaries/diffs (tools.rs), rollout discovery (sessions.rs)
   supergit/    the app (GPUI): main.rs, app.rs (view), model.rs (background
                loading), launch.rs (terminals/editor/browser), dump.rs,
                screenshot.rs (feature `screenshot`)
@@ -52,6 +57,41 @@ Same protocol as the Agent SDKs and the VS Code extension:
 - Live test against the real CLI (costs cents): `cargo test -p sg_claude -- --ignored`.
 - UI checks: `SUPERGIT_DEBUG_CHAT=resume` or `SUPERGIT_DEBUG_CHAT='prompt:…'`
   (screenshot builds only) opens/sends on startup, then screenshot it.
+
+## Native Codex (sg_codex)
+
+`codex app-server` over stdio, JSON-RPC without the `jsonrpc` field, one
+process per conversation (protocol of Codex 0.157; `install::MIN_VERSION`).
+- CLI lookup: `SUPERGIT_CODEX`, `codex` on PATH, `~/.codex/packages/standalone`,
+  `/Applications/Codex.app`; each must answer `--version` (a pnpm shim whose
+  Node is gone does not). Regenerate the protocol types to read along:
+  `codex app-server generate-ts --out /tmp/codex-ts`.
+- Driver thread (process.rs) owns stdin and protocol state: `initialize` →
+  `initialized` → `account/read` (signed out → "run `codex login`") →
+  `thread/start {cwd, approvalPolicy, sandbox}` or `thread/resume {threadId,
+  excludeTurns}` → `turn/start` per queued message (with `approvalPolicy` +
+  `sandboxPolicy`: Codex applies policies per turn) → `turn/interrupt
+  {threadId, turnId}`. Answers to our requests reach the fold as
+  `{"response": method, "result"|"error"}`; notifications and server requests
+  verbatim.
+- Approvals are server requests: `item/commandExecution/requestApproval`
+  (`availableDecisions`: accept / acceptForSession /
+  acceptWithExecpolicyAmendment / decline / cancel), `item/fileChange/
+  requestApproval` (diff from the started `fileChange` item),
+  `item/permissions/requestApproval`. The fold stores the exact answers in
+  `PermissionRequest.suggestions[0]` (`allow`/`session`/`deny`); MCP
+  elicitations are declined, anything else gets a JSON-RPC error.
+- Policies (`Policy`: Read only / Auto / Full access) are Codex's approval +
+  sandbox presets — never mapped onto Claude's permission modes.
+- History: `read_history` runs a short-lived app server (`thread/read` +
+  `thread/turns/list`, no agent starts). Discovery reads rollouts
+  (`~/.codex/sessions/**/rollout-*.jsonl`: first-line `session_meta`, tail
+  turn boundaries) and thread names from `session_index.jsonl`.
+- Tests: recorded events (`src/conversation/tests.rs`), a fake app server
+  (`tests/fake_app_server.rs`); real Codex is opt-in:
+  `cargo test -p sg_codex --test live -- --ignored --nocapture`.
+- UI checks: `SUPERGIT_DEBUG_AGENT=codex` with `SUPERGIT_DEBUG_CHAT=…`, and
+  `SUPERGIT_DEBUG_POLICY=read-only|auto|full-access` for `prompt:` runs.
 
 Core crates are UI-agnostic and synchronous; the app runs them on GPUI's
 background executor and applies results on the main thread. Keep it that way:
@@ -167,7 +207,9 @@ never commit, push or create worktrees there without asking.
   `-z` formats, never human output.
 - **Sessions** are attributed to worktrees by the transcript's `cwd`, not by
   the project directory name (`repo/box` and `repo-box` encode the same).
-  `claude --resume` must run in the session's `start_cwd`.
+  `claude --resume` must run in the session's `start_cwd`. Session ids are
+  unique per provider only: compare `(provider, id)`. Persisted conversations
+  carry `provider` (`claude`, `codex`; empty means Claude).
 - **PRs**: `gh pr list --state all` with check rollups is slow (~10 s for 100);
   fetch open + recent merged in parallel instead.
 - Never modify the user's `~/.claude` configuration (hooks etc.) without asking.

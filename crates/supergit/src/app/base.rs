@@ -195,7 +195,7 @@ impl SuperGitApp {
             return Some("commit or discard its changes first".into());
         }
         if self.worktree_busy(info, cx) {
-            return Some("Claude is working here; wait until it finishes".into());
+            return Some("an agent is working here; wait until it finishes".into());
         }
         None
     }

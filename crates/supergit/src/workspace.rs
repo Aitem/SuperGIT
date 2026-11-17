@@ -61,6 +61,9 @@ pub struct SavedConversation {
     pub cwd: PathBuf,
     pub title: String,
     pub draft: String,
+    /// Codex's approval + sandbox policy (`sg_codex::Policy`); empty for
+    /// Claude, whose mode the CLI reports itself.
+    pub policy: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

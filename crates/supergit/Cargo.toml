@@ -1,6 +1,6 @@
 [package]
 name = "supergit"
-description = "SuperGIT — Git GUI for agent-driven development (worktrees, Claude sessions, commits, PRs)"
+description = "SuperGIT — Git GUI for agent-driven development (worktrees, Claude Code and Codex sessions, commits, PRs)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,6 +21,7 @@ sg_git.workspace = true
 sg_github.workspace = true
 sg_agents.workspace = true
 sg_claude.workspace = true
+sg_codex.workspace = true
 objc2 = "0.6"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSObject", "NSString", "NSError"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "UNUserNotificationCenter", "UNNotification", "UNNotificationRequest", "UNNotificationContent", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }

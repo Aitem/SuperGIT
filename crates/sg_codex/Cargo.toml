@@ -1,0 +1,17 @@
+[package]
+name = "sg_codex"
+description = "Codex as a native chat: `codex app-server` process control, conversation fold and session discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures = { workspace = true, features = ["executor"] }
+serde_json.workspace = true
+sg_agents.workspace = true
+
+[lints]
+workspace = true

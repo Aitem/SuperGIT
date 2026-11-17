@@ -56,6 +56,9 @@ pub struct Settings {
     pub appearance: Appearance,
     pub notify_approvals: bool,
     pub notify_completions: bool,
+    /// The agent new conversations start with (`claude`, `codex`): the one
+    /// picked last.
+    pub agent: String,
 }
 
 fn file() -> Option<PathBuf> {

@@ -118,13 +118,22 @@ fn osascript(script: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resume an existing Claude Code session (must run in the session's cwd).
-pub fn claude_resume(app: TerminalApp, dir: &Path, session_id: &str) -> Result<()> {
-    open_terminal(
-        app,
-        dir,
-        Some(&format!("claude --resume {}", shell_quote(session_id))),
-    )
+/// The command that continues a session in a terminal.
+pub fn resume_command(provider: sg_agents::Provider, session_id: &str) -> String {
+    match provider {
+        sg_agents::Provider::Claude => format!("claude --resume {}", shell_quote(session_id)),
+        sg_agents::Provider::Codex => format!("codex resume {}", shell_quote(session_id)),
+    }
+}
+
+/// Resume an existing agent session in a terminal (run in the session's cwd).
+pub fn agent_resume(
+    app: TerminalApp,
+    provider: sg_agents::Provider,
+    dir: &Path,
+    session_id: &str,
+) -> Result<()> {
+    open_terminal(app, dir, Some(&resume_command(provider, session_id)))
 }
 
 /// `SUPERGIT_EDITOR` (a CLI like `code`, `zed`, `cursor`), else VS Code.

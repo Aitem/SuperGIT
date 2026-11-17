@@ -1,5 +1,5 @@
 //! The main window: worktrees on the left, the selected worktree's changes,
-//! history, Claude sessions and pull requests on the right.
+//! history, agent sessions and pull requests on the right.
 
 mod base;
 mod projects;
@@ -23,7 +23,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use sg_agents::{AgentState, Session};
+use sg_agents::{AgentState, Provider, Session};
 use sg_git::{
     Commit, CommitDetails, FileChange, FileState, RefKind, RefLabel, Repo, relative_time,
 };
@@ -204,7 +204,8 @@ pub struct SuperGitApp {
     /// Inactive projects' last worktrees and PRs, for instant switching.
     project_cache: HashMap<PathBuf, projects::ProjectSnapshot>,
 
-    /// Native Claude conversations per worktree (tabs in the right panel).
+    /// Native agent conversations (Claude, Codex) per worktree (tabs in the
+    /// right panel).
     /// They keep running while other worktrees, or projects, are selected.
     chats: HashMap<PathBuf, Vec<Entity<ChatSession>>>,
     active_chat: HashMap<PathBuf, usize>,
@@ -496,9 +497,7 @@ impl SuperGitApp {
                 snapshots.extend(
                     saved
                         .iter()
-                        .filter(|conversation| {
-                            !conversation.provider.is_empty() && conversation.provider != "claude"
-                        })
+                        .filter(|conversation| !native_provider(&conversation.provider))
                         .cloned(),
                 );
             }
@@ -765,32 +764,33 @@ impl SuperGitApp {
             if let Some(chats) = self.chats.get(&path) {
                 for chat in chats {
                     let chat = chat.read(cx);
+                    let provider = chat.provider();
                     if let Some(id) = chat.session_id() {
-                        opened_sessions.insert(id.to_string());
+                        opened_sessions.insert((provider, id.to_string()));
                     }
                     entries.push(Entry {
                         key: format!("chat:{}:{}", path.display(), chat.local_id()),
                         path: path.clone(),
                         title: chat.title(),
-                        detail: format!("Claude · {branch} · {}", path.display()),
-                        search: format!("{} {search} claude", chat.title()),
+                        detail: format!("{} · {branch} · {}", provider.label(), path.display()),
+                        search: format!("{} {search} {}", chat.title(), provider.as_str()),
                         destination: Destination::Conversation(chat.local_id().into()),
                     });
                 }
             } else if let Some(chats) = self.repository_view().conversations.get(&path) {
-                for chat in chats
-                    .iter()
-                    .filter(|c| c.provider.is_empty() || c.provider == "claude")
-                {
+                for chat in chats.iter() {
+                    let Some(provider) = Provider::parse(&chat.provider) else {
+                        continue;
+                    };
                     if let Some(id) = &chat.session_id {
-                        opened_sessions.insert(id.clone());
+                        opened_sessions.insert((provider, id.clone()));
                     }
                     entries.push(Entry {
                         key: format!("chat:{}:{}", path.display(), chat.local_id),
                         path: path.clone(),
                         title: chat.title.clone(),
-                        detail: format!("Claude · {branch} · {}", path.display()),
-                        search: format!("{} {search} claude", chat.title),
+                        detail: format!("{} · {branch} · {}", provider.label(), path.display()),
+                        search: format!("{} {search} {}", chat.title, provider.as_str()),
                         destination: Destination::Conversation(chat.local_id.clone()),
                     });
                 }
@@ -798,14 +798,15 @@ impl SuperGitApp {
             for session in info
                 .sessions
                 .iter()
-                .filter(|s| !opened_sessions.contains(&s.id))
+                .filter(|s| !opened_sessions.contains(&(s.provider, s.id.clone())))
             {
+                let provider = session.provider;
                 entries.push(Entry {
-                    key: format!("session:claude:{}", session.id),
+                    key: format!("session:{}:{}", provider.as_str(), session.id),
                     path: path.clone(),
                     title: session.title.clone(),
-                    detail: format!("Claude · {branch} · {}", path.display()),
-                    search: format!("{} {search} claude", session.title),
+                    detail: format!("{} · {branch} · {}", provider.label(), path.display()),
+                    search: format!("{} {search} {}", session.title, provider.as_str()),
                     destination: Destination::Transcript(session.clone()),
                 });
             }
@@ -1360,17 +1361,32 @@ impl SuperGitApp {
         cx.defer(move |cx| {
             let _ = window.update(cx, |_, window, cx| {
                 this.update(cx, |app, cx| {
+                    // `SUPERGIT_DEBUG_AGENT=codex|claude` picks the agent.
+                    let agent = std::env::var("SUPERGIT_DEBUG_AGENT")
+                        .ok()
+                        .and_then(|a| Provider::parse(&a));
                     if spec == "resume" {
-                        if let Some(s) = app
-                            .selected_info()
-                            .and_then(|i| i.sessions.first().cloned())
-                        {
+                        if let Some(s) = app.selected_info().and_then(|i| {
+                            i.sessions
+                                .iter()
+                                .find(|s| agent.is_none_or(|a| s.provider == a))
+                                .cloned()
+                        }) {
                             app.open_session_chat(s, window, cx);
                         }
                     } else if let Some(prompt) = spec.strip_prefix("prompt:") {
-                        app.new_chat(window, cx);
+                        app.new_chat_with(agent.unwrap_or_else(default_provider), window, cx);
+                        // `SUPERGIT_DEBUG_POLICY=read-only|auto|full-access` (Codex).
+                        let policy = std::env::var("SUPERGIT_DEBUG_POLICY")
+                            .ok()
+                            .and_then(|p| sg_codex::Policy::parse(&p));
                         if let Some(chat) = app.active_chat_entity() {
-                            chat.update(cx, |chat, cx| chat.send_text(prompt, cx));
+                            chat.update(cx, |chat, cx| {
+                                if let Some(policy) = policy {
+                                    chat.set_policy(policy, cx);
+                                }
+                                chat.send_text(prompt, cx)
+                            });
                         }
                     }
                 })
@@ -1781,7 +1797,7 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    // ---- Claude panel ------------------------------------------------------
+    // ---- agent panel -------------------------------------------------------
 
     fn watch_chat(&mut self, path: PathBuf, chat: &Entity<ChatSession>, cx: &mut Context<Self>) {
         let Some(repository) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
@@ -1799,6 +1815,7 @@ impl SuperGitApp {
         cx.observe(chat, move |this, chat, cx| {
             let state = chat.read(cx).attention().clone();
             let local_id = chat.read(cx).local_id().to_string();
+            let provider = chat.read(cx).provider();
             let revision_changed =
                 this.notified.insert(key.clone(), state.revision) != Some(state.revision);
             let focused = this
@@ -1834,14 +1851,14 @@ impl SuperGitApp {
                         &notifications::Target {
                             repository: repository.clone(),
                             worktree: path.clone(),
-                            provider: "claude".into(),
+                            provider: provider.as_str().into(),
                             conversation: local_id,
                         },
                         state.revision,
-                        match state.kind {
-                            Kind::Approval => "Claude needs your approval",
-                            Kind::Failed => "Claude task failed",
-                            _ => "Claude task completed",
+                        &match state.kind {
+                            Kind::Approval => format!("{} needs your approval", provider.label()),
+                            Kind::Failed => format!("{} task failed", provider.label()),
+                            _ => format!("{} task completed", provider.label()),
                         },
                         &chat.read(cx).title(),
                         cx,
@@ -1900,7 +1917,7 @@ impl SuperGitApp {
                         .get(info.path())
                         .into_iter()
                         .flatten()
-                        .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
+                        .filter(|chat| native_provider(&chat.provider))
                         .filter(|chat| {
                             chat.attention.kind == kind
                                 && (matches!(kind, Kind::Running | Kind::Approval)
@@ -1929,7 +1946,7 @@ impl SuperGitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if target.provider != "claude" {
+        if !native_provider(&target.provider) {
             self.flash(
                 "This provider does not support notification navigation yet",
                 true,
@@ -1993,8 +2010,18 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// A new conversation for the selected worktree.
+    /// A new conversation for the selected worktree, with the agent picked
+    /// last (switchable until the first message).
     pub fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_chat_with(default_provider(), window, cx);
+    }
+
+    pub fn new_chat_with(
+        &mut self,
+        provider: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(path) = self.selected.clone() else {
             return;
         };
@@ -2005,17 +2032,19 @@ impl SuperGitApp {
         if let Some(ix) = self.chats.get(&path).and_then(|list| {
             list.iter().position(|c| {
                 let c = c.read(cx);
-                c.is_empty() && c.session_id().is_none() && !c.has_draft(cx)
+                c.is_fresh() && !c.has_draft(cx)
             })
         }) {
             self.active_chat.insert(path.clone(), ix);
             self.chat_open = true;
-            let input = self.chats[&path][ix].read(cx).input();
+            let chat = self.chats[&path][ix].clone();
+            chat.update(cx, |chat, cx| chat.set_provider(provider, window, cx));
+            let input = chat.read(cx).input();
             input.update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
             return;
         }
-        let chat = cx.new(|cx| ChatSession::new(path.clone(), window, cx));
+        let chat = cx.new(|cx| ChatSession::new(path.clone(), provider, window, cx));
         self.add_chat(path, chat, window, cx);
     }
 
@@ -2028,14 +2057,16 @@ impl SuperGitApp {
         self.new_chat(window, cx);
     }
 
-    /// Open an existing Claude Code session in the panel (history + resume).
+    /// Open an existing agent session in the panel (history + resume).
     fn open_session_chat(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.selected.clone() else {
             return;
         };
         if let Some(ix) = self.chats.get(&path).and_then(|list| {
-            list.iter()
-                .position(|c| c.read(cx).session_id() == Some(session.id.as_str()))
+            list.iter().position(|c| {
+                let c = c.read(cx);
+                c.provider() == session.provider && c.session_id() == Some(session.id.as_str())
+            })
         }) {
             self.active_chat.insert(path, ix);
             self.chat_open = true;
@@ -2053,7 +2084,7 @@ impl SuperGitApp {
         if let Some(list) = self.chats.get_mut(&path)
             && ix < list.len()
         {
-            // Dropping the session kills its `claude` process.
+            // Dropping the session kills its agent process.
             list.remove(ix);
             let active = self.active_chat.get(&path).copied().unwrap_or(0);
             let next = if active > ix { active - 1 } else { active };
@@ -2103,8 +2134,8 @@ impl SuperGitApp {
             .get(path)?
             .iter()
             .filter_map(|c| match c.read(cx).status() {
-                sg_claude::Status::NeedsPermission => Some(AgentState::NeedsAttention),
-                sg_claude::Status::Working | sg_claude::Status::Starting => {
+                sg_agents::chat::Status::NeedsPermission => Some(AgentState::NeedsAttention),
+                sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
                     Some(AgentState::Working)
                 }
                 _ => None,
@@ -2114,49 +2145,72 @@ impl SuperGitApp {
 
     /// Estimates apply only to transcripts not owned by the native UI.
     fn external_agent_state(&self, info: &WorktreeInfo, cx: &App) -> Option<AgentState> {
-        let ids: std::collections::HashSet<_> = self
+        self.external_agent(info, cx).map(|(state, _)| state)
+    }
+
+    /// The most urgent estimated state of sessions running outside SuperGIT,
+    /// with the agent behind it.
+    fn external_agent(&self, info: &WorktreeInfo, cx: &App) -> Option<(AgentState, Provider)> {
+        let ids: std::collections::HashSet<(Provider, String)> = self
             .chats
             .get(info.path())
             .into_iter()
             .flatten()
-            .filter_map(|chat| chat.read(cx).session_id().map(str::to_string))
+            .filter_map(|chat| {
+                let chat = chat.read(cx);
+                Some((chat.provider(), chat.session_id()?.to_string()))
+            })
             .chain(
                 self.repository_view()
                     .conversations
                     .get(info.path())
                     .into_iter()
                     .flatten()
-                    .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
-                    .filter_map(|chat| chat.session_id.clone()),
+                    .filter_map(|chat| {
+                        Some((Provider::parse(&chat.provider)?, chat.session_id.clone()?))
+                    }),
             )
             .collect();
         info.sessions
             .iter()
-            .filter(|session| !ids.contains(&session.id))
-            .map(|session| session.state)
-            .filter(|state| state.is_active())
+            .filter(|session| !ids.contains(&(session.provider, session.id.clone())))
+            .filter(|session| session.state.is_active())
+            .map(|session| (session.state, session.provider))
             .min()
     }
 
     fn native_attention_for(&self, path: &Path, cx: &App) -> Option<Kind> {
-        let states: Vec<_> = if let Some(chats) = self.chats.get(path) {
-            chats.iter().map(|chat| chat.read(cx).attention()).collect()
-        } else {
-            self.repository_view()
-                .conversations
-                .get(path)
-                .into_iter()
-                .flatten()
-                .filter(|chat| chat.provider.is_empty() || chat.provider == "claude")
-                .map(|chat| &chat.attention)
-                .collect()
-        };
+        self.native_attention(path, cx).map(|(kind, _)| kind)
+    }
+
+    /// The most urgent attention among a worktree's conversations, with the
+    /// agent of the first conversation that has it.
+    fn native_attention(&self, path: &Path, cx: &App) -> Option<(Kind, Provider)> {
+        let states: Vec<(&crate::attention::Attention, Provider)> =
+            if let Some(chats) = self.chats.get(path) {
+                chats
+                    .iter()
+                    .map(|chat| {
+                        let chat = chat.read(cx);
+                        (chat.attention(), chat.provider())
+                    })
+                    .collect()
+            } else {
+                self.repository_view()
+                    .conversations
+                    .get(path)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|chat| Some((&chat.attention, Provider::parse(&chat.provider)?)))
+                    .collect()
+            };
         [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
             .into_iter()
-            .find(|kind| {
-                states.iter().any(|state| {
-                    state.kind == *kind
-                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+            .find_map(|kind| {
+                states.iter().find_map(|(state, provider)| {
+                    (state.kind == kind
+                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread))
+                        .then_some((kind, *provider))
                 })
             })
     }
@@ -2646,8 +2700,8 @@ impl SuperGitApp {
         let branch = info.wt.branch.clone();
         let pr = self.pr_for_branch(branch.as_deref());
         let agent = self.agent_state_for(info, cx);
-        let native = self.native_attention_for(info.path(), cx);
-        let external = self.external_agent_state(info, cx);
+        let native = self.native_attention(info.path(), cx);
+        let external = self.external_agent(info, cx);
         let owner = cx.entity().downgrade();
         let context_path = path.clone();
         let kept = self.kept_active(info.path());
@@ -2732,11 +2786,11 @@ impl SuperGitApp {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .children(meta)
-                    .when_some(native, |el, kind| {
+                    .when_some(native, |el, (kind, provider)| {
                         let target = info.wt.path.clone();
                         el.child(
                             Button::new(("worktree-attention", ix))
-                                .label(format!("Claude {}", kind.label()))
+                                .label(format!("{} {}", provider.label(), kind.label()))
                                 .text_color(attention_color(kind, theme))
                                 .xsmall()
                                 .ghost()
@@ -2752,12 +2806,12 @@ impl SuperGitApp {
                                 })),
                         )
                     })
-                    .when_some(external, |el, a| {
-                        el.child(
-                            div()
-                                .text_color(agent_color(a, theme))
-                                .child(format!("Claude {} (estimated)", a.label())),
-                        )
+                    .when_some(external, |el, (a, provider)| {
+                        el.child(div().text_color(agent_color(a, theme)).child(format!(
+                            "{} {} (estimated)",
+                            provider.label(),
+                            a.label()
+                        )))
                     })
                     .when_some(self.render_rebase_button(ix, info, cx), |el, button| {
                         el.child(div().flex_1()).child(button)
@@ -2885,7 +2939,7 @@ impl SuperGitApp {
                     }))
                     .child(Tab::new().label(history))
                     .child(Tab::new().label(format!("Changes · {changes}")))
-                    .child(Tab::new().label(format!("Claude · {sessions}")))
+                    .child(Tab::new().label(format!("Agents · {sessions}")))
                     .child(Tab::new().label(format!("Pull requests · {open_prs}"))),
             )
             .child(div().flex_1().min_h_0().child(content))
@@ -2977,10 +3031,13 @@ impl SuperGitApp {
                     .flex_none()
                     .child(
                         Button::new("claude-new")
-                            .label("✦ New Claude")
+                            .label({
+                                let provider = default_provider();
+                                format!("{} New {}", provider.glyph(), provider.label())
+                            })
                             .small()
                             .primary()
-                            .tooltip("New Claude conversation in this worktree (cmd-n)")
+                            .tooltip("New conversation in this worktree (cmd-n); pick the agent before the first message")
                             .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
                     )
                     .when_some(last_session, |el, session| {
@@ -2989,7 +3046,8 @@ impl SuperGitApp {
                                 .label("Resume last")
                                 .small()
                                 .tooltip(format!(
-                                    "Continue “{}” in the Claude panel",
+                                    "Continue {} “{}” in the agent panel",
+                                    session.provider.label(),
                                     session.title
                                 ))
                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -4094,17 +4152,28 @@ impl SuperGitApp {
                 .justify_center()
                 .gap_2()
                 .text_color(theme.muted_foreground)
-                .child("No Claude sessions in this worktree yet")
+                .child("No agent sessions in this worktree yet")
                 .child(
-                    Button::new("claude-new-empty")
-                        .label("✦ Start Claude here")
-                        .primary()
-                        .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
+                    h_flex()
+                        .gap_2()
+                        .children(Provider::ALL.into_iter().map(|provider| {
+                            Button::new(("agent-new-empty", provider as usize))
+                                .label(format!(
+                                    "{} Start {} here",
+                                    provider.glyph(),
+                                    provider.label()
+                                ))
+                                .when(provider == default_provider(), |b| b.primary())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.new_chat_with(provider, window, cx)
+                                }))
+                        })),
                 )
                 .into_any_element();
         }
         let rows = info.sessions.iter().enumerate().map(|(ix, s)| {
             let id = s.id.clone();
+            let provider = s.provider;
             let dir = s.start_cwd.clone().unwrap_or_else(|| path.clone());
             let session = s.clone();
             session_row(ix, s, theme)
@@ -4112,7 +4181,7 @@ impl SuperGitApp {
                     Button::new(("open-session", ix))
                         .label("Open")
                         .small()
-                        .tooltip("Continue in the Claude panel")
+                        .tooltip(format!("Continue in the {} panel", provider.label()))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_session_chat(session.clone(), window, cx)
                         })),
@@ -4122,9 +4191,13 @@ impl SuperGitApp {
                         .label("Terminal")
                         .small()
                         .ghost()
-                        .tooltip(format!("claude --resume in {}", terminal.name()))
+                        .tooltip(format!(
+                            "{} in {}",
+                            launch::resume_command(provider, &id),
+                            terminal.name()
+                        ))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let r = launch::claude_resume(terminal, &dir, &id);
+                            let r = launch::agent_resume(terminal, provider, &dir, &id);
                             this.report(r, "Session resumed in a new terminal", cx);
                         })),
                 )
@@ -4213,15 +4286,15 @@ impl SuperGitApp {
     }
 
     fn ensure_chats(&mut self, path: &PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        // Every worktree gets a ready-to-type conversation; the `claude`
-        // process only starts with the first message.
+        // Every worktree gets a ready-to-type conversation; the agent process
+        // only starts with the first message.
         if !self.chats.contains_key(path) {
             let saved = self.repository_view().clone();
             let conversations = saved.conversations.get(path).cloned().unwrap_or_default();
             let mut restored = Vec::new();
             for conversation in conversations
                 .iter()
-                .filter(|c| c.provider == "claude" || c.provider.is_empty())
+                .filter(|c| native_provider(&c.provider))
             {
                 let chat =
                     cx.new(|cx| ChatSession::restore(path.clone(), conversation, window, cx));
@@ -4242,7 +4315,8 @@ impl SuperGitApp {
             }
         }
         if self.chats.get(path).is_none_or(Vec::is_empty) {
-            let chat = cx.new(|cx| ChatSession::new(path.clone(), window, cx));
+            let provider = default_provider();
+            let chat = cx.new(|cx| ChatSession::new(path.clone(), provider, window, cx));
             self.watch_chat(path.clone(), &chat, cx);
             self.chats.insert(path.clone(), vec![chat]);
             self.active_chat.insert(path.clone(), 0);
@@ -4255,7 +4329,7 @@ impl SuperGitApp {
         }
     }
 
-    /// Open the Claude panel on the selected worktree's conversation `ix`.
+    /// Open the agent panel on the selected worktree's conversation `ix`.
     fn open_chat_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.selected.clone() else {
             return;
@@ -4270,9 +4344,10 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// The collapsed Claude panel: a button to expand it, one ✦ per
-    /// conversation of the selected worktree colored by its state (title in
-    /// the tooltip; clicking opens it), and a new-conversation button.
+    /// The collapsed agent panel: a button to expand it, one glyph per
+    /// conversation of the selected worktree (✦ Claude, ◆ Codex) colored by
+    /// its state (title in the tooltip; clicking opens it), and a
+    /// new-conversation button.
     fn render_chat_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
@@ -4282,10 +4357,16 @@ impl SuperGitApp {
         let cells = chats.iter().enumerate().map(|(ix, chat)| {
             let c = chat.read(cx);
             let kind = c.attention().kind;
+            let glyph = c.provider().glyph();
             let tooltip = if kind == Kind::Idle {
-                c.title()
+                format!("{} · {}", c.provider().label(), c.title())
             } else {
-                format!("{} · {}", c.title(), kind.label())
+                format!(
+                    "{} · {} · {}",
+                    c.provider().label(),
+                    c.title(),
+                    kind.label()
+                )
             };
             div()
                 .id(("rail-chat", ix))
@@ -4307,7 +4388,7 @@ impl SuperGitApp {
                     div()
                         .text_sm()
                         .text_color(attention_color(kind, &theme))
-                        .child("✦"),
+                        .child(glyph),
                 )
         });
         v_flex()
@@ -4322,7 +4403,7 @@ impl SuperGitApp {
                         .icon(IconName::PanelRightOpen)
                         .xsmall()
                         .ghost()
-                        .tooltip("Expand the Claude panel (cmd-l)")
+                        .tooltip("Expand the agent panel (cmd-l)")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_claude(&ToggleClaude, window, cx)
                         })),
@@ -4375,10 +4456,16 @@ impl SuperGitApp {
         }
         let tabs = chats.iter().enumerate().map(|(ix, chat)| {
             let c = chat.read(cx);
-            let title: String = c.title().chars().take(22).collect();
+            let title = format!(
+                "{} {}",
+                c.provider().glyph(),
+                c.title().chars().take(22).collect::<String>()
+            );
             let dot = match c.status() {
-                sg_claude::Status::Working | sg_claude::Status::Starting => Some(theme.blue),
-                sg_claude::Status::NeedsPermission => Some(theme.warning),
+                sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
+                    Some(theme.blue)
+                }
+                sg_agents::chat::Status::NeedsPermission => Some(theme.warning),
                 _ => None,
             };
             let path = path.clone();
@@ -4443,7 +4530,15 @@ impl SuperGitApp {
                             .px_1()
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
-                            .child("✦ Claude"),
+                            .child(
+                                chats
+                                    .get(active)
+                                    .map(|chat| {
+                                        let provider = chat.read(cx).provider();
+                                        format!("{} {}", provider.glyph(), provider.label())
+                                    })
+                                    .unwrap_or_else(|| "Agents".into()),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -4467,7 +4562,7 @@ impl SuperGitApp {
                             .icon(IconName::PanelRightClose)
                             .xsmall()
                             .ghost()
-                            .tooltip("Collapse the Claude panel (cmd-l)")
+                            .tooltip("Collapse the agent panel (cmd-l)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_claude(&ToggleClaude, window, cx)
                             })),
@@ -4483,7 +4578,7 @@ impl SuperGitApp {
     }
 
     /// Everything between the title bar and the status bar: the Projects
-    /// panel, then the active project (worktrees, review, Claude).
+    /// panel, then the active project (worktrees, review, agents).
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let project = self.render_project(window, cx);
         if !self.projects_visible() {
@@ -4649,11 +4744,9 @@ impl SuperGitApp {
                         .font_weight(FontWeight::BOLD)
                         .child("SuperGIT"),
                 )
-                .child(
-                    div().text_color(theme.muted_foreground).child(
-                        "Worktrees, Claude sessions, commits and pull requests in one place.",
-                    ),
-                )
+                .child(div().text_color(theme.muted_foreground).child(
+                    "Worktrees, Claude and Codex sessions, commits and pull requests in one place.",
+                ))
                 .child(
                     h_flex().child(
                         Button::new("welcome-open")
@@ -4802,7 +4895,18 @@ fn attention_color(kind: Kind, theme: &gpui_kit::component::Theme) -> Hsla {
     }
 }
 
-/// Width of a collapsed side panel (worktree list, Claude panel).
+/// Saved conversations of a provider this build drives natively (an empty
+/// provider is Claude: state written before providers existed).
+pub(crate) fn native_provider(provider: &str) -> bool {
+    Provider::parse(provider).is_some()
+}
+
+/// The agent new conversations start with: the one picked last.
+pub(crate) fn default_provider() -> Provider {
+    Provider::parse(&crate::settings::load().agent).unwrap_or_default()
+}
+
+/// Width of a collapsed side panel (worktree list, agent panel).
 const RAIL_WIDTH: f32 = 48.;
 
 /// Two letters for a worktree in the collapsed list: the first letters of
@@ -5333,11 +5437,11 @@ fn session_row(ix: usize, s: &Session, theme: &gpui_kit::component::Theme) -> St
         .border_color(theme.border)
         .child(
             div()
-                .w(px(76.))
+                .w(px(88.))
                 .flex_none()
                 .text_xs()
                 .text_color(agent_color(s.state, theme))
-                .child(format!("● {}", s.state.label())),
+                .child(format!("{} {}", s.provider.glyph(), s.state.label())),
         )
         .child(
             v_flex()

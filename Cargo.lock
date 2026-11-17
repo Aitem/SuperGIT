@@ -6123,6 +6123,7 @@ dependencies = [
 name = "sg_agents"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "serde_json",
 ]
 
@@ -6133,6 +6134,17 @@ dependencies = [
  "anyhow",
  "futures",
  "serde_json",
+ "sg_agents",
+]
+
+[[package]]
+name = "sg_codex"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "serde_json",
+ "sg_agents",
 ]
 
 [[package]]
@@ -6453,6 +6465,7 @@ dependencies = [
  "serde_json",
  "sg_agents",
  "sg_claude",
+ "sg_codex",
  "sg_git",
  "sg_github",
 ]
