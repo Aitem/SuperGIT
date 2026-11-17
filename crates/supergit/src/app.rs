@@ -6,6 +6,7 @@ mod edit;
 mod projects;
 mod pulls;
 mod sidebar;
+mod staging;
 mod worktrees;
 
 use crate::MOD;
@@ -3796,11 +3797,8 @@ impl SuperGitApp {
                             this.toggle_dir(list, path.clone(), cx)
                         }),
                     )
-                    .on_click(Self::open_file(
-                        list,
-                        files[ix].path.clone(),
-                        cx,
-                    )),
+                    .on_click(Self::open_file(list, files[ix].path.clone(), cx))
+                    .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
                     cx,
                 ),
@@ -3825,11 +3823,8 @@ impl SuperGitApp {
                         tree_indent(depth),
                         theme,
                     )
-                    .on_click(Self::open_file(
-                        list,
-                        files[ix].path.clone(),
-                        cx,
-                    )),
+                    .on_click(Self::open_file(list, files[ix].path.clone(), cx))
+                    .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
                     cx,
                 ),
@@ -3849,11 +3844,8 @@ impl SuperGitApp {
                             px(12.),
                             theme,
                         )
-                        .on_click(Self::open_file(
-                            list,
-                            file.path.clone(),
-                            cx,
-                        )),
+                        .on_click(Self::open_file(list, file.path.clone(), cx))
+                        .children(self.staging_buttons(list, file, cx)),
                         file.path.clone(),
                         cx,
                     )
