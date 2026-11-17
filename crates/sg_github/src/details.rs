@@ -1,6 +1,8 @@
 //! One pull request in depth — description, conversation, review threads,
 //! checks and mergeability in a single GraphQL call — and merging it.
 
+pub(crate) mod review_actions;
+
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -165,6 +167,7 @@ pub struct ReviewThread {
     pub line: Option<u64>,
     pub resolved: bool,
     pub outdated: bool,
+    pub permissions: review_actions::ThreadPermissions,
     /// The diff around the commented line, from the first comment.
     pub diff_hunk: String,
     pub comments: Vec<Comment>,
@@ -263,7 +266,9 @@ const DETAILS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int
       reviews(last: 100) { nodes { author { login } body state submittedAt url } }
       reviewThreads(last: 100) { nodes {
         id isResolved isOutdated path line originalLine
-        comments(first: 50) { nodes { author { login } body createdAt url diffHunk } }
+        viewerCanReply viewerCanResolve viewerCanUnresolve
+        original: comments(first: 1) { nodes { author { login } body createdAt url diffHunk } }
+        comments(last: 50) { nodes { author { login } body createdAt url diffHunk } }
       } }
     }
   }
@@ -530,6 +535,10 @@ struct RawThread {
     path: String,
     line: Option<u64>,
     original_line: Option<u64>,
+    #[serde(flatten)]
+    permissions: review_actions::ThreadPermissions,
+    #[serde(default)]
+    original: Nodes<RawComment>,
     #[serde(default)]
     comments: Nodes<RawComment>,
 }
@@ -727,11 +736,17 @@ fn parse_details(json: &[u8]) -> Result<PrDetails> {
             .nodes
             .into_iter()
             .map(|t| {
-                let diff_hunk = t
-                    .comments
-                    .nodes
+                let mut comments = t.comments.nodes;
+                if let Some(original) = t.original.nodes.into_iter().next()
+                    && comments
+                        .first()
+                        .is_none_or(|comment| comment.url != original.url)
+                {
+                    comments.insert(0, original);
+                }
+                let diff_hunk = comments
                     .first()
-                    .map(|c| c.diff_hunk.clone())
+                    .map(|comment| comment.diff_hunk.clone())
                     .unwrap_or_default();
                 ReviewThread {
                     id: t.id,
@@ -739,13 +754,9 @@ fn parse_details(json: &[u8]) -> Result<PrDetails> {
                     line: t.line.or(t.original_line),
                     resolved: t.is_resolved,
                     outdated: t.is_outdated,
+                    permissions: t.permissions,
                     diff_hunk,
-                    comments: t
-                        .comments
-                        .nodes
-                        .into_iter()
-                        .map(RawComment::into_comment)
-                        .collect(),
+                    comments: comments.into_iter().map(RawComment::into_comment).collect(),
                 }
             })
             .collect(),
