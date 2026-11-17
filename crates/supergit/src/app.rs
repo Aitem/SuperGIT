@@ -3,6 +3,7 @@
 
 mod base;
 mod projects;
+mod pulls;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -97,6 +98,7 @@ enum LayoutPanel {
     Changes,
     History,
     CommitFiles,
+    Pulls,
 }
 
 /// A file list beside a diff: the Changes tab's, or the selected commit's.
@@ -173,6 +175,8 @@ pub struct SuperGitApp {
     prs: Vec<PullRequest>,
     prs_error: Option<String>,
     prs_loaded: bool,
+    /// The Pull requests tab: search, scope, details, merging.
+    pulls: pulls::Pulls,
 
     selected: Option<PathBuf>,
     tab: MainTab,
@@ -275,6 +279,7 @@ impl SuperGitApp {
         });
         let changes_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
         let commit_diff = cx.new(|cx| DiffState::new(Vec::<DiffFile>::new(), cx));
+        let pulls = pulls::Pulls::new(window, cx);
 
         let mut persisted = workspace::load();
         if let Some(repo) = &repo {
@@ -337,6 +342,7 @@ impl SuperGitApp {
             prs: Vec::new(),
             prs_error: None,
             prs_loaded: false,
+            pulls,
             selected: None,
             tab: initial_tab(),
             details: Details::default(),
@@ -732,6 +738,7 @@ impl SuperGitApp {
             LayoutPanel::Changes => view.changes_width = width,
             LayoutPanel::History => view.history_width = width,
             LayoutPanel::CommitFiles => view.commit_files_width = width,
+            LayoutPanel::Pulls => view.pulls_width = width,
         }
         view.sanitize();
         self.queue_persist(cx);
@@ -1184,6 +1191,11 @@ impl SuperGitApp {
                 cx.background_executor().timer(POLL_INTERVAL).await;
             }
         }));
+        self.start_pr_polling(cx);
+    }
+
+    /// (Re)start the pull request refresh loop; it fetches right away.
+    fn start_pr_polling(&mut self, cx: &mut Context<Self>) {
         self.prs_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 let Ok(Some(root)) =
@@ -1750,6 +1762,7 @@ impl SuperGitApp {
         self.prs.clear();
         self.prs_error = None;
         self.prs_loaded = false;
+        self.pulls.reset(cx);
         self.selected = None;
         self.reset_details(cx);
     }
@@ -2918,7 +2931,10 @@ impl SuperGitApp {
                 .render_history(main_width, &theme, cx)
                 .into_any_element(),
             MainTab::Sessions => self.render_sessions(&info, &theme, cx).into_any_element(),
-            MainTab::PullRequests => self.render_prs(&info, &theme, cx).into_any_element(),
+            MainTab::PullRequests => {
+                self.ensure_pulls(cx);
+                self.render_pulls(&info, main_width, cx)
+            }
         };
         let _ = window;
 
@@ -4210,81 +4226,6 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    fn render_prs(
-        &self,
-        info: &WorktreeInfo,
-        theme: &gpui_kit::component::Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        if let Some(e) = &self.prs_error {
-            return div()
-                .p_4()
-                .text_color(theme.danger)
-                .child(e.clone())
-                .into_any_element();
-        }
-        let current = info.wt.branch.clone();
-        let mut prs: Vec<&PullRequest> = self.prs.iter().collect();
-        // This worktree's PR first.
-        prs.sort_by_key(|p| Some(p.head_branch.as_str()) != current.as_deref());
-        let rows = prs.into_iter().enumerate().map(|(ix, pr)| {
-            let url = pr.url.clone();
-            let pr_owned = pr.clone();
-            let mine = Some(pr.head_branch.as_str()) == current.as_deref();
-            let has_worktree = self
-                .worktrees
-                .iter()
-                .any(|w| w.wt.branch.as_deref() == Some(pr.head_branch.as_str()));
-            pr_row(ix, pr, mine, theme)
-                .child(
-                    Button::new(("pr-open", ix))
-                        .label("Open")
-                        .small()
-                        .ghost()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let r = launch::open_url(&url);
-                            this.report(r, "Opened in browser", cx);
-                        })),
-                )
-                .when(
-                    matches!(pr.state, PrState::Open | PrState::Draft) && !mine,
-                    |el| {
-                        el.child(
-                            Button::new(("pr-wt", ix))
-                                .label(if has_worktree {
-                                    "Go to worktree"
-                                } else {
-                                    "Worktree"
-                                })
-                                .small()
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.checkout_pr(&pr_owned, cx)
-                                })),
-                        )
-                    },
-                )
-        });
-        v_flex()
-            .id("prs")
-            .size_full()
-            .overflow_y_scroll()
-            .when(self.prs.is_empty(), |el| {
-                el.child(
-                    div()
-                        .p_4()
-                        .text_color(theme.muted_foreground)
-                        .child(if self.prs_loaded {
-                            "No open pull requests"
-                        } else {
-                            "Loading pull requests…"
-                        }),
-                )
-            })
-            .children(rows)
-            .into_any_element()
-    }
-
     fn ensure_chats(&mut self, path: &PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // Every worktree gets a ready-to-type conversation; the agent process
         // only starts with the first message.
@@ -4848,6 +4789,9 @@ impl Render for SuperGitApp {
             })
             .when(self.rebase_dialog.is_some(), |el| {
                 el.child(self.render_rebase_dialog(cx))
+            })
+            .when(self.pulls.dialog_open(), |el| {
+                el.child(self.render_merge_dialog(cx))
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
@@ -5475,74 +5419,6 @@ fn session_row(ix: usize, s: &Session, theme: &gpui_kit::component::Theme) -> St
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(time_ago(s.modified)),
-        )
-}
-
-fn pr_row(
-    ix: usize,
-    pr: &PullRequest,
-    mine: bool,
-    theme: &gpui_kit::component::Theme,
-) -> Stateful<Div> {
-    let review = match pr.review_decision.as_str() {
-        "APPROVED" => Some(("approved", theme.success)),
-        "CHANGES_REQUESTED" => Some(("changes requested", theme.danger)),
-        "REVIEW_REQUIRED" => Some(("review required", theme.muted_foreground)),
-        _ => None,
-    };
-    h_flex()
-        .id(("pr", ix))
-        .px_4()
-        .py_2()
-        .gap_3()
-        .border_b_1()
-        .border_color(theme.border)
-        .when(mine, |el| el.bg(theme.list_active))
-        .child(
-            div()
-                .w(px(56.))
-                .flex_none()
-                .text_xs()
-                .text_color(pr_color(pr.state, theme))
-                .child(pr.state.label()),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_0p5()
-                .child(
-                    div()
-                        .truncate()
-                        .child(format!("#{} {}", pr.number, pr.title)),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{} → {}", pr.head_branch, pr.base_branch))
-                        .child(format!("@{}", pr.author))
-                        .child(
-                            div()
-                                .text_color(theme.success)
-                                .child(format!("+{}", pr.additions)),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme.danger)
-                                .child(format!("−{}", pr.deletions)),
-                        )
-                        .when(pr.checks.total() > 0, |el| {
-                            el.child(format!(
-                                "checks ✓{} ✗{} ●{}",
-                                pr.checks.passed, pr.checks.failed, pr.checks.pending
-                            ))
-                        })
-                        .when_some(review, |el, (label, color)| {
-                            el.child(div().text_color(color).child(label))
-                        }),
-                ),
         )
 }
 

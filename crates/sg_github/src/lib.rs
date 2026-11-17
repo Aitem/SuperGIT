@@ -3,11 +3,51 @@
 //! remote itself.
 #![forbid(unsafe_code)]
 
+mod details;
+
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
+
+pub use details::{
+    AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review,
+    ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_details,
+};
+
+/// Run `gh` in `repo` without prompts or colors; stdout on success, its
+/// stderr as the error otherwise.
+fn gh<I, S>(repo: &Path, args: I) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<S> = args.into_iter().collect();
+    let out = Command::new("gh")
+        .args(&args)
+        .current_dir(repo)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        let command: Vec<_> = args
+            .iter()
+            .take(2)
+            .map(|a| a.as_ref().to_string_lossy())
+            .collect();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        bail!(
+            "gh {}: {}",
+            command.join(" "),
+            if stderr.is_empty() { "failed" } else { stderr }
+        );
+    }
+    Ok(out.stdout)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrState {
@@ -62,6 +102,18 @@ pub struct PullRequest {
     pub updated_at: String,
 }
 
+impl PullRequest {
+    /// Open or draft: it can still change and be merged.
+    pub fn is_open(&self) -> bool {
+        matches!(self.state, PrState::Open | PrState::Draft)
+    }
+
+    /// When it last changed on GitHub.
+    pub fn updated(&self) -> Option<std::time::SystemTime> {
+        parse_timestamp(&self.updated_at)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawPr {
@@ -73,6 +125,7 @@ struct RawPr {
     #[serde(default)]
     head_ref_oid: String,
     head_repository: Option<RawRepository>,
+    head_repository_owner: Option<RawAuthor>,
     base_ref_name: String,
     state: String,
     is_draft: bool,
@@ -90,10 +143,15 @@ struct RawAuthor {
     login: String,
 }
 
+/// `gh pr list` leaves `nameWithOwner` empty; `name` plus
+/// `headRepositoryOwner` say the same.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawRepository {
+    #[serde(default)]
     name_with_owner: String,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -105,7 +163,7 @@ struct RawCheck {
     state: Option<String>,
 }
 
-const FIELDS: &str = "number,title,headRefName,headRefOid,headRepository,baseRefName,state,isDraft,url,author,reviewDecision,statusCheckRollup,additions,deletions,createdAt,mergedAt,updatedAt";
+const FIELDS: &str = "number,title,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,state,isDraft,url,author,reviewDecision,statusCheckRollup,additions,deletions,createdAt,mergedAt,updatedAt";
 
 /// A commit author as GitHub knows them: the email on their commits and
 /// the account it belongs to.
@@ -128,8 +186,10 @@ const AUTHORS_QUERY: &str = "query($owner: String!, $name: String!) {
 /// A single GraphQL call; it reads the repository's history and sends no
 /// emails anywhere.
 pub fn commit_authors(repo: &Path) -> Result<Vec<Author>> {
-    let out = Command::new("gh")
-        .args([
+    let query = format!("query={AUTHORS_QUERY}");
+    let out = gh(
+        repo,
+        [
             "api",
             "graphql",
             "-F",
@@ -137,20 +197,10 @@ pub fn commit_authors(repo: &Path) -> Result<Vec<Author>> {
             "-F",
             "name={repo}",
             "-f",
-        ])
-        .arg(format!("query={AUTHORS_QUERY}"))
-        .current_dir(repo)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .output()?;
-    if !out.status.success() {
-        bail!(
-            "gh api graphql: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    parse_authors(&out.stdout)
+            &query,
+        ],
+    )?;
+    parse_authors(&out)
 }
 
 fn parse_authors(json: &[u8]) -> Result<Vec<Author>> {
@@ -243,22 +293,62 @@ fn gh_pr_list(repo: &Path, state: &str, limit: usize) -> Result<Vec<PullRequest>
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let out = Command::new("gh")
-        .args(["pr", "list", "--state", state, "--limit"])
-        .arg(limit.to_string())
-        .args(["--json", FIELDS])
-        .current_dir(repo)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .output()?;
-    if !out.status.success() {
-        bail!(
-            "gh pr list: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    let limit = limit.to_string();
+    let out = gh(
+        repo,
+        [
+            "pr", "list", "--state", state, "--limit", &limit, "--json", FIELDS,
+        ],
+    )?;
+    parse_prs(&out)
+}
+
+/// Every pull request (any state) whose head is `branch`: the ones a
+/// worktree on that branch produced, beyond the recent ones `list_prs` sees.
+pub fn list_branch_prs(repo: &Path, branch: &str, limit: usize) -> Result<Vec<PullRequest>> {
+    let limit = limit.to_string();
+    let out = gh(
+        repo,
+        [
+            "pr", "list", "--state", "all", "--head", branch, "--limit", &limit, "--json", FIELDS,
+        ],
+    )?;
+    parse_prs(&out)
+}
+
+/// GitHub's search over all pull requests (titles, bodies, `author:x`…),
+/// most recently updated first unless the query sorts itself.
+pub fn search_prs(repo: &Path, query: &str, limit: usize) -> Result<Vec<PullRequest>> {
+    let query = if query.contains("sort:") {
+        query.to_string()
+    } else {
+        format!("{query} sort:updated-desc")
+    };
+    let limit = limit.to_string();
+    let out = gh(
+        repo,
+        [
+            "pr", "list", "--state", "all", "--search", &query, "--limit", &limit, "--json", FIELDS,
+        ],
+    )?;
+    parse_prs(&out)
+}
+
+/// One pull request by number, in the list's shape.
+pub fn view_pr(repo: &Path, number: u64) -> Result<PullRequest> {
+    let number = number.to_string();
+    let out = gh(repo, ["pr", "view", &number, "--json", FIELDS])?;
+    let raw: RawPr = serde_json::from_slice(&out)?;
+    Ok(raw.into())
+}
+
+/// The head branch lives in the PR's own repository, not a fork: only
+/// then can a local branch of the same name be where it came from.
+pub fn head_in_same_repository(pr: &PullRequest) -> bool {
+    match (&pr.head_repository, pull_request_repository(pr)) {
+        (Some(head), Some(repository)) => head.eq_ignore_ascii_case(&repository),
+        _ => false,
     }
-    parse_prs(&out.stdout)
 }
 
 fn parse_prs(json: &[u8]) -> Result<Vec<PullRequest>> {
@@ -299,7 +389,15 @@ impl From<RawPr> for PullRequest {
             title: raw.title,
             head_branch: raw.head_ref_name,
             head_oid: raw.head_ref_oid,
-            head_repository: raw.head_repository.map(|repo| repo.name_with_owner),
+            head_repository: raw.head_repository.and_then(|repo| {
+                if !repo.name_with_owner.is_empty() {
+                    Some(repo.name_with_owner)
+                } else {
+                    let owner = raw.head_repository_owner?.login;
+                    (!owner.is_empty() && !repo.name.is_empty())
+                        .then(|| format!("{owner}/{}", repo.name))
+                }
+            }),
             base_branch: raw.base_ref_name,
             state,
             url: raw.url,
@@ -473,6 +571,31 @@ mod tests {
             "abc",
             now
         ));
+    }
+
+    #[test]
+    fn head_repository_comes_from_owner_and_name() {
+        // What `gh pr list` really returns: `nameWithOwner` is empty.
+        let prs = parse_prs(br#"[
+          {"number":36,"title":"T","headRefName":"x","headRepository":{"id":"R_1","name":"SuperGIT","nameWithOwner":""},
+           "headRepositoryOwner":{"id":"U_1","login":"Aitem"},"baseRefName":"main","state":"MERGED","isDraft":false,
+           "url":"https://github.com/Aitem/SuperGIT/pull/36","updatedAt":"t"},
+          {"number":37,"title":"T","headRefName":"x","headRepository":null,"headRepositoryOwner":null,
+           "baseRefName":"main","state":"CLOSED","isDraft":false,"url":"https://github.com/Aitem/SuperGIT/pull/37","updatedAt":"t"}
+        ]"#).unwrap();
+        assert_eq!(prs[0].head_repository.as_deref(), Some("Aitem/SuperGIT"));
+        assert!(head_in_same_repository(&prs[0]));
+        assert_eq!(prs[1].head_repository, None, "a deleted fork");
+    }
+
+    #[test]
+    fn fork_heads_are_not_local_branches() {
+        let mut pr = parse_prs(br#"[{"number":7,"title":"T","headRefName":"main","headRepository":{"nameWithOwner":"Owner/Repo"},"baseRefName":"main","state":"OPEN","isDraft":false,"url":"https://github.com/owner/repo/pull/7","updatedAt":"t"}]"#).unwrap().remove(0);
+        assert!(head_in_same_repository(&pr));
+        pr.head_repository = Some("someone/repo".into());
+        assert!(!head_in_same_repository(&pr));
+        pr.head_repository = None;
+        assert!(!head_in_same_repository(&pr), "a deleted fork");
     }
 
     #[test]

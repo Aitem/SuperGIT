@@ -27,8 +27,13 @@ Written in Rust on [GPUI](https://github.com/zed-industries/zed/tree/main/crates
 - **Claude tab** — every session that ran in this worktree (found from Claude
   Code's own transcripts, nothing to configure): AI title, last prompt,
   branch, age; **Open** it in the panel or resume it in a **Terminal**.
-- **Pull requests** — open PRs plus recently merged ones, with checks and
-  review state; open in the browser or check one out into a new worktree.
+- **Pull requests** — the selected worktree's PRs (its branch or the branch it
+  pushes to, plus PRs linked by hand) or all of them, searchable (number,
+  title, branch, `@author`; older PRs via GitHub search). A PR shows its
+  description, comments, reviews, inline review threads with their diff, every
+  check with links to its logs, and a merge box: merge / squash / rebase after
+  a confirmation (pinned to the shown head commit) or enable auto-merge.
+  Open in the browser or check one out into a new worktree.
 - **Create / remove worktrees** — new branch → sibling directory
   `<repo>-<branch>`; removal asks for confirmation (twice when dirty).
 - Refreshes every 3 s (PRs every minute); `cmd-r` refreshes now.

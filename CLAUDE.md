@@ -179,7 +179,12 @@ real (unfocused) window — keep them few, the user may be working.
 `SUPERGIT_CHANGES_TREE=1` (screenshot builds) shows the Changes list as a tree;
 `SUPERGIT_DEBUG_REBASE=<branch>` (screenshot builds) opens the Rebase dialog;
 `SUPERGIT_DEBUG_COMMIT=<sha prefix>` (screenshot builds) selects that History
-commit two seconds after startup, like a click.
+commit two seconds after startup, like a click;
+`SUPERGIT_DEBUG_PR=<number>` (screenshot builds, with `SUPERGIT_TAB=prs`)
+selects that pull request, `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its details
+(conversation, review threads) and `SUPERGIT_DEBUG_PR_MERGE=1` opens its merge
+dialog. For rich PR data use a shallow clone of a public repository (e.g.
+`git clone --depth 1 https://github.com/cli/cli /tmp/x`) — never merge there.
 
 Set `SUPERGIT_STATE_DIR=/tmp/supergit-profile` for isolated UI checks. Settings,
 recent repositories and workspace restoration then use that directory instead

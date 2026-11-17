@@ -47,6 +47,11 @@ pub struct WorktreeView {
     pub commit: Option<String>,
     pub changes_position: Option<ReviewPosition>,
     pub commit_position: Option<ReviewPosition>,
+    /// Pull requests linked to this worktree by hand, beyond those whose
+    /// head is its branch.
+    pub linked_prs: Vec<u64>,
+    /// Pull requests unlinked by hand even though their head is its branch.
+    pub unlinked_prs: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -85,6 +90,8 @@ pub struct RepositoryView {
     pub history_width: f32,
     /// File list beside a commit's diff in the History tab.
     pub commit_files_width: f32,
+    /// The pull request list beside a PR's details.
+    pub pulls_width: f32,
     pub chat_open: bool,
     /// The worktree list is expanded; collapsed it is a narrow rail.
     pub sidebar_open: bool,
@@ -117,6 +124,7 @@ impl Default for RepositoryView {
             changes_width: 300.,
             history_width: 300.,
             commit_files_width: 240.,
+            pulls_width: 320.,
             chat_open: true,
             sidebar_open: true,
             changes_tree: false,
@@ -131,6 +139,7 @@ impl RepositoryView {
         self.changes_width = finite(self.changes_width, 300.).clamp(140., 600.);
         self.history_width = finite(self.history_width, 300.).clamp(160., 800.);
         self.commit_files_width = finite(self.commit_files_width, 240.).clamp(140., 600.);
+        self.pulls_width = finite(self.pulls_width, 320.).clamp(200., 640.);
     }
 }
 
