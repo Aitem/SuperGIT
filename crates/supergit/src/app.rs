@@ -7,6 +7,8 @@ mod pulls;
 mod sidebar;
 mod worktrees;
 
+mod clone_repository;
+
 use crate::MOD;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -197,6 +199,8 @@ pub struct SuperGitApp {
     /// `None` shows the welcome screen (e.g. first launch from the Dock).
     repo: Option<Repo>,
     recent: Vec<PathBuf>,
+    clone_repository: Option<clone_repository::CloneForm>,
+    clone_focus: FocusHandle,
     launch_dir: PathBuf,
     terminal: TerminalApp,
     index: SharedSessionIndex,
@@ -382,6 +386,8 @@ impl SuperGitApp {
             switcher: None,
             repo,
             recent: crate::recent::load(),
+            clone_repository: None,
+            clone_focus: cx.focus_handle(),
             launch_dir,
             terminal: TerminalApp::detect(),
             index: Default::default(),
@@ -2539,6 +2545,17 @@ impl SuperGitApp {
                                     this.open_repository(&OpenRepository, window, cx)
                                 })),
                         )
+                        .when(self.repo.is_some(), |el| {
+                            el.child(
+                                Button::new("clone-repo")
+                                    .label("Clone…")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_clone_form(window, cx)
+                                    })),
+                            )
+                        })
                         .when(self.repo.is_some(), |el| {
                             el.child(
                                 Button::new("close-repo")
@@ -4770,14 +4787,24 @@ impl SuperGitApp {
                     "Worktrees, Claude and Codex sessions, commits and pull requests in one place.",
                 ))
                 .child(
-                    h_flex().child(
-                        Button::new("welcome-open")
-                            .label("Open Repository…")
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_repository(&OpenRepository, window, cx)
-                            })),
-                    ),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("welcome-open")
+                                .label("Open Repository…")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_repository(&OpenRepository, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("welcome-clone")
+                                .label("Clone Repository…")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_clone_form(window, cx)
+                                })),
+                        ),
                 )
                 .when(!self.recent.is_empty(), |el| {
                     el.child(
@@ -4864,6 +4891,9 @@ impl Render for SuperGitApp {
                 el.child(self.render_switcher(cx))
             })
             .when(self.settings_open, |el| el.child(self.render_settings(cx)))
+            .when(self.clone_repository.is_some(), |el| {
+                el.child(self.render_clone_form(cx))
+            })
             .when(self.cleanup_preview.is_some(), |el| {
                 el.child(self.render_cleanup_preview(cx))
             })

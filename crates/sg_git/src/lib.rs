@@ -82,6 +82,9 @@ impl Repo {
     }
 }
 
+mod clone_repository;
+pub use clone_repository::{clone_folder_name, clone_repository, clone_suggested_name};
+
 /// Human-friendly relative time ("5m", "3h", "2d") for a unix timestamp.
 pub fn relative_time(unix_secs: i64) -> String {
     let now = std::time::SystemTime::now()
