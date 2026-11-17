@@ -1,10 +1,12 @@
-use sg_github::{CheckAnnotation, CheckInspection};
+use sg_github::{ActionsJob, CheckAnnotation, CheckInspection, JobLog};
 
 use super::*;
 
 pub(super) struct OpenCheck {
     pub(super) id: String,
     details: LoadState<CheckInspection>,
+    log: Option<LoadState<JobLog>>,
+    log_task: Option<Task<()>>,
 }
 
 impl Pulls {
@@ -53,6 +55,8 @@ impl SuperGitApp {
         self.pulls.check_inspection = Some(OpenCheck {
             id: id.clone(),
             details: LoadState::Loading,
+            log: None,
+            log_task: None,
         });
         self.pulls.check_inspection_task = Some(cx.spawn(async move |this, cx| {
             let requested = id.clone();
@@ -94,6 +98,9 @@ impl SuperGitApp {
                 .into_any_element(),
             LoadState::Ready(details) => render_inspection(details, theme),
         };
+        let job = (check.status == CheckStatus::Failed)
+            .then(|| ActionsJob::from_check_url(check.url.as_deref()?))
+            .flatten();
         let id = open.id.clone();
         let copy = open
             .details
@@ -143,6 +150,134 @@ impl SuperGitApp {
                     ),
             )
             .child(content)
+            .when_some(job, |card, job| {
+                card.child(self.render_job_log(open, job, theme, cx))
+            })
+            .into_any_element()
+    }
+
+    fn fetch_failed_log(&mut self, id: &str, job: ActionsJob, cx: &mut Context<Self>) {
+        let Some(root) = self.active_root().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(open) = &mut self.pulls.check_inspection else {
+            return;
+        };
+        if open.id != id || open.log_task.is_some() {
+            return;
+        }
+        if open.log.is_none() {
+            open.log = Some(LoadState::Loading);
+        }
+        let id = id.to_owned();
+        open.log_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    job.failed_log(&root)
+                        .map(|mut log| {
+                            log.text = sg_agents::chat::strip_ansi(&log.text).trim().to_owned();
+                            log
+                        })
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(open) = &mut this.pulls.check_inspection
+                    && open.id == id
+                {
+                    open.log
+                        .get_or_insert_with(LoadState::default)
+                        .update(LoadState::from_result(result));
+                    open.log_task = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn render_job_log(
+        &self,
+        open: &OpenCheck,
+        job: ActionsJob,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = open.id.clone();
+        let log = open.log.as_ref();
+        let shown = log.and_then(LoadState::value);
+        let loading = open.log_task.is_some();
+        let label = if loading {
+            "Loading log…"
+        } else if log.is_some() {
+            "Refresh log"
+        } else {
+            "View failed log"
+        };
+        v_flex()
+            .gap_2()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        Button::new("load-check-log")
+                            .label(label)
+                            .xsmall()
+                            .outline()
+                            .disabled(loading)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.fetch_failed_log(&id, job.clone(), cx)
+                            })),
+                    )
+                    .when_some(shown.filter(|log| !log.text.is_empty()), |row, log| {
+                        let text = log.text.clone();
+                        row.child(
+                            Button::new("copy-check-log")
+                                .label("Copy shown log")
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                                    this.flash("Copied Actions log", false, cx);
+                                })),
+                        )
+                    }),
+            )
+            .when_some(log.and_then(LoadState::error), |card, error| {
+                card.child(div().text_color(theme.danger).child(error.to_owned()))
+            })
+            .when_some(shown, |card, log| {
+                if log.text.is_empty() {
+                    return card.child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child("GitHub returned no failed step logs"),
+                    );
+                }
+                card.when(log.truncated, |card| {
+                    card.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Showing the end of the failed log"),
+                    )
+                })
+                .child(
+                    div()
+                        .id("check-failed-log")
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .p_2()
+                        .rounded_md()
+                        .bg(theme.muted)
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .child(log.text.clone()),
+                )
+            })
             .into_any_element()
     }
 }
