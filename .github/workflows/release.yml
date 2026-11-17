@@ -1,0 +1,109 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/bundle-macos.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-26
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.platform }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             libasound2-dev libfontconfig1-dev libssl-dev libwayland-dev             libx11-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev             libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+      - name: Build and package macOS app
+        if: runner.os == 'macOS'
+        run: |
+          scripts/bundle-macos.sh
+          app=target/release/bundle.noindex/SuperGIT.app
+          codesign --verify --strict "$app"
+          plutil -lint "$app/Contents/Info.plist"
+          "$app/Contents/MacOS/supergit" --help
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/supergit-${PLATFORM}.zip"
+      - name: Build and package Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --release -p supergit
+          target/release/supergit --help
+          mkdir -p dist
+          tar -C target/release -czf "dist/supergit-${PLATFORM}.tar.gz" supergit
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: supergit-${{ matrix.platform }}
+          path: dist/supergit-*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: supergit-*
+          path: dist
+          merge-multiple: true
+      - name: Publish packages and checksums
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a version tag such as v1.2.3 or v1.2.3-rc.1" >&2
+            exit 1
+          fi
+          packages=(
+            supergit-macos-arm64.zip
+            supergit-linux-x86_64.tar.gz
+            supergit-linux-arm64.tar.gz
+          )
+          sha256sum "${packages[@]}" > SHA256SUMS
+          flags=(--verify-tag --generate-notes --title "$TAG")
+          if [[ "$TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" "${flags[@]}" "${packages[@]}" SHA256SUMS
