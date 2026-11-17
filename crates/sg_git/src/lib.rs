@@ -11,6 +11,12 @@ mod cleanup;
 mod comparison;
 pub mod difftastic;
 mod log;
+#[cfg(feature = "git2-probe")]
+mod native_refs;
+#[cfg(feature = "git2-probe")]
+mod native_status;
+#[cfg(feature = "git2-probe")]
+pub use native_status::read_fixture as probe_native_status;
 mod rebase;
 mod runner;
 mod status;
@@ -39,9 +45,32 @@ pub use submodule::{
 };
 pub use worktree::{Worktree, add_worktree, list_worktrees, remove_worktree};
 
+#[cfg(feature = "git2-probe")]
+fn use_git2_probe() -> bool {
+    std::env::var_os("SUPERGIT_GIT_BACKEND").as_deref() == Some(std::ffi::OsStr::new("git2"))
+        && [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_NO_REPLACE_OBJECTS",
+        ]
+        .iter()
+        .all(|key| std::env::var_os(key).is_none())
+}
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
+
+pub use status::polled_status;
 
 /// A repository as SuperGIT sees it: the main worktree plus the shared git dir.
 #[derive(Clone, Debug)]

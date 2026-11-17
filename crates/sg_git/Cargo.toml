@@ -14,6 +14,14 @@ serde_json.workspace = true
 similar = "2.7"
 tempfile = "3"
 libc = "0.2"
+git2 = { version = "=0.21.0", default-features = false, features = ["vendored-libgit2"], optional = true }
+
+[features]
+git2-probe = ["dep:git2"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "measure_status"
+required-features = ["git2-probe"]
