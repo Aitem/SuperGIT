@@ -28,6 +28,8 @@ const SEARCH_DELAY: Duration = Duration::from_millis(400);
 const BRANCH_LIMIT: usize = 50;
 const SEARCH_LIMIT: usize = 50;
 
+mod review_context;
+
 /// What a worktree's own PR list was fetched for.
 #[derive(Clone, PartialEq, Eq)]
 struct FetchKey {
@@ -2359,7 +2361,7 @@ impl SuperGitApp {
                         cx,
                     )
                 }
-                Activity::Thread(thread) => self.render_thread(number, ix, thread, theme, cx),
+                Activity::Thread(thread) => self.render_thread(&details.pr, ix, thread, theme, cx),
             })
             .collect();
         v_flex()
@@ -2397,12 +2399,13 @@ impl SuperGitApp {
 
     fn render_thread(
         &self,
-        number: u64,
+        pr: &PullRequest,
         ix: usize,
         thread: &ReviewThread,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let number = pr.number;
         let expanded = thread.resolved == self.pulls.toggled_threads.contains(&thread.id);
         let id = thread.id.clone();
         let location = match thread.line {
@@ -2488,8 +2491,11 @@ impl SuperGitApp {
             )
             .when(expanded, |el| {
                 el.child(diff_excerpt(&thread.diff_hunk, theme)).child(
-                    v_flex().px_3().py_2().gap_3().children(
-                        thread.comments.iter().enumerate().map(|(cix, comment)| {
+                    v_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_3()
+                        .children(thread.comments.iter().enumerate().map(|(cix, comment)| {
                             comment_body(
                                 SharedString::from(format!("pr-{number}-t{ix}-{cix}")),
                                 comment,
@@ -2497,8 +2503,8 @@ impl SuperGitApp {
                                 None,
                                 theme,
                             )
-                        }),
-                    ),
+                        }))
+                        .child(self.render_review_context_button(pr, ix, thread, cx)),
                 )
             })
             .into_any_element()
