@@ -7,10 +7,11 @@ mod check_inspection;
 mod details;
 
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 pub use check_inspection::{CheckAnnotation, CheckInspection, check_inspection};
@@ -33,14 +34,36 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    gh_with_input(repo, args, None)
+}
+
+fn gh_with_input<I, S>(repo: &Path, args: I, input: Option<&[u8]>) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let args: Vec<S> = args.into_iter().collect();
-    let out = Command::new("gh")
+    let mut command = Command::new("gh");
+    command
         .args(&args)
         .current_dir(repo)
         .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .output()?;
+        .env("NO_COLOR", "1");
+    let (out, written) = if let Some(input) = input {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let written = child
+            .stdin
+            .take()
+            .context("gh stdin is unavailable")?
+            .write_all(input);
+        (child.wait_with_output()?, written)
+    } else {
+        (command.stdin(Stdio::null()).output()?, Ok(()))
+    };
     if !out.status.success() {
         let command: Vec<_> = args
             .iter()
@@ -55,8 +78,13 @@ where
             if stderr.is_empty() { "failed" } else { stderr }
         );
     }
+    written?;
     Ok(out.stdout)
 }
+
+pub use details::review_actions::{
+    ReviewThreadState, ThreadPermissions, reply_to_thread, set_thread_resolved,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrState {

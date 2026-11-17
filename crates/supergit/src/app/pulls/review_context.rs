@@ -45,13 +45,13 @@ impl SuperGitApp {
         self.attach_context(attachment, false, window, cx);
     }
 
-    pub(super) fn render_review_context_button(
+    pub(super) fn review_context_button(
         &self,
         pr: &PullRequest,
         index: usize,
         thread: &ReviewThread,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Button {
         let target = self.review_worktree(pr);
         let tooltip = target.map_or_else(
             || "Select a worktree linked to this PR or check out its branch".to_string(),
@@ -60,21 +60,16 @@ impl SuperGitApp {
         let root = self.active_root().map(Path::to_path_buf);
         let pr = pr.clone();
         let thread = thread.clone();
-        h_flex()
-            .justify_end()
-            .child(
-                Button::new(("pr-thread-ask", index))
-                    .label("Ask agent about thread")
-                    .xsmall()
-                    .outline()
-                    .tooltip(tooltip)
-                    .disabled(target.is_none())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.active_root() == root.as_deref() {
-                            this.attach_review_context(&pr, &thread, window, cx);
-                        }
-                    })),
-            )
-            .into_any_element()
+        Button::new(("pr-thread-ask", index))
+            .label("Ask agent about thread")
+            .xsmall()
+            .outline()
+            .tooltip(tooltip)
+            .disabled(target.is_none())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.active_root() == root.as_deref() {
+                    this.attach_review_context(&pr, &thread, window, cx);
+                }
+            }))
     }
 }

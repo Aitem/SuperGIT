@@ -32,6 +32,7 @@ const SEARCH_DELAY: Duration = Duration::from_millis(400);
 const BRANCH_LIMIT: usize = 50;
 const SEARCH_LIMIT: usize = 50;
 
+mod review_actions;
 mod review_context;
 
 /// What a worktree's own PR list was fetched for.
@@ -103,6 +104,7 @@ pub(super) struct Pulls {
     /// Review threads shown the other way round from their default
     /// (resolved ones start collapsed).
     toggled_threads: HashSet<String>,
+    thread_actions: review_actions::ThreadActions,
     show_passed_checks: bool,
     check_inspection: Option<checks::OpenCheck>,
     check_inspection_task: Option<Task<()>>,
@@ -171,6 +173,7 @@ impl Pulls {
             commits: HashMap::new(),
             commits_task: None,
             toggled_threads: HashSet::new(),
+            thread_actions: review_actions::ThreadActions::default(),
             show_passed_checks: false,
             check_inspection: None,
             check_inspection_task: None,
@@ -2707,7 +2710,7 @@ impl SuperGitApp {
                                 theme,
                             )
                         }))
-                        .child(self.render_review_context_button(pr, ix, thread, cx)),
+                        .child(self.render_thread_actions(pr, ix, thread, cx)),
                 )
             })
             .into_any_element()
