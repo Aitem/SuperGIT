@@ -13,8 +13,8 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 
 pub use details::{
-    AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review,
-    ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_details,
+    AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrCommit, PrDetails, Review,
+    ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_commits, pr_details,
 };
 
 /// Run `gh` in `repo` without prompts or colors; stdout on success, its
