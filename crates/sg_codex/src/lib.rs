@@ -19,6 +19,7 @@ use std::path::PathBuf;
 pub mod conversation;
 pub mod install;
 pub mod process;
+mod questions;
 pub mod sessions;
 pub mod tools;
 
