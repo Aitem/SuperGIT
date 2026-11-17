@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::text::TextView;
+use sg_git::difftastic::Source;
 use sg_github::{
     Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review, ReviewState,
     ReviewThread,
@@ -21,6 +22,8 @@ use super::*;
 const OPEN_DETAILS_REFRESH: Duration = Duration::from_secs(20);
 const CLOSED_DETAILS_REFRESH: Duration = Duration::from_secs(300);
 const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
+/// A failed diff is retried this often while its tab is open.
+const PATCH_RETRY: Duration = Duration::from_secs(60);
 const SEARCH_DELAY: Duration = Duration::from_millis(400);
 const BRANCH_LIMIT: usize = 50;
 const SEARCH_LIMIT: usize = 50;
@@ -41,6 +44,25 @@ struct Fetched {
 struct Loaded {
     at: Instant,
     details: LoadState<PrDetails>,
+}
+
+/// A PR's patch, taken at `head`: a push makes it stale.
+pub(super) struct Patch {
+    head: String,
+    at: Instant,
+    /// GitHub refused (too large, offline): computed from local commits.
+    local: bool,
+    /// Where the changes start, when the commits are local (difftastic
+    /// reads both sides from them).
+    merge_base: Option<String>,
+    patch: LoadState<String>,
+}
+
+/// The details column's two views, as on GitHub.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailsTab {
+    Conversation,
+    Files,
 }
 
 struct MergeDialog {
@@ -74,14 +96,32 @@ pub(super) struct Pulls {
     /// The details column; back to the top when another PR is shown.
     details_scroll: ScrollHandle,
     shown: Option<u64>,
+    tab: DetailsTab,
+    /// The Files tab: patches by PR, the diff view and its file list.
+    patches: HashMap<u64, Patch>,
+    patch_task: Option<(u64, Task<()>)>,
+    pub(super) diff: Entity<DiffState>,
+    /// The same diff through difftastic, while it is on.
+    pub(super) difft: Entity<DifftView>,
+    /// The `(number, head)` whose patch `diff` holds.
+    diff_shown: Option<(u64, String)>,
+    pub(super) files_filter: Entity<InputState>,
+    pub(super) files_collapsed: HashSet<String>,
+    files_layout: Entity<ResizableState>,
+    /// A review thread's file and line to show once the diff is ready.
+    pending_jump: Option<(u64, String, Option<u64>)>,
     merge: Option<MergeDialog>,
     merge_task: Option<Task<()>>,
     merge_handle: FocusHandle,
-    _search_subscription: Subscription,
+    _subscriptions: [Subscription; 2],
 }
 
 impl Pulls {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<SuperGitApp>) -> Self {
+    pub(super) fn new(
+        window: &mut Window,
+        layout: DiffLayout,
+        cx: &mut Context<SuperGitApp>,
+    ) -> Self {
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search: #number, title, branch, @author")
         });
@@ -94,6 +134,12 @@ impl Pulls {
                 }
             },
         );
+        let files_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
+        let filter_subscription = cx.subscribe(&files_filter, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         Self {
             search,
             layout: cx.new(|_| ResizableState::default()),
@@ -109,10 +155,28 @@ impl Pulls {
             show_passed_checks: false,
             details_scroll: ScrollHandle::new(),
             shown: None,
+            // Screenshot builds: `SUPERGIT_DEBUG_PR_FILES=1` starts on Files
+            // (a background window only renders for the screenshot itself).
+            tab: if cfg!(feature = "screenshot")
+                && std::env::var_os("SUPERGIT_DEBUG_PR_FILES").is_some()
+            {
+                DetailsTab::Files
+            } else {
+                DetailsTab::Conversation
+            },
+            patches: HashMap::new(),
+            patch_task: None,
+            diff: new_diff_state(layout, cx),
+            difft: cx.new(|_| DifftView::new(diff_mode(layout))),
+            diff_shown: None,
+            files_filter,
+            files_collapsed: HashSet::new(),
+            files_layout: cx.new(|_| ResizableState::default()),
+            pending_jump: None,
             merge: None,
             merge_task: None,
             merge_handle: cx.focus_handle(),
-            _search_subscription: subscription,
+            _subscriptions: [subscription, filter_subscription],
         }
     }
 
@@ -130,6 +194,15 @@ impl Pulls {
         self.details_task = None;
         self.toggled_threads.clear();
         self.merge = None;
+        self.patches.clear();
+        self.patch_task = None;
+        self.diff_shown = None;
+        self.diff
+            .update(cx, |diff, cx| diff.set_files(Vec::new(), cx));
+        self.difft.update(cx, |view, cx| view.clear(cx));
+        self.files_collapsed.clear();
+        self.files_layout = cx.new(|_| ResizableState::default());
+        self.pending_jump = None;
     }
 
     pub(super) fn dialog_open(&self) -> bool {
@@ -507,12 +580,215 @@ impl SuperGitApp {
             self.pulls.details_scroll.set_offset(point(px(0.), px(0.)));
         }
         if let Some(number) = selected {
-            let open = visible
-                .iter()
-                .find(|pr| pr.number == number)
-                .is_some_and(PullRequest::is_open);
-            self.ensure_pr_details(root, number, open, cx);
+            let listed = visible.iter().find(|pr| pr.number == number);
+            let open = listed.is_some_and(PullRequest::is_open);
+            self.ensure_pr_details(root.clone(), number, open, cx);
+            // The details carry the freshest head (a push changes the diff)
+            // and the base commit the diff starts from: wait for them,
+            // unless they failed.
+            let loaded = self.pulls.details.get(&number);
+            let target = match loaded.and_then(|l| l.details.value()) {
+                Some(details) => Some((details.pr.clone(), details.base_oid.clone())),
+                None if loaded.is_some_and(|l| l.details.error().is_some()) => {
+                    listed.map(|pr| (pr.clone(), String::new()))
+                }
+                None => None,
+            };
+            if self.pulls.tab == DetailsTab::Files
+                && let Some((pr, base_oid)) = target
+            {
+                self.ensure_pr_patch(root, &pr, base_oid, cx);
+            }
+            self.show_pr_diff(number, cx);
         }
+    }
+
+    fn ensure_pr_patch(
+        &mut self,
+        root: PathBuf,
+        pr: &PullRequest,
+        base_oid: String,
+        cx: &mut Context<Self>,
+    ) {
+        let number = pr.number;
+        let due = match self.pulls.patches.get(&number) {
+            None => true,
+            Some(p) => {
+                p.head != pr.head_oid || (p.patch.error().is_some() && p.at.elapsed() > PATCH_RETRY)
+            }
+        };
+        let running = self
+            .pulls
+            .patch_task
+            .as_ref()
+            .is_some_and(|(n, _)| *n == number);
+        if !due || running {
+            return;
+        }
+        let head = pr.head_oid.clone();
+        let base = pr.base_branch.clone();
+        let request = (root.clone(), head.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let (result, merge_base) = cx
+                .background_executor()
+                .spawn(async move {
+                    let (root, head) = request;
+                    // The PR's diff is its head against this merge base:
+                    // the local repository often has both commits.
+                    let merge_base = sg_git::pr_merge_base(&root, &base_oid, &base, &head);
+                    let result = match sg_github::pr_diff(&root, number) {
+                        Ok(patch) => Ok((patch, false)),
+                        Err(remote) => match &merge_base {
+                            Ok(from) => sg_git::range_patch(&root, from, &head)
+                                .map(|patch| (patch, true))
+                                .map_err(|local| format!("{remote:#}\nLocal diff: {local:#}")),
+                            Err(local) => Err(format!("{remote:#}\nLocal diff: {local:#}")),
+                        },
+                    };
+                    (result, merge_base.ok())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.active_root() != Some(root.as_path()) {
+                    return;
+                }
+                if this
+                    .pulls
+                    .patch_task
+                    .as_ref()
+                    .is_some_and(|(n, _)| *n == number)
+                {
+                    this.pulls.patch_task = None;
+                }
+                let previous = this
+                    .pulls
+                    .patches
+                    .remove(&number)
+                    .filter(|p| p.head == head);
+                let local = match (&result, &previous) {
+                    (Ok((_, local)), _) => *local,
+                    (Err(_), Some(previous)) => previous.local,
+                    (Err(_), None) => false,
+                };
+                let mut patch = previous.map(|p| p.patch).unwrap_or_default();
+                patch.update(LoadState::from_result(result.map(|(patch, _)| patch)));
+                this.pulls.patches.insert(
+                    number,
+                    Patch {
+                        head,
+                        at: Instant::now(),
+                        local,
+                        merge_base,
+                        patch,
+                    },
+                );
+                this.show_pr_diff(number, cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.pulls.patch_task = Some((number, task));
+    }
+
+    /// Put PR `number`'s patch into the diff view (once per head), then
+    /// scroll to a review thread's line if one was asked for.
+    fn show_pr_diff(&mut self, number: u64, cx: &mut Context<Self>) {
+        if self.pulls.shown != Some(number) {
+            return;
+        }
+        let Some(entry) = self.pulls.patches.get_mut(&number) else {
+            return;
+        };
+        let key = (number, entry.head.clone());
+        if self.pulls.diff_shown.as_ref() != Some(&key) {
+            let Some(patch) = entry.patch.value() else {
+                return;
+            };
+            match crate::syntax::parse_patch(patch) {
+                Ok(files) => {
+                    self.pulls
+                        .diff
+                        .update(cx, |diff, cx| diff.set_files(files, cx));
+                    self.pulls.files_collapsed.clear();
+                }
+                Err(error) => {
+                    entry.patch = LoadState::Failed {
+                        error: format!("Cannot display the diff: {error}"),
+                        previous: None,
+                    };
+                    self.pulls
+                        .diff
+                        .update(cx, |diff, cx| diff.set_files(Vec::new(), cx));
+                }
+            }
+            self.pulls.diff_shown = Some(key);
+            self.refresh_difft(FileList::Pull, cx);
+        }
+        if let Some((_, path, line)) = self.pulls.pending_jump.take_if(|(n, _, _)| *n == number) {
+            self.pulls
+                .difft
+                .update(cx, |view, cx| view.scroll_to_file(&path, cx));
+            self.pulls.diff.update(cx, |diff, cx| match line {
+                Some(line) => diff.scroll_to_line(
+                    DiffLinePosition::new(path, DiffSide::Modified, line as usize),
+                    cx,
+                ),
+                None => diff.scroll_to_file(&path, cx),
+            });
+        }
+    }
+
+    /// What difftastic compares for the shown PR diff: its patch and both
+    /// sides as local commits, when they are here.
+    pub(super) fn pr_difft_parts(&self) -> Option<(&String, Source, Source)> {
+        let (number, head) = self.pulls.diff_shown.as_ref()?;
+        let entry = self
+            .pulls
+            .patches
+            .get(number)
+            .filter(|entry| entry.head == *head)?;
+        let from = entry.merge_base.clone()?;
+        Some((
+            entry.patch.value()?,
+            Source::Revision(from),
+            Source::Revision(head.clone()),
+        ))
+    }
+
+    /// Difftastic is on but cannot show this PR: its commits are not local.
+    pub(super) fn pr_difft_unavailable(&self) -> bool {
+        self.difftastic_active() && self.pr_difft_parts().is_none()
+    }
+
+    /// The Files tab's diff as agent context: the PR and the head it shows.
+    pub(super) fn pr_diff_context(
+        &self,
+    ) -> anyhow::Result<(&Entity<DiffState>, &LoadState<String>, String)> {
+        let (number, head) = self
+            .pulls
+            .diff_shown
+            .as_ref()
+            .filter(|_| self.pulls.tab == DetailsTab::Files)
+            .ok_or_else(|| anyhow::anyhow!("Open the pull request's Files tab first"))?;
+        let entry = self
+            .pulls
+            .patches
+            .get(number)
+            .filter(|entry| entry.head == *head)
+            .ok_or_else(|| anyhow::anyhow!("Wait for the pull request's diff"))?;
+        Ok((
+            &self.pulls.diff,
+            &entry.patch,
+            format!(
+                "Pull request #{number} at {}{}",
+                &head[..head.len().min(8)],
+                if entry.local {
+                    " (computed locally)"
+                } else {
+                    ""
+                }
+            ),
+        ))
     }
 
     fn fetch_worktree_prs(
@@ -708,6 +984,19 @@ impl SuperGitApp {
                 });
                 loaded.at = Instant::now();
                 loaded.details.update(LoadState::from_result(result));
+                // The Files tab waits for the head and base commit: start
+                // its diff now rather than at the next frame.
+                if this.pulls.tab == DetailsTab::Files
+                    && this.pulls.shown == Some(number)
+                    && let Some(details) = this
+                        .pulls
+                        .details
+                        .get(&number)
+                        .and_then(|l| l.details.value())
+                {
+                    let (pr, base_oid) = (details.pr.clone(), details.base_oid.clone());
+                    this.ensure_pr_patch(root.clone(), &pr, base_oid, cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -797,6 +1086,38 @@ impl SuperGitApp {
             false,
             cx,
         );
+    }
+
+    fn set_details_tab(&mut self, tab: DetailsTab, cx: &mut Context<Self>) {
+        self.pulls.tab = tab;
+        cx.notify();
+    }
+
+    /// From a review thread to its line in the Files tab.
+    fn jump_to_thread(
+        &mut self,
+        number: u64,
+        path: String,
+        line: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pulls.pending_jump = Some((number, path, line));
+        self.pulls.tab = DetailsTab::Files;
+        self.show_pr_diff(number, cx);
+        cx.notify();
+    }
+
+    fn retry_pr_patch(&mut self, number: u64, cx: &mut Context<Self>) {
+        self.pulls.patches.remove(&number);
+        if self
+            .pulls
+            .diff_shown
+            .as_ref()
+            .is_some_and(|(n, _)| *n == number)
+        {
+            self.pulls.diff_shown = None;
+        }
+        cx.notify();
     }
 
     fn toggle_thread(&mut self, id: String, cx: &mut Context<Self>) {
@@ -951,8 +1272,9 @@ impl SuperGitApp {
 
     /// Screenshot builds: `SUPERGIT_DEBUG_PR=<number>` selects that PR (in
     /// "All" when it is not the worktree's); `SUPERGIT_DEBUG_PR_MERGE=1`
-    /// then opens its merge dialog once the details are loaded, and
-    /// `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its details.
+    /// then opens its merge dialog once the details are loaded,
+    /// `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its conversation and
+    /// `SUPERGIT_DEBUG_PR_FILES=1` opens its Files tab.
     #[cfg(feature = "screenshot")]
     fn debug_pr_once(&mut self, info: &WorktreeInfo, cx: &mut Context<Self>) {
         let Some(number) = std::env::var("SUPERGIT_DEBUG_PR")
@@ -1033,9 +1355,18 @@ impl SuperGitApp {
         let visible = self.visible_prs(info, cx);
         let selected = self.selected_pr_number(info.path(), &visible);
         let list_max = (width - 320.).clamp(200., 640.);
+        let list_width = self
+            .pulls
+            .layout
+            .read(cx)
+            .sizes()
+            .first()
+            .map(|w| w.as_f32())
+            .unwrap_or(self.repository_view().pulls_width)
+            .min(list_max);
         let list = self.render_pr_list(info, &visible, selected, &theme, cx);
         let details = match selected.and_then(|n| visible.iter().find(|pr| pr.number == n)) {
-            Some(pr) => self.render_pr_details(info, pr, &theme, cx),
+            Some(pr) => self.render_pr_details(info, pr, width - list_width, &theme, cx),
             None => div()
                 .size_full()
                 .flex()
@@ -1277,6 +1608,7 @@ impl SuperGitApp {
         &self,
         info: &WorktreeInfo,
         listed: &PullRequest,
+        width: f32,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1295,42 +1627,243 @@ impl SuperGitApp {
                 cx,
             )
         });
-        let content = v_flex()
-            .id("pr-details")
-            // Out of the flow: long code lines in a body must not widen the
-            // panel (their min-content would), they are clipped instead.
-            .absolute()
-            .inset_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.pulls.details_scroll)
-            .child(self.render_pr_header(info, pr, details, theme, cx))
-            .children(error)
-            .when(
-                details.is_none() && loaded.is_none_or(|l| l.details.is_loading()),
-                |el| {
-                    el.child(
-                        div()
-                            .px_4()
-                            .py_3()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Loading conversation and checks…"),
-                    )
-                },
-            )
-            .when_some(details, |el, details| {
-                el.child(self.render_merge_box(details, theme, cx))
-                    .children(self.render_checks(details, theme, cx))
-                    .child(render_description(details, theme))
-                    .child(self.render_activity(details, theme, cx))
-            });
+        let tab = self.pulls.tab;
+        let conversation = details.map(|d| activity(d).len() as u64);
+        let files = details.map(|d| d.changed_files).or_else(|| {
+            self.pulls
+                .diff_shown
+                .as_ref()
+                .filter(|(n, _)| *n == pr.number)
+                .map(|_| self.pulls.diff.read(cx).files().len() as u64)
+        });
+        let count = |label: &str, n: Option<u64>| match n {
+            Some(n) => format!("{label} · {n}"),
+            None => label.to_string(),
+        };
+        let tabs = TabBar::new("pr-tabs")
+            .underline()
+            .px_2()
+            .selected_index(match tab {
+                DetailsTab::Conversation => 0,
+                DetailsTab::Files => 1,
+            })
+            .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                this.set_details_tab(
+                    if *ix == 0 {
+                        DetailsTab::Conversation
+                    } else {
+                        DetailsTab::Files
+                    },
+                    cx,
+                )
+            }))
+            .child(Tab::new().label(count("Conversation", conversation)))
+            .child(Tab::new().label(count("Files changed", files)));
+        let body = match tab {
+            DetailsTab::Conversation => div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    v_flex()
+                        .id("pr-conversation")
+                        // Out of the flow: long code lines in a body must not
+                        // widen the panel (their min-content would).
+                        .absolute()
+                        .inset_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.pulls.details_scroll)
+                        .when(
+                            details.is_none() && loaded.is_none_or(|l| l.details.is_loading()),
+                            |el| {
+                                el.child(
+                                    div()
+                                        .px_4()
+                                        .py_3()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Loading conversation and checks…"),
+                                )
+                            },
+                        )
+                        .when_some(details, |el, details| {
+                            el.child(self.render_merge_box(details, theme, cx))
+                                .children(self.render_checks(details, theme, cx))
+                                .child(render_description(details, theme))
+                                .child(self.render_activity(details, theme, cx))
+                        }),
+                )
+                .into_any_element(),
+            DetailsTab::Files => div()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_pr_files(pr, width, theme, cx))
+                .into_any_element(),
+        };
+        // The whole column is out of the flow too, for the same reason.
         div()
             .relative()
             .size_full()
-            .child(content)
+            .child(
+                v_flex()
+                    .absolute()
+                    .inset_0()
+                    .child(self.render_pr_header(info, pr, details, theme, cx))
+                    .children(error)
+                    .child(tabs)
+                    .child(body),
+            )
             .into_any_element()
     }
 
+    /// The Files tab: the PR's files beside its diff, like a commit in
+    /// History. `width` is the details column's.
+    fn render_pr_files(
+        &self,
+        pr: &PullRequest,
+        width: f32,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let number = pr.number;
+        let muted = |text: &str| {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(text.to_string())
+                .into_any_element()
+        };
+        let Some(entry) = self.pulls.patches.get(&number) else {
+            return muted("Loading the diff…");
+        };
+        let shown = self
+            .pulls
+            .diff_shown
+            .as_ref()
+            .is_some_and(|(n, head)| *n == number && *head == entry.head);
+        let url = pr.url.clone();
+        let notice = entry.patch.error().map(|error| {
+            v_flex()
+                .flex_none()
+                .p_3()
+                .gap_2()
+                .text_sm()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                    if entry.patch.value().is_some() {
+                        "The diff may be out of date — showing the last successful one"
+                    } else {
+                        "Diff unavailable"
+                    },
+                ))
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(error.to_string()),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("pr-diff-retry")
+                                .label("Retry")
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.retry_pr_patch(number, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("pr-diff-web")
+                                .label("Open files on GitHub")
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let r = launch::open_url(&format!("{url}/files"));
+                                    this.report(r, "Opened in browser", cx);
+                                })),
+                        ),
+                )
+        });
+        let local = entry.local.then(|| {
+            div()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .text_color(theme.warning)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(format!(
+                    "GitHub did not return this diff; computed locally: {} against its merge base with {}",
+                    &entry.head[..entry.head.len().min(8)],
+                    pr.base_branch
+                ))
+        });
+        let no_difft = (shown && self.pr_difft_unavailable()).then(|| {
+            div()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(format!(
+                    "Difftastic needs the PR's commits locally (fetch {}); showing the line diff",
+                    pr.head_branch
+                ))
+        });
+        let content = match entry.patch.value() {
+            None if entry.patch.is_loading() => muted("Loading the diff…"),
+            None => div().into_any_element(),
+            Some(patch) if patch.trim().is_empty() => muted("No changes"),
+            Some(_) if !shown => muted("Loading the diff…"),
+            Some(_) => {
+                let files: Vec<FileChange> = self
+                    .pulls
+                    .diff
+                    .read(cx)
+                    .files()
+                    .iter()
+                    .map(commit_file)
+                    .collect();
+                let list_max = (width - 180.).clamp(140., 600.);
+                h_resizable("pr-files-layout")
+                    .with_state(&self.pulls.files_layout)
+                    .on_resize(cx.listener(|this, state, _, cx| {
+                        this.remember_layout(LayoutPanel::CommitFiles, state, cx)
+                    }))
+                    .child(
+                        resizable_panel()
+                            .size(px(self.repository_view().commit_files_width.min(list_max)))
+                            .size_range(px(140.)..px(list_max))
+                            .fixed()
+                            .child(self.render_file_list(FileList::Pull, &files, theme, cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(px(180.)..Pixels::MAX)
+                            .child(elastic(self.render_review_diff(FileList::Pull, cx))),
+                    )
+                    .into_any_element()
+            }
+        };
+        v_flex()
+            .size_full()
+            .border_t_1()
+            .border_color(theme.border)
+            .children(notice)
+            .children(local)
+            .children(no_difft)
+            .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
     fn render_pr_header(
         &self,
         info: &WorktreeInfo,
@@ -1905,6 +2438,19 @@ impl SuperGitApp {
                         el.child(tag("outdated", theme.warning))
                     })
                     .child(div().flex_1())
+                    .child({
+                        let path = thread.path.clone();
+                        // An outdated line may be gone: show the file then.
+                        let line = thread.line.filter(|_| !thread.outdated);
+                        Button::new(("pr-thread-diff", ix))
+                            .label("View in diff")
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.jump_to_thread(number, path.clone(), line, cx)
+                            }))
+                    })
                     .when(!expanded, |el| {
                         el.child(
                             div()

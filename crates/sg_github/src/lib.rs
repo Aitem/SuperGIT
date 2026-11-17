@@ -334,6 +334,14 @@ pub fn search_prs(repo: &Path, query: &str, limit: usize) -> Result<Vec<PullRequ
     parse_prs(&out)
 }
 
+/// The pull request's changes as a unified Git patch. GitHub refuses very
+/// large ones (over 20 000 lines or 300 files).
+pub fn pr_diff(repo: &Path, number: u64) -> Result<String> {
+    let number = number.to_string();
+    let out = gh(repo, ["pr", "diff", &number, "--color=never"])?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// One pull request by number, in the list's shape.
 pub fn view_pr(repo: &Path, number: u64) -> Result<PullRequest> {
     let number = number.to_string();
