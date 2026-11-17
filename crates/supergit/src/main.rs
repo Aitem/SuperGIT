@@ -18,6 +18,7 @@ mod recent;
 mod screenshot;
 mod settings;
 mod shell_env;
+mod submodules;
 mod switcher;
 mod syntax;
 mod workspace;

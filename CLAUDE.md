@@ -9,7 +9,8 @@ for the author and colleagues: macOS only, GitHub only (via `gh`).
 ```
 crates/
   sg_git/      git core: worktrees, status, log, diffs (git CLI, porcelain -z);
-               difftastic.rs runs the optional `difft` and aligns its JSON
+               difftastic.rs runs the optional `difft` and aligns its JSON;
+               submodule.rs inlines changed submodules' own diffs
   sg_github/   pull requests through the `gh` CLI
   sg_agents/   provider-neutral agent layer: `Provider`, chat model
                (chat.rs: Conversation/Item/PermissionRequest), `AgentProcess`
@@ -23,7 +24,8 @@ crates/
   supergit/    the app (GPUI): main.rs, app.rs (view), model.rs (background
                loading), launch.rs (terminals/editor/browser), dump.rs,
                screenshot.rs (feature `screenshot`), difft_view.rs (the
-               difftastic diff view), syntax.rs (syntect highlight names)
+               difftastic diff view), syntax.rs (syntect highlight names),
+               submodules.rs (submodule rows and diff cards)
 docs/ROADMAP.md
 ```
 
@@ -235,3 +237,14 @@ never commit, push or create worktrees there without asking.
   sides itself and lines them up. Screenshot checks: write
   `{"diff_layout":"split","difftastic":true}` to
   `$SUPERGIT_STATE_DIR/settings.json`.
+- **Submodules**: every patch is `git diff` with `PATCH_OPTIONS`
+  (`--submodule=short`, explicit `a/` `b/` prefixes — user config must not
+  change the format), then `sg_git::inline_submodules` finds the
+  `Subproject commit` entries and inserts each submodule's own diff after
+  its entry (paths under the submodule, untracked files of its checkout
+  included), plus a `SubmoduleChange` (commits between the recorded commits,
+  why nothing is inlined: not checked out, commits missing). The app keeps
+  those per list (`Details.submodules`, `commit_submodules`, PR patches) for
+  the file-list rows, the cards under submodule headers and difftastic,
+  which reads a submodule's files from its checkout. Tests:
+  `cargo test -p sg_git --test submodules`.

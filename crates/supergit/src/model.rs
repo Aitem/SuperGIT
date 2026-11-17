@@ -184,6 +184,8 @@ pub struct Details {
     pub files: LoadState<Vec<sg_git::FileChange>>,
     pub status: LoadState<WorktreeStatus>,
     pub patch: LoadState<String>,
+    /// The submodules `patch` changes, their own diffs inlined in it.
+    pub submodules: Vec<sg_git::SubmoduleChange>,
     pub commits: LoadState<Vec<Commit>>,
     /// Commits since the branch forked from the base branch; `None` on the
     /// base branch itself or when there is none.
@@ -200,6 +202,10 @@ impl Details {
         self.files.update(next.files);
         self.merge_base = next.merge_base;
         self.suggested_base = next.suggested_base;
+        // They describe the patch: keep them with the last one that loaded.
+        if next.patch.value().is_some() {
+            self.submodules = next.submodules;
+        }
         self.patch.update(next.patch);
         self.commits.update(next.commits);
         self.fork = next.fork;
@@ -217,6 +223,7 @@ pub fn load_details(
         .map(|status| status.files.clone())
         .map_err(Clone::clone);
     let mut merge_base = None;
+    let mut submodules = Vec::new();
     let patch = match &status {
         Ok(st) if base.is_some() => {
             match sg_git::branch_changes(path, st, base.as_deref().unwrap_or_default())
@@ -225,6 +232,7 @@ pub fn load_details(
                 Ok(changes) => {
                     files = Ok(changes.files);
                     merge_base = Some(changes.merge_base);
+                    submodules = changes.submodules;
                     Ok(changes.patch)
                 }
                 Err(error) => {
@@ -233,7 +241,18 @@ pub fn load_details(
                 }
             }
         }
-        Ok(st) if !st.is_clean() => sg_git::worktree_patch(path, st).map_err(git_error_message),
+        Ok(st) if !st.is_clean() => match sg_git::worktree_patch(path, st) {
+            Ok(patch) => {
+                // Each changed submodule's files follow its entry.
+                files = Ok(sg_git::with_submodule_files(
+                    st.files.clone(),
+                    &patch.submodules,
+                ));
+                submodules = patch.submodules;
+                Ok(patch.text)
+            }
+            Err(error) => Err(git_error_message(error)),
+        },
         Ok(_) => Ok(String::new()),
         Err(error) => Err(error.clone()),
     };
@@ -246,6 +265,7 @@ pub fn load_details(
         files: LoadState::from_result(files),
         status: LoadState::from_result(status),
         patch: LoadState::from_result(patch),
+        submodules,
         commits: LoadState::from_result(commits),
         fork: sg_git::fork(path).ok().flatten(),
     }

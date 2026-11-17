@@ -22,6 +22,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::runner::git_bytes_with_input;
+use crate::submodule::{SubmoduleChange, submodule_of};
 
 /// Files beyond this many are listed but not compared.
 pub const MAX_FILES: usize = 300;
@@ -77,6 +78,8 @@ pub struct FileRequest {
     pub added: bool,
     /// Removed by the change: there is no new side to read.
     pub deleted: bool,
+    /// A submodule's recorded commit: nothing to compare as text.
+    pub submodule: bool,
 }
 
 impl FileRequest {
@@ -125,6 +128,8 @@ pub enum Outcome {
     TooLarge,
     /// Beyond [`MAX_FILES`].
     Skipped,
+    /// A submodule's recorded commit.
+    Submodule,
     Failed(String),
 }
 
@@ -209,23 +214,80 @@ impl StructuralFile {
 }
 
 /// Reads both sides of `files`: `old` and `new` say where each side lives.
+///
+/// Files inside one of `submodules` are read from its checkout, at its two
+/// recorded commits (or its working tree when `new` is the worktree).
 pub fn read_pairs(
     worktree: &Path,
     old: &Source,
     new: &Source,
     files: &[FileRequest],
+    submodules: &[SubmoduleChange],
 ) -> Result<Vec<FilePair>> {
     let files = &files[..files.len().min(MAX_FILES)];
-    let old_specs: Vec<Option<String>> = files
+    let mut old_contents = vec![Content::Absent; files.len()];
+    let mut new_contents = vec![Content::Absent; files.len()];
+    // The superproject's files first, then each submodule's.
+    let owners: Vec<Option<&SubmoduleChange>> = files
         .iter()
-        .map(|file| (!file.added).then(|| file.old_path().to_string()))
+        .map(|file| submodule_of(submodules, &file.path))
         .collect();
-    let new_specs: Vec<Option<String>> = files
-        .iter()
-        .map(|file| (!file.deleted).then(|| file.path.clone()))
-        .collect();
-    let old_contents = read_side(worktree, old, &old_specs)?;
-    let new_contents = read_side(worktree, new, &new_specs)?;
+    let mut groups: Vec<Option<&SubmoduleChange>> = vec![None];
+    for owner in owners.iter().flatten() {
+        if !groups
+            .iter()
+            .flatten()
+            .any(|group| group.path == owner.path)
+        {
+            groups.push(Some(owner));
+        }
+    }
+    for group in groups {
+        let members: Vec<usize> = (0..files.len())
+            .filter(|&ix| owners[ix].map(|o| &o.path) == group.map(|g| &g.path))
+            .filter(|&ix| !files[ix].submodule)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let (repo, old, new, prefix) = match group {
+            None => (
+                worktree.to_path_buf(),
+                Some(old.clone()),
+                Some(new.clone()),
+                0,
+            ),
+            Some(submodule) => (
+                worktree.join(&submodule.path),
+                submodule.old.clone().map(Source::Revision),
+                match new {
+                    Source::WorkTree => Some(Source::WorkTree),
+                    Source::Revision(_) => submodule.new.clone().map(Source::Revision),
+                },
+                submodule.path.len() + 1,
+            ),
+        };
+        let inner = |path: &str| path.get(prefix..).unwrap_or(path).to_string();
+        let old_specs: Vec<Option<String>> = members
+            .iter()
+            .map(|&ix| (!files[ix].added).then(|| inner(files[ix].old_path())))
+            .collect();
+        let new_specs: Vec<Option<String>> = members
+            .iter()
+            .map(|&ix| (!files[ix].deleted).then(|| inner(&files[ix].path)))
+            .collect();
+        for (side, source, specs) in [
+            (&mut old_contents, old, old_specs),
+            (&mut new_contents, new, new_specs),
+        ] {
+            let Some(source) = source else {
+                continue;
+            };
+            for (&ix, content) in members.iter().zip(read_side(&repo, &source, &specs)?) {
+                side[ix] = content;
+            }
+        }
+    }
     Ok(files
         .iter()
         .zip(old_contents.into_iter().zip(new_contents))
@@ -376,6 +438,9 @@ pub fn skipped(request: &FileRequest) -> StructuralFile {
 /// Compares one pair with difftastic.
 pub fn compare(pair: &FilePair) -> StructuralFile {
     let request = &pair.request;
+    if request.submodule {
+        return StructuralFile::empty(request, Outcome::Submodule);
+    }
     let bytes = |content: &Content| match content {
         Content::Bytes(bytes) => Some(bytes.clone()),
         _ => None,
@@ -843,6 +908,7 @@ mod tests {
             old_path: None,
             added: false,
             deleted: false,
+            submodule: false,
         }
     }
 

@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::status::PATCH_OPTIONS;
+use crate::submodule::{Patch, inline_submodules};
 use crate::{GitError, git};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -380,21 +382,13 @@ fn nearest_branch(path: &Path, current: Option<&str>, base: &str) -> Option<Fork
 }
 
 /// The patch introduced by a commit (against its first parent).
-pub fn commit_patch(path: &Path, sha: &str) -> Result<String> {
-    git(
-        path,
-        [
-            "show",
-            "--format=",
-            "--patch",
-            "-M",
-            "--no-color",
-            "--no-ext-diff",
-            "--first-parent",
-            sha,
-            "--",
-        ],
-    )
+/// The commit's changes against its first parent, with changed submodules
+/// inlined from their checkouts in `path`.
+pub fn commit_patch(path: &Path, sha: &str) -> Result<Patch> {
+    let mut args = vec!["show", "--format=", "--patch", "--first-parent"];
+    args.extend(PATCH_OPTIONS);
+    args.extend([sha, "--"]);
+    Ok(inline_submodules(path, &git(path, args)?, None))
 }
 
 #[cfg(test)]

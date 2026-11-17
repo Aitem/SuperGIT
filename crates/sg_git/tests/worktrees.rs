@@ -89,7 +89,7 @@ fn worktree_lifecycle() {
     assert_eq!(st.files.len(), 2);
     assert_eq!(st.untracked_count(), 1);
 
-    let patch = sg_git::worktree_patch(&wt_path, &st).unwrap();
+    let patch = sg_git::worktree_patch(&wt_path, &st).unwrap().text;
     assert!(patch.contains("+two"), "{patch}");
     assert!(patch.contains("+++ b/new.txt"), "{patch}");
     assert!(patch.contains("+fresh"), "{patch}");
@@ -116,7 +116,7 @@ fn worktree_lifecycle() {
     assert_eq!(log[0].subject, "work");
     assert!(log[0].by_agent);
     assert!(!log[1].by_agent);
-    let commit_patch = sg_git::commit_patch(&wt_path, &log[0].sha).unwrap();
+    let commit_patch = sg_git::commit_patch(&wt_path, &log[0].sha).unwrap().text;
     assert!(commit_patch.contains("new.txt"));
 
     // Removing a dirty worktree needs force; a clean one does not.
@@ -152,7 +152,7 @@ fn existing_branch_checkout_and_unborn_repo() {
     let st = sg_git::status(&empty).unwrap();
     assert!(st.is_unborn());
     assert_eq!(sg_git::log(&empty, &["HEAD"], 10).unwrap().len(), 0);
-    let patch = sg_git::worktree_patch(&empty, &st).unwrap();
+    let patch = sg_git::worktree_patch(&empty, &st).unwrap().text;
     assert!(patch.contains("+hi"));
     assert_eq!(FileState::Untracked, st.files[0].state());
 }
@@ -191,6 +191,7 @@ fn branch_comparison_keeps_committed_and_new_work_against_merge_base() {
     assert!(
         !sg_git::worktree_patch(&t.root(), &status)
             .unwrap()
+            .text
             .contains("committed work")
     );
     t.git(&["checkout", "--detach", "-q"]);
@@ -279,7 +280,7 @@ fn untracked_symlinks_show_targets_without_reading_them() {
     symlink("..", t.root().join("directory-link")).unwrap();
 
     let st = sg_git::status(&t.root()).unwrap();
-    let patch = sg_git::worktree_patch(&t.root(), &st).unwrap();
+    let patch = sg_git::worktree_patch(&t.root(), &st).unwrap().text;
     assert!(!patch.contains("external file contents"), "{patch}");
     for (name, target) in [
         ("link", "../outside.txt"),

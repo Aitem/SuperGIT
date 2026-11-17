@@ -1,7 +1,8 @@
 //! The Changes tab's file list: filtering by path and the folder-tree view.
 //! Folders come before files, and a chain of folders that only hold one
 //! folder each is compacted into a single row (`crates/app/src`), the way
-//! code editors show them.
+//! code editors show them. A changed path that also holds changed files —
+//! a submodule with its own changes — is one folder row carrying the entry.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -17,6 +18,8 @@ pub enum TreeRow {
         collapsed: bool,
         /// Changed files anywhere below.
         files: usize,
+        /// The change to this path itself (a submodule), by index.
+        entry: Option<usize>,
     },
     File {
         /// Index of the file in the list given to [`rows`].
@@ -39,11 +42,30 @@ pub fn matches(path: &str, query: &str) -> bool {
 struct Node {
     dirs: BTreeMap<String, Node>,
     files: Vec<(String, usize)>,
+    /// A file at this folder's own path.
+    entry: Option<usize>,
 }
 
 impl Node {
+    /// Changed paths below, not counting the folder's own entry.
     fn file_count(&self) -> usize {
-        self.files.len() + self.dirs.values().map(Node::file_count).sum::<usize>()
+        self.files.len()
+            + self
+                .dirs
+                .values()
+                .map(|dir| dir.file_count() + usize::from(dir.entry.is_some()))
+                .sum::<usize>()
+    }
+
+    /// Moves files named like a sibling folder into that folder's entry.
+    fn fold_entries(&mut self) {
+        for (name, ix) in std::mem::take(&mut self.files) {
+            match self.dirs.get_mut(&name) {
+                Some(dir) if dir.entry.is_none() => dir.entry = Some(ix),
+                _ => self.files.push((name, ix)),
+            }
+        }
+        self.dirs.values_mut().for_each(Node::fold_entries);
     }
 }
 
@@ -65,6 +87,7 @@ pub fn rows<'a>(
         }
         node.files.push((name.to_string(), ix));
     }
+    root.fold_entries();
     let mut out = Vec::new();
     push_rows(&root, "", 0, collapsed, &mut out);
     out
@@ -82,7 +105,7 @@ fn push_rows(
     for (name, mut dir) in dirs {
         let mut name = name.clone();
         // A folder holding nothing but one folder joins it: `a/b`.
-        while dir.files.is_empty() && dir.dirs.len() == 1 {
+        while dir.files.is_empty() && dir.dirs.len() == 1 && dir.entry.is_none() {
             let Some((sub, inner)) = dir.dirs.iter().next() else {
                 break;
             };
@@ -101,6 +124,7 @@ fn push_rows(
             depth,
             collapsed: is_collapsed,
             files: dir.file_count(),
+            entry: dir.entry,
         });
         if !is_collapsed {
             push_rows(dir, &path, depth + 1, collapsed, out);
@@ -126,6 +150,7 @@ mod tests {
             depth,
             collapsed,
             files,
+            entry: None,
         }
     }
 
@@ -190,6 +215,38 @@ mod tests {
                 file(4, "lib.rs", 2),
                 file(1, "README.md", 0),
             ]
+        );
+    }
+
+    #[test]
+    fn a_submodule_with_changed_files_is_one_folder_row() {
+        let paths = [
+            (0, "vendor/lib"),
+            (1, "vendor/lib/src/a.rs"),
+            (2, "vendor/lib/b.rs"),
+            (3, "main.rs"),
+        ];
+        assert_eq!(
+            rows(paths, &HashSet::new()),
+            vec![
+                TreeRow::Dir {
+                    path: "vendor/lib".into(),
+                    name: "vendor/lib".into(),
+                    depth: 0,
+                    collapsed: false,
+                    files: 2,
+                    entry: Some(0),
+                },
+                dir("vendor/lib/src", "src", 1, false, 1),
+                file(1, "a.rs", 2),
+                file(2, "b.rs", 1),
+                file(3, "main.rs", 0),
+            ]
+        );
+        // Without files inside, it stays a file.
+        assert_eq!(
+            rows([(0, "vendor/lib")], &HashSet::new()),
+            vec![dir("vendor", "vendor", 0, false, 1), file(0, "lib", 1)]
         );
     }
 

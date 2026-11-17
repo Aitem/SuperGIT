@@ -57,7 +57,7 @@ fn a_pull_request_diff_is_its_head_against_the_merge_base() {
 
     let from = pr_merge_base(root, &moved, "trunk", &head).unwrap();
     assert_eq!(from, fork);
-    let patch = range_patch(root, &from, &head).unwrap();
+    let patch = range_patch(root, &from, &head).unwrap().text;
     assert!(patch.contains("+++ b/feature.txt"));
     assert!(patch.contains("+новое"));
     assert!(!patch.contains("shared.txt"), "{patch}");

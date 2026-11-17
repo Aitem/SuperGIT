@@ -56,6 +56,8 @@ pub(super) struct Patch {
     /// reads both sides from them).
     merge_base: Option<String>,
     patch: LoadState<String>,
+    /// The submodules the patch moves, inlined from local checkouts.
+    submodules: Vec<sg_git::SubmoduleChange>,
 }
 
 /// The details column's two views, as on GitHub.
@@ -637,7 +639,7 @@ impl SuperGitApp {
                     // the local repository often has both commits.
                     let merge_base = sg_git::pr_merge_base(&root, &base_oid, &base, &head);
                     let result = match sg_github::pr_diff(&root, number) {
-                        Ok(patch) => Ok((patch, false)),
+                        Ok(patch) => Ok((sg_git::inline_submodules(&root, &patch, None), false)),
                         Err(remote) => match &merge_base {
                             Ok(from) => sg_git::range_patch(&root, from, &head)
                                 .map(|patch| (patch, true))
@@ -670,8 +672,13 @@ impl SuperGitApp {
                     (Err(_), Some(previous)) => previous.local,
                     (Err(_), None) => false,
                 };
-                let mut patch = previous.map(|p| p.patch).unwrap_or_default();
-                patch.update(LoadState::from_result(result.map(|(patch, _)| patch)));
+                let (mut patch, mut submodules) = previous
+                    .map(|p| (p.patch, p.submodules))
+                    .unwrap_or_default();
+                if let Ok((loaded, _)) = &result {
+                    submodules = loaded.submodules.clone();
+                }
+                patch.update(LoadState::from_result(result.map(|(patch, _)| patch.text)));
                 this.pulls.patches.insert(
                     number,
                     Patch {
@@ -680,6 +687,7 @@ impl SuperGitApp {
                         local,
                         merge_base,
                         patch,
+                        submodules,
                     },
                 );
                 this.show_pr_diff(number, cx);
@@ -753,6 +761,20 @@ impl SuperGitApp {
             Source::Revision(from),
             Source::Revision(head.clone()),
         ))
+    }
+
+    /// The submodules the shown PR diff moves.
+    pub(super) fn pr_submodules(&self) -> &[sg_git::SubmoduleChange] {
+        self.pulls
+            .diff_shown
+            .as_ref()
+            .and_then(|(number, head)| {
+                self.pulls
+                    .patches
+                    .get(number)
+                    .filter(|entry| entry.head == *head)
+            })
+            .map_or(&[], |entry| entry.submodules.as_slice())
     }
 
     /// Difftastic is on but cannot show this PR: its commits are not local.
