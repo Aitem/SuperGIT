@@ -1,5 +1,5 @@
 //! Recently opened repositories, so a Dock/Finder launch reopens the last one.
-//! Stored in `~/Library/Application Support/SuperGIT/recent.json`.
+//! Stored in `recent.json` under `settings::support_dir()`.
 
 use std::path::{Path, PathBuf};
 

@@ -67,9 +67,17 @@ fn candidates() -> Vec<PathBuf> {
     if let Some(home) = crate::codex_home() {
         out.push(home.join("packages/standalone/current/bin/codex"));
     }
-    out.push("/Applications/Codex.app/Contents/Resources/codex".into());
-    out.push("/opt/homebrew/bin/codex".into());
+    if cfg!(target_os = "macos") {
+        out.push("/Applications/Codex.app/Contents/Resources/codex".into());
+        out.push("/opt/homebrew/bin/codex".into());
+    } else if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        // User-level installs a desktop launcher's PATH may lack.
+        out.push(home.join(".local/bin/codex"));
+        out.push(home.join(".npm-global/bin/codex"));
+        out.push(home.join(".bun/bin/codex"));
+    }
     out.push("/usr/local/bin/codex".into());
+    out.push("/usr/bin/codex".into());
     let mut seen = std::collections::HashSet::new();
     out.retain(|p| seen.insert(p.clone()));
     out

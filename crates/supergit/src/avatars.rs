@@ -4,7 +4,7 @@
 //! emails name their account outright, the rest come from one `gh` GraphQL
 //! call over the default branch's history (no emails are sent anywhere).
 //! Images are downloaded with `curl` into `~/Library/Caches/SuperGIT/avatars`
-//! and refreshed weekly; a stale copy is kept when the network fails.
+//! (`~/.cache/supergit/avatars` on Linux) and refreshed weekly; a stale copy is kept when the network fails.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -17,8 +17,11 @@ pub type Avatars = HashMap<String, PathBuf>;
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
 fn cache_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Caches/SuperGIT/avatars"))
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")?;
+        return Some(PathBuf::from(home).join("Library/Caches/SuperGIT/avatars"));
+    }
+    Some(crate::settings::xdg_dir("XDG_CACHE_HOME", ".cache")?.join("supergit/avatars"))
 }
 
 /// Avatars for every author in the repository's history. Blocking: run it

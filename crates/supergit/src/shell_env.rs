@@ -1,7 +1,8 @@
 //! Apps started from Finder, the Dock or Spotlight get launchd's minimal
 //! environment (`PATH=/usr/bin:/bin:/usr/sbin:/sbin`), so `gh`, `claude` and
-//! Homebrew's git would not be found. Like Zed and VS Code, take the user's
-//! login-shell environment at startup instead.
+//! Homebrew's git would not be found. Linux desktop launchers likewise skip
+//! the shell rc files where `~/.local/bin`, nvm, cargo… join `PATH`. Like Zed
+//! and VS Code, take the user's login-shell environment at startup instead.
 
 use std::io::Read as _;
 use std::process::{Command, Stdio};
@@ -42,7 +43,12 @@ pub fn import_if_needed() {
 }
 
 fn login_shell_env() -> Option<Vec<(String, String)>> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let fallback = if cfg!(target_os = "macos") {
+        "/bin/zsh"
+    } else {
+        "/bin/sh"
+    };
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| fallback.into());
     // -l: profile files, -i: rc files (where most PATH tweaks live).
     let script = format!("printf '%s\\0' {MARKER}; /usr/bin/env -0");
     let mut child = Command::new(&shell)

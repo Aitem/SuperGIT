@@ -18,6 +18,7 @@ mod recent;
 mod screenshot;
 mod settings;
 mod shell_env;
+mod single_instance;
 mod submodules;
 mod switcher;
 mod syntax;
@@ -28,9 +29,30 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use gpui_kit::component::TitleBar;
+use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::*;
 
 actions!(supergit, [Quit]);
+
+/// A keystroke with the primary modifier, as a `'static` keymap string:
+/// `shortcut!("shift-b")` is `cmd-shift-b` on macOS, `ctrl-shift-b` elsewhere.
+/// (`KeyBinding::new` cannot resolve gpui's `secondary-`.)
+macro_rules! shortcut {
+    ($keys:literal) => {
+        if cfg!(target_os = "macos") {
+            concat!("cmd-", $keys)
+        } else {
+            concat!("ctrl-", $keys)
+        }
+    };
+}
+
+/// The primary shortcut modifier as `shortcut!` spells it, for tooltips.
+pub(crate) const MOD: &str = if cfg!(target_os = "macos") {
+    "cmd"
+} else {
+    "ctrl"
+};
 
 const USAGE: &str = "\
 SuperGIT — Git GUI for agent-driven development
@@ -41,8 +63,13 @@ USAGE:
     supergit --dump [PATH]   print worktrees, agent sessions and PRs as text
 
 ENV:
-    SUPERGIT_TERMINAL   ghostty | iterm | terminal (default: first installed)
+    SUPERGIT_TERMINAL   macOS: ghostty | iterm | terminal; Linux: ghostty | kitty |
+                        wezterm | alacritty | konsole | gnome-terminal | ptyxis |
+                        xfce4-terminal | foot | xterm (default: $TERMINAL, the
+                        desktop's own, then the first installed)
     SUPERGIT_EDITOR     editor CLI for \"Editor\" (default: VS Code)
+    SUPERGIT_NEW_INSTANCE  Linux: start a separate instance instead of handing
+                        the folder to the running one
 ";
 
 fn main() -> Result<()> {
@@ -87,16 +114,35 @@ fn main() -> Result<()> {
         let repo = repo.context("not inside a git repository")?;
         return dump::run(&repo);
     }
+    // Screenshot runs are throwaway windows: never hand off to, or act as,
+    // the user's instance.
+    let headless = std::env::var_os("SUPERGIT_SCREENSHOT").is_some();
+    let listener = if headless {
+        None
+    } else {
+        // A launcher click (no repository here) only raises the window.
+        match single_instance::claim(repo.is_some().then_some(launch_dir.as_path())) {
+            single_instance::Role::Forwarded => return Ok(()),
+            single_instance::Role::Primary(listener) => listener,
+        }
+    };
     if let Some(repo) = &repo {
         recent::remember(&repo.root);
     }
 
     let app = gpui_kit::application().with_assets(icons::AppAssets);
-    // Folders dropped on the Dock icon or `open -a SuperGIT <dir>`.
-    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+    // Folders dropped on the Dock icon or `open -a SuperGIT <dir>`; on Linux
+    // later launches (`supergit <dir>`, "Open with"). `None` only raises.
+    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Option<PathBuf>>();
+    if let Some(listener) = listener {
+        let open_tx = open_tx.clone();
+        single_instance::serve(listener, move |folder| {
+            let _ = open_tx.unbounded_send(folder);
+        });
+    }
     app.on_open_urls(move |urls| {
         for path in urls.iter().filter_map(|u| launch::file_url_to_path(u)) {
-            let _ = open_tx.unbounded_send(path);
+            let _ = open_tx.unbounded_send(Some(path));
         }
     });
 
@@ -106,16 +152,16 @@ fn main() -> Result<()> {
         let mut notifications = notifications::init(cx);
 
         cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-r", app::Refresh, None),
-            KeyBinding::new("cmd-o", app::OpenRepository, None),
-            KeyBinding::new("cmd-shift-o", app::CloseRepository, None),
-            KeyBinding::new("cmd-l", app::ToggleClaude, None),
-            KeyBinding::new("cmd-b", app::ToggleSidebar, None),
-            KeyBinding::new("cmd-n", app::NewClaudeChat, None),
-            KeyBinding::new("cmd-p", app::OpenSwitcher, None),
-            KeyBinding::new("cmd-,", app::OpenSettings, None),
-            KeyBinding::new("cmd-shift-a", app::AskAgent, None),
+            KeyBinding::new(shortcut!("q"), Quit, None),
+            KeyBinding::new(shortcut!("r"), app::Refresh, None),
+            KeyBinding::new(shortcut!("o"), app::OpenRepository, None),
+            KeyBinding::new(shortcut!("shift-o"), app::CloseRepository, None),
+            KeyBinding::new(shortcut!("l"), app::ToggleClaude, None),
+            KeyBinding::new(shortcut!("b"), app::ToggleSidebar, None),
+            KeyBinding::new(shortcut!("n"), app::NewClaudeChat, None),
+            KeyBinding::new(shortcut!("p"), app::OpenSwitcher, None),
+            KeyBinding::new(shortcut!(","), app::OpenSettings, None),
+            KeyBinding::new(shortcut!("shift-a"), app::AskAgent, None),
             KeyBinding::new("up", app::SwitcherPrevious, Some("Switcher")),
             KeyBinding::new("down", app::SwitcherNext, Some("Switcher")),
             KeyBinding::new("escape", app::CloseSwitcher, Some("Switcher")),
@@ -151,7 +197,6 @@ fn main() -> Result<()> {
             }
         }
         // Screenshot runs must not steal focus (or keystrokes) from the user.
-        let headless = std::env::var_os("SUPERGIT_SCREENSHOT").is_some();
         let options = WindowOptions {
             focus: !headless,
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -159,6 +204,9 @@ fn main() -> Result<()> {
                 px(1100_f32.min(bounds.size.width.as_f32())),
                 px(600_f32.min(bounds.size.height.as_f32())),
             )),
+            // Wayland app id / X11 class: matches `supergit.desktop`
+            // (scripts/install-linux.sh) for the taskbar icon.
+            app_id: Some("supergit".into()),
             ..TitleBar::window_options()
         };
         let (_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
@@ -184,6 +232,8 @@ fn main() -> Result<()> {
         cx.spawn(async move |cx| {
             while let Some(target) = notifications.next().await {
                 let _ = cx.update_window(_handle, |_, window, cx| {
+                    // macOS brings the app forward on click; elsewhere we must.
+                    window.activate_window();
                     notification_view
                         .update(cx, |app, cx| app.open_notification(target, window, cx))
                         .ok();
@@ -194,6 +244,8 @@ fn main() -> Result<()> {
         let view = view.downgrade();
         cx.spawn(async move |cx| {
             while let Some(path) = open_rx.next().await {
+                let _ = cx.update_window(_handle, |_, window, _| window.activate_window());
+                let Some(path) = path else { continue };
                 if view.update(cx, |app, cx| app.open_path(path, cx)).is_err() {
                     break;
                 }
@@ -210,13 +262,27 @@ fn main() -> Result<()> {
 /// The menu bar. Rebuilt when a checkmark changes (appearance).
 pub(crate) fn set_app_menus(cx: &mut App) {
     cx.set_menus([
-        Menu::new("SuperGIT").items([
-            MenuItem::action("Settings…", app::OpenSettings),
-            MenuItem::separator(),
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
-            MenuItem::separator(),
-            MenuItem::action("Quit SuperGIT", Quit),
-        ]),
+        Menu::new("SuperGIT").items(
+            [
+                MenuItem::action("Settings…", app::OpenSettings),
+                MenuItem::separator(),
+            ]
+            .into_iter()
+            // Only macOS has a Services menu.
+            .chain(
+                cfg!(target_os = "macos")
+                    .then(|| {
+                        [
+                            MenuItem::os_submenu("Services", SystemMenuType::Services),
+                            MenuItem::separator(),
+                        ]
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
+            .chain([MenuItem::action("Quit SuperGIT", Quit)])
+            .collect::<Vec<_>>(),
+        ),
         Menu::new("File").items([
             MenuItem::action("Open Repository as Project…", app::OpenRepository),
             MenuItem::action("Recent Repositories", app::CloseRepository),
@@ -247,4 +313,40 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::action("Update Worktree Base", app::UpdateBase),
         ]),
     ]);
+    // Linux and Windows have no global menu bar: the window draws the same
+    // menus itself (`menu_bar`).
+    if !cfg!(target_os = "macos") {
+        let menus = cx.get_menus().unwrap_or_default();
+        gpui_kit::base::GlobalState::global_mut(cx).set_app_menus(menus);
+        if let Some(bar) = cx.try_global::<MenuBar>().map(|bar| bar.0.clone()) {
+            bar.update(cx, |bar, cx| bar.reload(cx));
+        }
+    }
+}
+
+struct MenuBar(Entity<AppMenuBar>);
+impl Global for MenuBar {}
+
+/// The in-window menu bar where the platform has no global one.
+pub(crate) fn menu_bar(cx: &mut App) -> Option<Entity<AppMenuBar>> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    if let Some(bar) = cx.try_global::<MenuBar>() {
+        return Some(bar.0.clone());
+    }
+    let bar = AppMenuBar::new(cx);
+    cx.set_global(MenuBar(bar.clone()));
+    Some(bar)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shortcuts_parse_on_this_platform() {
+        for keys in [shortcut!("q"), shortcut!("shift-b")] {
+            gpui_kit::Keystroke::parse(keys).expect(keys);
+        }
+        assert!(!shortcut!("q").contains("secondary"));
+    }
 }

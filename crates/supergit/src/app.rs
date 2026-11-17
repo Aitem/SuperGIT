@@ -7,6 +7,7 @@ mod pulls;
 mod sidebar;
 mod worktrees;
 
+use crate::MOD;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -1219,7 +1220,11 @@ impl SuperGitApp {
                             .label(if enabled {"On"} else {"Off"}).small().ghost()
                             .on_click(cx.listener(move |this,_,_,cx| this.toggle_notification(approval,cx))))))
                 .child(div().text_sm().text_color(theme.muted_foreground).child(
-                    "Only exact events from native conversations are notified. The visible conversation stays quiet. If macOS blocks alerts, enable SuperGIT in System Settings → Notifications."))
+                    if cfg!(target_os = "macos") {
+                        "Only exact events from native conversations are notified. The visible conversation stays quiet. If macOS blocks alerts, enable SuperGIT in System Settings → Notifications."
+                    } else {
+                        "Only exact events from native conversations are notified. The visible conversation stays quiet. Alerts go to your desktop's notification server; Do Not Disturb hides them."
+                    }))
                 .child(self.render_diff_settings(cx))
                 .child(self.render_cleanup_settings(cx)))
             .into_any_element()
@@ -2458,6 +2463,7 @@ impl SuperGitApp {
     // ---- rendering -------------------------------------------------------
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu_bar = crate::menu_bar(cx);
         let indicators =
             [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
                 .into_iter()
@@ -2496,6 +2502,7 @@ impl SuperGitApp {
                 .child(
                     h_flex()
                         .gap_2()
+                        .when_some(menu_bar, |el, bar| el.child(div().h_full().child(bar)))
                         .child(div().font_weight(FontWeight::BOLD).child("SuperGIT"))
                         .when_some(self.repo.as_ref().map(Repo::name), |el, name| {
                             el.child(
@@ -2514,7 +2521,9 @@ impl SuperGitApp {
                                 .label("Switch…")
                                 .small()
                                 .ghost()
-                                .tooltip("Switch worktree, conversation or project (cmd-p)")
+                                .tooltip(format!(
+                                    "Switch worktree, conversation or project ({MOD}-p)"
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_switcher(&OpenSwitcher, window, cx)
                                 })),
@@ -2525,7 +2534,7 @@ impl SuperGitApp {
                                 .label("Open…")
                                 .ghost()
                                 .small()
-                                .tooltip("Open a repository as a project (cmd-o)")
+                                .tooltip(format!("Open a repository as a project ({MOD}-o)"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_repository(&OpenRepository, window, cx)
                                 })),
@@ -2536,7 +2545,9 @@ impl SuperGitApp {
                                     .label("Recent")
                                     .ghost()
                                     .small()
-                                    .tooltip("Switch to a recent repository (cmd-shift-o)")
+                                    .tooltip(format!(
+                                        "Switch to a recent repository ({MOD}-shift-o)"
+                                    ))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_repository(&CloseRepository, window, cx)
                                     })),
@@ -2569,7 +2580,7 @@ impl SuperGitApp {
                                 .label("Refresh")
                                 .ghost()
                                 .small()
-                                .tooltip("Refresh now (cmd-r)")
+                                .tooltip(format!("Refresh now ({MOD}-r)"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.refresh(&Refresh, window, cx)
                                 })),
@@ -2766,7 +2777,7 @@ impl SuperGitApp {
                             })
                             .small()
                             .primary()
-                            .tooltip("New conversation in this worktree (cmd-n); pick the agent before the first message")
+                            .tooltip(format!("New conversation in this worktree ({MOD}-n); pick the agent before the first message"))
                             .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
                     )
                     .when_some(last_session, |el, session| {
@@ -2807,14 +2818,14 @@ impl SuperGitApp {
                     )
                     .child(
                         Button::new("finder")
-                            .label("Finder")
+                            .label(launch::FILE_MANAGER)
                             .small()
                             .ghost()
                             .on_click(cx.listener({
                                 let path = path.clone();
                                 move |this, _, _, cx| {
                                     let r = launch::reveal_in_finder(&path);
-                                    this.report(r, "Opened in Finder", cx);
+                                    this.report(r, &format!("Opened in {}", launch::FILE_MANAGER), cx);
                                 }
                             })),
                     )
@@ -3558,7 +3569,7 @@ impl SuperGitApp {
                 .label("Ask agent")
                 .xsmall()
                 .ghost()
-                .tooltip("Attach selected lines or a file (cmd-shift-a)")
+                .tooltip(format!("Attach selected lines or a file ({MOD}-shift-a)"))
                 .on_click(cx.listener(|this, _, window, cx| this.ask_agent(&AskAgent, window, cx))),
         );
         v_flex().w_full().border_b_1().border_color(theme.border).child(bar)
@@ -4436,7 +4447,7 @@ impl SuperGitApp {
                         .icon(IconName::PanelRightOpen)
                         .xsmall()
                         .ghost()
-                        .tooltip("Expand the agent panel (cmd-l)")
+                        .tooltip(format!("Expand the agent panel ({MOD}-l)"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_claude(&ToggleClaude, window, cx)
                         })),
@@ -4455,7 +4466,7 @@ impl SuperGitApp {
                                 .label("+")
                                 .xsmall()
                                 .ghost()
-                                .tooltip("New conversation (cmd-n)")
+                                .tooltip(format!("New conversation ({MOD}-n)"))
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
                                 ),
@@ -4587,7 +4598,7 @@ impl SuperGitApp {
                             .label("+")
                             .xsmall()
                             .ghost()
-                            .tooltip("New conversation (cmd-n)")
+                            .tooltip(format!("New conversation ({MOD}-n)"))
                             .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
                     )
                     .child(
@@ -4595,7 +4606,7 @@ impl SuperGitApp {
                             .icon(IconName::PanelRightClose)
                             .xsmall()
                             .ghost()
-                            .tooltip("Collapse the agent panel (cmd-l)")
+                            .tooltip(format!("Collapse the agent panel ({MOD}-l)"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_claude(&ToggleClaude, window, cx)
                             })),
