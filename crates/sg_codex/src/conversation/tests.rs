@@ -410,3 +410,51 @@ fn rebuilds_history_from_turns() {
             .contains("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n")
     );
 }
+
+#[test]
+fn live_plan_updates_one_card_per_turn_and_ignores_stale_events() {
+    use sg_agents::chat::PlanStepStatus;
+
+    let mut c = Conversation::new();
+    c.session_id = Some(THREAD.into());
+    let mut fold = CodexFold::new();
+    let start = |id| json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":id}}});
+    let update = |thread, turn, status| {
+        json!({
+            "method":"turn/plan/updated",
+            "params":{
+                "threadId":thread, "turnId":turn, "explanation":"Check the cache boundary first",
+                "plan":[{"step":"Add regression test","status":status}, {"step":"Run checks","status":"pending"}]
+            }
+        })
+    };
+    fold.apply(&mut c, &start(TURN));
+    fold.apply(&mut c, &update(THREAD, TURN, "inProgress"));
+    fold.apply(&mut c, &update(THREAD, TURN, "completed"));
+    fold.apply(&mut c, &update("unrelated-thread", TURN, "pending"));
+    fold.apply(&mut c, &update(THREAD, "old-turn", "pending"));
+    let [Item::Plan(plan)] = c.items.as_slice() else {
+        panic!("expected a single plan card");
+    };
+    assert_eq!(plan.steps[0].status, PlanStepStatus::Completed);
+    assert_eq!(
+        plan.explanation.as_deref(),
+        Some("Check the cache boundary first")
+    );
+    assert!(!plan.finished);
+    fold.apply(&mut c, &json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":TURN,"status":"completed"}}}));
+    fold.apply(&mut c, &update(THREAD, TURN, "pending"));
+    assert!(
+        matches!(&c.items[0], Item::Plan(plan) if plan.finished && plan.steps[0].status == PlanStepStatus::Completed)
+    );
+
+    fold.apply(&mut c, &start("next-turn"));
+    fold.apply(&mut c, &update(THREAD, "next-turn", "inProgress"));
+    assert!(matches!(c.items.last(), Some(Item::Plan(plan)) if !plan.finished));
+    c.on_exit(None, "Codex");
+    assert!(
+        c.items
+            .iter()
+            .all(|item| !matches!(item, Item::Plan(plan) if !plan.finished))
+    );
+}

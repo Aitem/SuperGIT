@@ -33,6 +33,8 @@ use sg_codex::{CodexFold, CodexProcess, Policy};
 
 mod questions;
 
+mod turn_plan;
+
 /// Max lines of tool output shown when a tool row is expanded.
 const OUTPUT_LINES: usize = 40;
 
@@ -981,6 +983,7 @@ impl ChatSession {
             Item::Tool(tool) => self.render_tool(ix, &tool, &theme, cx).into_any_element(),
             Item::Permission(p) => self.render_permission(&p, &theme, cx).into_any_element(),
             Item::UserInput(request) => self.render_user_input(&request, window, cx),
+            Item::Plan(plan) => turn_plan::render(&plan, &theme),
             Item::Notice { text, is_error } => div()
                 .text_xs()
                 .text_color(if is_error {
