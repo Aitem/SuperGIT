@@ -37,6 +37,7 @@ mod questions;
 
 mod collaboration;
 mod turn_plan;
+mod usage;
 
 /// Max lines of tool output shown when a tool row is expanded.
 const OUTPUT_LINES: usize = 40;
@@ -1519,22 +1520,27 @@ impl Render for ChatSession {
             )),
         };
         let cost = self.convo.total_cost_usd.map(|c| format!("${c:.2}"));
+        let usage = self.render_codex_usage(cx);
         v_flex()
             .size_full()
-            .when(cost.is_some() || status.is_some(), |chat| {
-                chat.child(
-                    h_flex()
-                        .px_4()
-                        .py_1()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(div().flex_1().children(cost))
-                        .when_some(status, |el, (label, color)| {
-                            el.child(div().text_color(color).child(label))
-                        }),
-                )
-            })
+            .when(
+                cost.is_some() || status.is_some() || usage.is_some(),
+                |chat| {
+                    chat.child(
+                        h_flex()
+                            .px_4()
+                            .py_1()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(div().flex_1().children(cost))
+                            .children(usage)
+                            .when_some(status, |el, (label, color)| {
+                                el.child(div().text_color(color).child(label))
+                            }),
+                    )
+                },
+            )
             .children(self.render_latest_prompt(cx))
             .child(if self.convo.items.is_empty() {
                 let provider = self.provider();

@@ -16,7 +16,7 @@ use sg_agents::chat::{
 };
 
 use crate::process::{History, request_id_text};
-use crate::tools;
+use crate::{TokenUsage, tools};
 
 /// What the host must do after an event.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,11 +36,17 @@ pub struct CodexFold {
     thinking: HashMap<String, usize>,
     active_turn: Option<String>,
     active_plan: Option<usize>,
+    usage: Option<Box<TokenUsage>>,
+    usage_turn: Option<String>,
 }
 
 impl CodexFold {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn token_usage(&self) -> Option<&TokenUsage> {
+        self.usage.as_deref()
     }
 
     /// Apply one live event.
@@ -98,6 +104,8 @@ impl CodexFold {
         self.thinking.clear();
         self.active_turn = None;
         self.active_plan = None;
+        self.usage = None;
+        self.usage_turn = None;
         c.status = Status::Idle;
     }
 
@@ -130,6 +138,10 @@ impl CodexFold {
     fn on_thread(&mut self, c: &mut Conversation, thread: &Value) {
         let s = |k: &str| thread.get(k).and_then(Value::as_str).map(String::from);
         if let Some(id) = s("id") {
+            if c.session_id.as_ref() != Some(&id) {
+                self.usage = None;
+                self.usage_turn = None;
+            }
             c.session_id = Some(id);
         }
         if let Some(cwd) = s("cwd") {
@@ -146,6 +158,9 @@ impl CodexFold {
             "thread/started" => self.on_thread(c, p.get("thread").unwrap_or(&Value::Null)),
             "turn/started" => {
                 let turn = p.pointer("/turn/id").and_then(Value::as_str);
+                if let Some(turn) = turn {
+                    self.usage_turn = Some(turn.to_owned());
+                }
                 if self.active_turn.as_deref() != turn {
                     if let Some(index) = self.active_plan.take()
                         && let Some(Item::Plan(previous)) = c.items.get_mut(index)
@@ -172,6 +187,19 @@ impl CodexFold {
                 self.active_plan = None;
             }
             "turn/plan/updated" => self.on_plan(c, p),
+            "thread/tokenUsage/updated" => {
+                if s("threadId").is_some()
+                    && s("threadId") == c.session_id.as_deref()
+                    && self
+                        .usage_turn
+                        .as_deref()
+                        .is_none_or(|turn| s("turnId") == Some(turn))
+                    && let Some(raw) = p.get("tokenUsage")
+                    && let Ok(usage) = serde_json::from_value::<TokenUsage>(raw.clone())
+                {
+                    self.usage = Some(Box::new(usage));
+                }
+            }
             "item/started" => self.on_item(c, p.get("item").unwrap_or(&Value::Null), true, true),
             "item/completed" => self.on_item(c, p.get("item").unwrap_or(&Value::Null), false, true),
             "item/agentMessage/delta" => {
@@ -223,7 +251,13 @@ impl CodexFold {
                     c.title = Some(short_title(name));
                 }
             }
-            "thread/compacted" => c.push_notice("Conversation compacted", false),
+            "thread/compacted"
+                if s("threadId").is_none_or(|thread| c.session_id.as_deref() == Some(thread)) =>
+            {
+                self.usage = None;
+                self.usage_turn = None;
+                c.push_notice("Conversation compacted", false);
+            }
             _ => {}
         }
     }

@@ -22,6 +22,7 @@ pub mod process;
 mod questions;
 pub mod sessions;
 pub mod tools;
+mod usage;
 
 pub use conversation::{CodexFold, Reply};
 pub use process::{
@@ -29,6 +30,7 @@ pub use process::{
     list_models, read_history,
 };
 pub use sessions::CodexSessionIndex;
+pub use usage::{TokenCounts, TokenUsage};
 
 /// `~/.codex`, honouring `CODEX_HOME`.
 pub fn codex_home() -> Option<PathBuf> {
