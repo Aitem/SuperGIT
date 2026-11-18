@@ -86,6 +86,8 @@ mod stashes;
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
+mod cherry_pick;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainTab {
     History,
@@ -182,6 +184,8 @@ const TABS: [MainTab; 4] = [
 pub struct SuperGitApp {
     worktree_dialog: Option<issue_worktree::WorktreeDialog>,
     worktree_dialog_handle: FocusHandle,
+    cherry_pick: Option<cherry_pick::CherryPickDialog>,
+    cherry_pick_handle: FocusHandle,
     creation_base: LoadState<sg_git::BaseInfo>,
     creation_base_task: Option<Task<()>>,
     base_update_error: Option<String>,
@@ -392,6 +396,8 @@ impl SuperGitApp {
         let mut this = Self {
             worktree_dialog: None,
             worktree_dialog_handle: cx.focus_handle(),
+            cherry_pick: None,
+            cherry_pick_handle: cx.focus_handle(),
             creation_base: LoadState::Loading,
             creation_base_task: None,
             base_update_error: None,
@@ -1963,6 +1969,7 @@ impl SuperGitApp {
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.worktree_dialog = None;
+        self.cherry_pick = None;
         self.creation_base = LoadState::Loading;
         self.base_update_error = None;
         self.sync_dialog = None;
@@ -3776,6 +3783,16 @@ impl SuperGitApp {
                 );
         }
         bar = bar.child(
+            Button::new("check-cherry-pick")
+                .label("Cherry-pick status")
+                .xsmall()
+                .ghost()
+                .disabled(self.git_operation_running())
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.open_cherry_pick(None, window, cx)),
+                ),
+        );
+        bar = bar.child(
             Button::new("ask-agent-diff")
                 .label("Ask agent")
                 .xsmall()
@@ -4398,6 +4415,7 @@ impl SuperGitApp {
         };
         let sha = commit.sha.clone();
         let checkout = sha.clone();
+        let cherry_pick = sha.clone();
         let parents = commit.parents.iter().enumerate().map(|(ix, parent)| {
             let parent = parent.clone();
             Button::new(("commit-parent", ix))
@@ -4510,6 +4528,19 @@ impl SuperGitApp {
                         .children(parents)
                     })
                     .children(refs)
+                    .when(!commit.is_merge(), |el| {
+                        el.child(
+                            Button::new("cherry-pick-history")
+                                .label("Cherry-pick…")
+                                .xsmall()
+                                .ghost()
+                                .tooltip("Apply this commit to the selected worktree’s branch")
+                                .disabled(self.git_operation_running())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_cherry_pick(Some(cherry_pick.clone()), window, cx);
+                                })),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(format!("{files} file{}", if files == 1 { "" } else { "s" }))
                     .child(
@@ -5170,6 +5201,9 @@ impl Render for SuperGitApp {
             .child(self.render_title_bar(cx))
             .child(self.render_body(window, cx))
             .child(self.render_status_bar(cx))
+            .when(self.cherry_pick.is_some(), |el| {
+                el.child(self.render_cherry_pick(cx))
+            })
             .when(self.switcher.is_some(), |el| {
                 el.child(self.render_switcher(cx))
             })
