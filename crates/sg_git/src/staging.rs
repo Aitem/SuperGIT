@@ -26,14 +26,14 @@ impl Staging {
     }
 
     pub fn available(self, file: &FileChange) -> bool {
-        if file.unstaged == Some(FileState::Conflicted) || file.path.contains('\u{fffd}') {
+        if file.path.contains('\u{fffd}') {
             return false;
         }
         match self {
             Self::Stage => file.unstaged.is_some_and(|state| {
                 state == FileState::Deleted || file.submodule.is_none_or(|sub| sub.commit_changed)
             }),
-            Self::Unstage => file.staged.is_some(),
+            Self::Unstage => file.unstaged != Some(FileState::Conflicted) && file.staged.is_some(),
         }
     }
 }

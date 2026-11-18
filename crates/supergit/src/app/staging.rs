@@ -29,7 +29,12 @@ impl SuperGitApp {
         let disabled = self.action_task.is_some()
             || self.cleanup_task.is_some()
             || self.base_update_paths.contains(path);
-        let actions = [(Staging::Unstage, "Unstage"), (Staging::Stage, "Stage")];
+        let stage_label = if file.unstaged == Some(FileState::Conflicted) {
+            "Mark resolved"
+        } else {
+            "Stage"
+        };
+        let actions = [(Staging::Unstage, "Unstage"), (Staging::Stage, stage_label)];
         let buttons: Vec<_> = actions
             .into_iter()
             .filter_map(|(action, label)| {
