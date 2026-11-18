@@ -38,7 +38,7 @@ impl SuperGitApp {
             return None;
         }
         let patch = self.pulls.patches.get(number)?;
-        if &patch.head != rendered_head {
+        if &patch.head != rendered_head || details.base_oid != patch.base_oid {
             return None;
         }
         let raw = patch.patch.value()?;
