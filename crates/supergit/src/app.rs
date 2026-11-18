@@ -4914,6 +4914,9 @@ impl Render for SuperGitApp {
             .when(self.switcher.is_some(), |el| {
                 el.child(self.render_switcher(cx))
             })
+            .when(self.stash_dialog.is_some(), |el| {
+                el.child(self.render_stashes(cx))
+            })
             .when(self.settings_open, |el| el.child(self.render_settings(cx)))
             .when(self.cleanup_preview.is_some(), |el| {
                 el.child(self.render_cleanup_preview(cx))
@@ -4926,9 +4929,6 @@ impl Render for SuperGitApp {
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
-            })
-            .when(self.stash_dialog.is_some(), |el| {
-                el.child(self.render_stashes(cx))
             })
     }
 }

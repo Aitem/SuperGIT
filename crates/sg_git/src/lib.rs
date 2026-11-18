@@ -48,9 +48,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 
-mod stash;
-pub use stash::{Stash, apply_stash, can_save_stash, list_stashes, save_stash};
-
 /// A repository as SuperGIT sees it: the main worktree plus the shared git dir.
 #[derive(Clone, Debug)]
 pub struct Repo {
@@ -89,6 +86,9 @@ impl Repo {
             .unwrap_or_else(|| self.root.display().to_string())
     }
 }
+
+mod stash;
+pub use stash::{Stash, apply_stash, can_save_stash, list_stashes, save_stash};
 
 /// Human-friendly relative time ("5m", "3h", "2d") for a unix timestamp.
 pub fn relative_time(unix_secs: i64) -> String {
