@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 use sg_agents::chat::{
-    Conversation, Decision, Item, PermissionRequest, Status, ToolCall, short_title, strip_ansi,
+    Conversation, Decision, InputResolution, Item, PermissionRequest, Status, ToolCall,
+    short_title, strip_ansi,
 };
 
 use crate::process::{History, request_id_text};
@@ -140,7 +141,7 @@ impl CodexFold {
         match method {
             "thread/started" => self.on_thread(c, p.get("thread").unwrap_or(&Value::Null)),
             "turn/started" => {
-                if c.status != Status::NeedsPermission {
+                if !matches!(c.status, Status::NeedsPermission | Status::NeedsInput) {
                     c.status = Status::Working;
                 }
             }
@@ -173,10 +174,15 @@ impl CodexFold {
                 }
             }
             "serverRequest/resolved" => {
-                if let Some(id) = p.get("requestId").map(request_id_text)
-                    && c.permission(&id).is_some_and(|r| r.decision.is_none())
-                {
-                    c.resolve_permission(&id, Decision::Expired);
+                if let Some(id) = p.get("requestId").map(request_id_text) {
+                    if c.permission(&id)
+                        .is_some_and(|request| request.decision.is_none())
+                    {
+                        c.resolve_permission(&id, Decision::Expired);
+                    }
+                    if c.user_input(&id).is_some() {
+                        c.resolve_user_input(&id, InputResolution::Expired);
+                    }
                 }
             }
             "error" => {
@@ -313,6 +319,16 @@ impl CodexFold {
         };
         let item_id = s("itemId");
         let request = match method {
+            "item/tool/requestUserInput" => {
+                if let Some(request) = crate::questions::request(request_id, p) {
+                    c.push_user_input(request);
+                    return None;
+                }
+                return Some(Reply::Unsupported {
+                    request_id: request_id.to_string(),
+                    method: "malformed user-input request".to_string(),
+                });
+            }
             "item/commandExecution/requestApproval" => {
                 let offered: Vec<Value> = p
                     .get("availableDecisions")

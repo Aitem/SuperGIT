@@ -2,10 +2,14 @@
 //! history, agent sessions and pull requests on the right.
 
 mod base;
+mod edit;
 mod projects;
 mod pulls;
 mod sidebar;
+mod staging;
 mod worktrees;
+
+mod clone_repository;
 
 use crate::MOD;
 use std::collections::{HashMap, HashSet};
@@ -198,6 +202,8 @@ pub struct SuperGitApp {
     /// `None` shows the welcome screen (e.g. first launch from the Dock).
     repo: Option<Repo>,
     recent: Vec<PathBuf>,
+    clone_repository: Option<clone_repository::CloneForm>,
+    clone_focus: FocusHandle,
     launch_dir: PathBuf,
     terminal: TerminalApp,
     index: SharedSessionIndex,
@@ -241,6 +247,7 @@ pub struct SuperGitApp {
     commit_generation: u64,
 
     branch_input: Entity<InputState>,
+    git_editor: edit::GitEditor,
     /// Filters the Changes tab's file list by path.
     changes_filter: Entity<InputState>,
     /// Folders collapsed in the Changes tab's tree view.
@@ -397,6 +404,8 @@ impl SuperGitApp {
             switcher: None,
             repo,
             recent: crate::recent::load(),
+            clone_repository: None,
+            clone_focus: cx.focus_handle(),
             launch_dir,
             terminal: TerminalApp::detect(),
             index: Default::default(),
@@ -429,6 +438,7 @@ impl SuperGitApp {
             details_generation: 0,
             commit_generation: 0,
             branch_input,
+            git_editor: Default::default(),
             changes_filter,
             changes_collapsed: HashSet::new(),
             commit_filter,
@@ -1236,7 +1246,7 @@ impl SuperGitApp {
                     .child(Button::new("close-settings").label("Done").small().ghost()
                         .on_click(cx.listener(|this,_,window,cx| this.close_settings(window,cx)))))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Background notifications"))
-                .children([(true,"Approval requests",settings.notify_approvals),(false,"Completion and failures",settings.notify_completions)]
+                .children([(true,"Approvals and questions",settings.notify_approvals),(false,"Completion and failures",settings.notify_completions)]
                     .into_iter().map(|(approval,label,enabled)| h_flex().justify_between().child(label)
                         .child(Button::new(if approval {"notify-approval"} else {"notify-completion"})
                             .label(if enabled {"On"} else {"Off"}).small().ghost()
@@ -1710,6 +1720,7 @@ impl SuperGitApp {
     }
 
     fn reset_details(&mut self, cx: &mut Context<Self>) {
+        self.reset_edit_selection();
         self.details_generation += 1;
         self.commit_generation += 1;
         self.history_generation += 1;
@@ -1729,6 +1740,9 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.selected.as_ref() != Some(&path) {
+            self.reset_edit_selection();
+        }
         if self.cleanup_paths.contains(&path) || self.base_update_paths.contains(&path) {
             self.flash("A Git operation is in progress for this worktree", true, cx);
             return;
@@ -2038,6 +2052,7 @@ impl SuperGitApp {
                         state.revision,
                         &match state.kind {
                             Kind::Approval => format!("{} needs your approval", provider.label()),
+                            Kind::Question => format!("{} has a question", provider.label()),
                             Kind::Failed => format!("{} task failed", provider.label()),
                             _ => format!("{} task completed", provider.label()),
                         },
@@ -2071,10 +2086,7 @@ impl SuperGitApp {
                             .and_then(|chats| chats.iter().find(|chat| chat.local_id == *id))
                             .map(|chat| &chat.attention)
                     });
-                state.is_some_and(|state| {
-                    state.kind == kind
-                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
-                })
+                state.is_some_and(|state| state.kind == kind && (kind.is_live() || state.unread))
             })
             .collect()
     }
@@ -2088,8 +2100,7 @@ impl SuperGitApp {
                         .iter()
                         .filter(|chat| {
                             let state = chat.read(cx).attention();
-                            state.kind == kind
-                                && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+                            state.kind == kind && (kind.is_live() || state.unread)
                         })
                         .count()
                 } else {
@@ -2100,9 +2111,7 @@ impl SuperGitApp {
                         .flatten()
                         .filter(|chat| native_provider(&chat.provider))
                         .filter(|chat| {
-                            chat.attention.kind == kind
-                                && (matches!(kind, Kind::Running | Kind::Approval)
-                                    || chat.attention.unread)
+                            chat.attention.kind == kind && (kind.is_live() || chat.attention.unread)
                         })
                         .count()
                 }
@@ -2301,7 +2310,9 @@ impl SuperGitApp {
             .get(path)?
             .iter()
             .filter_map(|c| match c.read(cx).status() {
-                sg_agents::chat::Status::NeedsPermission => Some(AgentState::NeedsAttention),
+                sg_agents::chat::Status::NeedsPermission | sg_agents::chat::Status::NeedsInput => {
+                    Some(AgentState::NeedsAttention)
+                }
                 sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
                     Some(AgentState::Working)
                 }
@@ -2378,15 +2389,12 @@ impl SuperGitApp {
                     })
                     .collect()
             };
-        [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
-            .into_iter()
-            .find_map(|kind| {
-                states.iter().find_map(|(state, provider, id)| {
-                    (state.kind == kind
-                        && (matches!(kind, Kind::Running | Kind::Approval) || state.unread))
-                        .then(|| (kind, *provider, (*id).to_string()))
-                })
+        projects::ATTENTION_ORDER.into_iter().find_map(|kind| {
+            states.iter().find_map(|(state, provider, id)| {
+                (state.kind == kind && (kind.is_live() || state.unread))
+                    .then(|| (kind, *provider, (*id).to_string()))
             })
+        })
     }
 
     /// Exact native activity and explicitly labeled external estimates.
@@ -2551,35 +2559,33 @@ impl SuperGitApp {
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu_bar = crate::menu_bar(cx);
-        let indicators =
-            [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running]
-                .into_iter()
-                .filter_map(|kind| {
-                    let count = self.attention_count(kind, cx);
-                    (count > 0).then(|| {
-                        Button::new(match kind {
-                            Kind::Approval => "attention-approval",
-                            Kind::Failed => "attention-failed",
-                            Kind::Completed => "attention-completed",
-                            _ => "attention-running",
-                        })
-                        .label(format!("{count} {}", kind.label()))
-                        .text_color(attention_color(kind, cx.theme()))
-                        .xsmall()
-                        .ghost()
-                        .tooltip(format!(
-                            "{} · Open the exact conversation; repeat to cycle",
-                            if kind == Kind::Completed {
-                                "Completed and unread"
-                            } else {
-                                kind.label()
-                            }
-                        ))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| this.open_attention(kind, window, cx),
-                        ))
-                    })
-                });
+        let indicators = projects::ATTENTION_ORDER.into_iter().filter_map(|kind| {
+            let count = self.attention_count(kind, cx);
+            (count > 0).then(|| {
+                Button::new(match kind {
+                    Kind::Approval => "attention-approval",
+                    Kind::Question => "attention-question",
+                    Kind::Failed => "attention-failed",
+                    Kind::Completed => "attention-completed",
+                    _ => "attention-running",
+                })
+                .label(format!("{count} {}", kind.label()))
+                .text_color(attention_color(kind, cx.theme()))
+                .xsmall()
+                .ghost()
+                .tooltip(format!(
+                    "{} · Open the exact conversation; repeat to cycle",
+                    if kind == Kind::Completed {
+                        "Completed and unread"
+                    } else {
+                        kind.label()
+                    }
+                ))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.open_attention(kind, window, cx)),
+                )
+            })
+        });
         let theme = cx.theme();
         TitleBar::new().child(
             h_flex()
@@ -2626,6 +2632,17 @@ impl SuperGitApp {
                                     this.open_repository(&OpenRepository, window, cx)
                                 })),
                         )
+                        .when(self.repo.is_some(), |el| {
+                            el.child(
+                                Button::new("clone-repo")
+                                    .label("Clone…")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_clone_form(window, cx)
+                                    })),
+                            )
+                        })
                         .when(self.repo.is_some(), |el| {
                             el.child(
                                 Button::new("close-repo")
@@ -2726,16 +2743,27 @@ impl SuperGitApp {
         let (_, main_width) = self.pane_widths(window, cx);
         let content = match self.tab {
             MainTab::Changes => {
-                let comparison = self.render_comparison(window, cx);
+                #[cfg(feature = "screenshot")]
+                self.debug_staging_once(cx);
+                let switch = self.render_staging_switch(cx).into_any_element();
+                let body = if self.git_editor.staging {
+                    self.render_index_editor(&info, window, cx)
+                } else {
+                    v_flex()
+                        .size_full()
+                        .child(self.render_comparison(window, cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(self.render_changes(&info, main_width, &theme, cx)),
+                        )
+                        .into_any_element()
+                };
                 v_flex()
                     .size_full()
-                    .child(comparison)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .child(self.render_changes(&info, main_width, &theme, cx)),
-                    )
+                    .child(switch)
+                    .child(div().flex_1().min_h_0().child(body))
                     .into_any_element()
             }
             MainTab::History => self
@@ -2754,6 +2782,14 @@ impl SuperGitApp {
             .min_w_0()
             .h_full()
             .child(self.render_header(&info, &theme, cx))
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(self.render_sync(&info, cx)),
+            )
             .child(
                 TabBar::new("main-tabs")
                     .underline()
@@ -3100,6 +3136,7 @@ impl SuperGitApp {
             ("File diff".into(), raw.to_string())
         };
         Ok(Attachment {
+            kind: agent_context::AttachmentKind::Diff,
             worktree: path,
             path: relative,
             comparison: format!(
@@ -3130,7 +3167,7 @@ impl SuperGitApp {
     ) {
         if self.selected.as_ref() != Some(&item.worktree) {
             self.flash(
-                "This selection belongs to another worktree. Reopen its diff to attach it.",
+                "This context belongs to another worktree. Switch back before attaching it.",
                 true,
                 cx,
             );
@@ -3818,11 +3855,8 @@ impl SuperGitApp {
                             this.toggle_dir(list, path.clone(), cx)
                         }),
                     )
-                    .on_click(Self::open_file(
-                        list,
-                        files[ix].path.clone(),
-                        cx,
-                    )),
+                    .on_click(Self::open_file(list, files[ix].path.clone(), cx))
+                    .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
                     cx,
                 ),
@@ -3847,11 +3881,8 @@ impl SuperGitApp {
                         tree_indent(depth),
                         theme,
                     )
-                    .on_click(Self::open_file(
-                        list,
-                        files[ix].path.clone(),
-                        cx,
-                    )),
+                    .on_click(Self::open_file(list, files[ix].path.clone(), cx))
+                    .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
                     cx,
                 ),
@@ -3871,11 +3902,8 @@ impl SuperGitApp {
                             px(12.),
                             theme,
                         )
-                        .on_click(Self::open_file(
-                            list,
-                            file.path.clone(),
-                            cx,
-                        )),
+                        .on_click(Self::open_file(list, file.path.clone(), cx))
+                        .children(self.staging_buttons(list, file, cx)),
                         file.path.clone(),
                         cx,
                     )
@@ -4140,6 +4168,7 @@ impl SuperGitApp {
             .size_full()
             .children(notice)
             .children(summary)
+            .child(self.render_squash(commits, cx))
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
@@ -4675,7 +4704,9 @@ impl SuperGitApp {
                 sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
                     Some(theme.blue)
                 }
-                sg_agents::chat::Status::NeedsPermission => Some(theme.warning),
+                sg_agents::chat::Status::NeedsPermission | sg_agents::chat::Status::NeedsInput => {
+                    Some(theme.warning)
+                }
                 _ => None,
             };
             let path = path.clone();
@@ -4699,11 +4730,9 @@ impl SuperGitApp {
                     el.child(div().size(px(6.)).rounded_full().bg(color))
                 })
                 .child(title)
-                .when(
-                    c.attention().unread
-                        || matches!(c.attention().kind, Kind::Running | Kind::Approval),
-                    |el| el.child(div().text_xs().child(c.attention().kind.label())),
-                )
+                .when(c.attention().unread || c.attention().kind.is_live(), |el| {
+                    el.child(div().text_xs().child(c.attention().kind.label()))
+                })
                 .when(chats.len() > 1, |el| {
                     el.child(
                         div()
@@ -4936,14 +4965,24 @@ impl SuperGitApp {
                     "Worktrees, Claude and Codex sessions, commits and pull requests in one place.",
                 ))
                 .child(
-                    h_flex().child(
-                        Button::new("welcome-open")
-                            .label("Open Repository…")
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_repository(&OpenRepository, window, cx)
-                            })),
-                    ),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("welcome-open")
+                                .label("Open Repository…")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_repository(&OpenRepository, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("welcome-clone")
+                                .label("Clone Repository…")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_clone_form(window, cx)
+                                })),
+                        ),
                 )
                 .when(!self.recent.is_empty(), |el| {
                     el.child(
@@ -5030,6 +5069,9 @@ impl Render for SuperGitApp {
                 el.child(self.render_switcher(cx))
             })
             .when(self.settings_open, |el| el.child(self.render_settings(cx)))
+            .when(self.clone_repository.is_some(), |el| {
+                el.child(self.render_clone_form(cx))
+            })
             .when(self.cleanup_preview.is_some(), |el| {
                 el.child(self.render_cleanup_preview(cx))
             })
@@ -5037,7 +5079,7 @@ impl Render for SuperGitApp {
                 el.child(self.render_rebase_dialog(cx))
             })
             .when(self.pulls.dialog_open(), |el| {
-                el.child(self.render_merge_dialog(cx))
+                el.child(self.render_pr_dialog(cx))
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
@@ -5142,7 +5184,7 @@ fn agent_color(state: AgentState, theme: &gpui_kit::component::Theme) -> Hsla {
 
 fn attention_color(kind: Kind, theme: &gpui_kit::component::Theme) -> Hsla {
     match kind {
-        Kind::Approval => theme.warning,
+        Kind::Approval | Kind::Question => theme.warning,
         Kind::Failed => theme.danger,
         Kind::Completed => theme.success,
         Kind::Running => theme.blue,

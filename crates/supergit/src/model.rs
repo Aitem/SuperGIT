@@ -84,7 +84,7 @@ pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<Wor
                     } else if let Some(reason) = &wt.prunable {
                         Err(format!("prunable: {reason}"))
                     } else {
-                        sg_git::status(&wt.path).map_err(git_error_message)
+                        sg_git::polled_status(&wt.path).map_err(git_error_message)
                     };
                     let identity = sg_git::worktree_identity(&repo.common_dir, wt).ok();
                     (status, identity)
