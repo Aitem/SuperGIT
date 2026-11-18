@@ -28,6 +28,7 @@ const SEARCH_DELAY: Duration = Duration::from_millis(400);
 const BRANCH_LIMIT: usize = 50;
 const SEARCH_LIMIT: usize = 50;
 
+mod file_review;
 mod inline_review;
 mod review_actions;
 mod review_context;
@@ -53,6 +54,7 @@ struct Loaded {
 /// A PR's patch, taken at `head`: a push makes it stale.
 pub(super) struct Patch {
     head: String,
+    base_oid: String,
     at: Instant,
     /// GitHub refused (too large, offline): computed from local commits.
     local: bool,
@@ -107,6 +109,7 @@ pub(super) struct Pulls {
     /// The Files tab: patches by PR, the diff view and its file list.
     patches: HashMap<u64, Patch>,
     patch_task: Option<(u64, Task<()>)>,
+    file_review: file_review::ReviewProgress,
     pub(super) diff: Entity<DiffState>,
     /// The same diff through difftastic, while it is on.
     pub(super) difft: Entity<DifftView>,
@@ -175,6 +178,7 @@ impl Pulls {
             },
             patches: HashMap::new(),
             patch_task: None,
+            file_review: file_review::ReviewProgress::default(),
             diff: new_diff_state(layout, cx),
             difft: cx.new(|_| DifftView::new(diff_mode(layout))),
             diff_shown: None,
@@ -206,6 +210,7 @@ impl Pulls {
         self.merge = None;
         self.patches.clear();
         self.patch_task = None;
+        self.file_review = file_review::ReviewProgress::default();
         self.diff_shown = None;
         self.diff
             .update(cx, |diff, cx| diff.set_files(Vec::new(), cx));
@@ -608,6 +613,7 @@ impl SuperGitApp {
             if self.pulls.tab == DetailsTab::Files
                 && let Some((pr, base_oid)) = target
             {
+                self.ensure_pr_file_review(root.clone(), &pr, &base_oid, cx);
                 self.ensure_pr_patch(root, &pr, base_oid, cx);
             }
             self.show_pr_diff(number, cx);
@@ -625,7 +631,9 @@ impl SuperGitApp {
         let due = match self.pulls.patches.get(&number) {
             None => true,
             Some(p) => {
-                p.head != pr.head_oid || (p.patch.error().is_some() && p.at.elapsed() > PATCH_RETRY)
+                p.head != pr.head_oid
+                    || p.base_oid != base_oid
+                    || (p.patch.error().is_some() && p.at.elapsed() > PATCH_RETRY)
             }
         };
         let running = self
@@ -638,12 +646,12 @@ impl SuperGitApp {
         }
         let head = pr.head_oid.clone();
         let base = pr.base_branch.clone();
-        let request = (root.clone(), head.clone());
+        let request = (root.clone(), head.clone(), base_oid.clone());
         let task = cx.spawn(async move |this, cx| {
             let (result, merge_base) = cx
                 .background_executor()
                 .spawn(async move {
-                    let (root, head) = request;
+                    let (root, head, base_oid) = request;
                     // The PR's diff is its head against this merge base:
                     // the local repository often has both commits.
                     let merge_base = sg_git::pr_merge_base(&root, &base_oid, &base, &head);
@@ -675,7 +683,10 @@ impl SuperGitApp {
                     .pulls
                     .patches
                     .remove(&number)
-                    .filter(|p| p.head == head);
+                    .filter(|p| p.head == head && p.base_oid == base_oid);
+                if previous.is_none() && this.pulls.shown == Some(number) {
+                    this.pulls.diff_shown = None;
+                }
                 let local = match (&result, &previous) {
                     (Ok((_, local)), _) => *local,
                     (Err(_), Some(previous)) => previous.local,
@@ -692,6 +703,7 @@ impl SuperGitApp {
                     number,
                     Patch {
                         head,
+                        base_oid,
                         at: Instant::now(),
                         local,
                         merge_base,
@@ -1867,6 +1879,7 @@ impl SuperGitApp {
                     .read(cx)
                     .files()
                     .iter()
+                    .filter(|file| !self.hide_pr_file(file.path().as_ref()))
                     .map(commit_file)
                     .collect();
                 let list_max = (width - 180.).clamp(140., 600.);
@@ -1894,6 +1907,7 @@ impl SuperGitApp {
             .size_full()
             .border_t_1()
             .border_color(theme.border)
+            .children(self.render_pr_review_progress(cx))
             .children(notice)
             .children(local)
             .children(no_difft)

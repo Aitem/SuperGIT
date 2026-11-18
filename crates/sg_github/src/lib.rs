@@ -13,6 +13,8 @@ use std::process::{Command, Stdio};
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
+mod file_review;
+
 pub use details::{
     AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review,
     ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_details,
@@ -74,6 +76,7 @@ where
 }
 
 pub use details::ReviewSide;
+pub use file_review::{FileReview, FileViewedState, pr_file_review, set_pr_file_viewed};
 
 pub use details::review_actions::{
     ReviewThreadState, ThreadPermissions, reply_to_thread, set_thread_resolved,
