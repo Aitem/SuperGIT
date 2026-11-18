@@ -10,6 +10,7 @@ use super::{LoadState, git_error_message};
 
 /// Git config and reflog-only changes will be reconciled at the next full read.
 const RECONCILE_HISTORY_AFTER: Duration = Duration::from_secs(30);
+pub(super) const HISTORY_PAGE: usize = 400;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistorySource {
@@ -63,20 +64,36 @@ fn optional_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 pub struct History {
     pub commits: LoadState<Arc<Vec<Commit>>>,
     pub fork: Option<Fork>,
+    loaded_limit: Option<usize>,
+    pub has_more: bool,
     cached: Option<(Arc<HistoryKey>, Instant)>,
 }
 
 impl History {
-    pub fn load(&self, path: &Path, source: Option<&HistorySource>) -> Self {
+    pub fn limit(&self) -> usize {
+        self.loaded_limit.unwrap_or(HISTORY_PAGE)
+    }
+
+    pub fn next_limit(&self) -> usize {
+        self.limit().saturating_add(HISTORY_PAGE)
+    }
+
+    pub fn load(&self, path: &Path, source: Option<&HistorySource>, limit: usize) -> Self {
         let key = source.and_then(|source| HistoryKey::read(path, source).ok());
         if let Some((cached, when)) = &self.cached
+            && self.loaded_limit == Some(limit)
             && when.elapsed() < RECONCILE_HISTORY_AFTER
             && key.as_ref() == Some(cached.as_ref())
         {
             return self.clone();
         }
-        let commits = sg_git::history(path, 400)
-            .map(Arc::new)
+        let mut has_more = false;
+        let commits = sg_git::history(path, limit.saturating_add(1))
+            .map(|mut commits| {
+                has_more = commits.len() > limit;
+                commits.truncate(limit);
+                Arc::new(commits)
+            })
             .map_err(git_error_message);
         let fork = sg_git::fork(path);
         // Read the refs on both sides of a miss. If a fetch changes the graph
@@ -90,8 +107,10 @@ impl History {
             None
         };
         Self {
+            loaded_limit: commits.as_ref().ok().map(|_| limit),
             commits: LoadState::from_result(commits),
             fork: fork.ok().flatten(),
+            has_more,
             cached,
         }
     }
@@ -99,6 +118,8 @@ impl History {
     pub fn update(&mut self, next: Self) {
         if next.commits.error().is_none() {
             self.fork = next.fork;
+            self.loaded_limit = next.loaded_limit;
+            self.has_more = next.has_more;
         }
         self.commits.update(next.commits);
         self.cached = next.cached;
@@ -106,5 +127,60 @@ impl History {
 
     pub fn invalidate(&mut self) {
         self.cached = None;
+    }
+}
+
+pub fn search_terms(query: &str) -> Vec<String> {
+    query.split_whitespace().map(str::to_lowercase).collect()
+}
+
+pub fn matches_commit(commit: &Commit, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let subject = commit.subject.to_lowercase();
+    let author = commit.author.to_lowercase();
+    let email = commit.email.to_lowercase();
+    let refs = commit
+        .refs
+        .iter()
+        .map(|label| label.name.to_lowercase())
+        .collect::<Vec<_>>();
+    terms.iter().all(|term| {
+        commit.sha.contains(term)
+            || subject.contains(term)
+            || author.contains(term)
+            || email.contains(term)
+            || refs.iter().any(|name| name.contains(term))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{matches_commit, search_terms};
+    use sg_git::{Commit, RefKind, RefLabel};
+
+    #[test]
+    fn terms_can_match_different_commit_fields() {
+        let commit = Commit {
+            sha: "abc4901234".into(),
+            parents: Vec::new(),
+            author: "Éloïse Swift".into(),
+            email: "eloise@example.com".into(),
+            time: 0,
+            subject: "Fix startup latency".into(),
+            refs: vec![RefLabel {
+                kind: RefKind::Tag,
+                name: "Ship/v1".into(),
+                current: false,
+            }],
+            by_agent: false,
+        };
+        assert!(matches_commit(
+            &commit,
+            &search_terms("  ABC49  ÉLOÏSE example.com  LATENCY Ship/V1\t")
+        ));
+        assert!(matches_commit(&commit, &search_terms("  ")));
+        assert!(!matches_commit(&commit, &search_terms("startup crash")));
     }
 }

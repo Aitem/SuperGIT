@@ -8,7 +8,7 @@ use sg_agents::{AgentState, Session, SessionIndex};
 use sg_codex::CodexSessionIndex;
 use sg_git::{Repo, Worktree, WorktreeStatus};
 
-mod history;
+pub(super) mod history;
 pub use history::{History, HistorySource};
 
 #[derive(Clone, Debug)]
@@ -379,7 +379,7 @@ mod tests {
         assert!(details.patch.error().is_some());
         assert!(
             History::default()
-                .load(&temp.0, None)
+                .load(&temp.0, None, history::HISTORY_PAGE)
                 .commits
                 .error()
                 .is_some()
@@ -388,7 +388,7 @@ mod tests {
         assert!(details.patch.value().is_none());
         assert!(
             History::default()
-                .load(&temp.0, None)
+                .load(&temp.0, None, history::HISTORY_PAGE)
                 .commits
                 .value()
                 .is_none()
@@ -408,7 +408,7 @@ mod tests {
         assert!(details.status.value().unwrap().is_clean());
         assert_eq!(details.patch.value().map(String::as_str), Some(""));
         assert!(
-            matches!(History::default().load(&temp.0, None).commits, LoadState::Ready(commits) if commits.is_empty())
+            matches!(History::default().load(&temp.0, None, history::HISTORY_PAGE).commits, LoadState::Ready(commits) if commits.is_empty())
         );
     }
 
@@ -419,9 +419,13 @@ mod tests {
         temp.git(&["config", "user.email", "test@example.com"]);
         temp.git(&["config", "user.name", "Tester"]);
         temp.git(&["commit", "--allow-empty", "-qm", "initial"]);
-        let mut history = History::default().load(&temp.0, None);
+        let mut history = History::default().load(&temp.0, None, history::HISTORY_PAGE);
         let original = history.commits.value().unwrap().clone();
-        history.update(History::default().load(&temp.0.join("missing"), None));
+        history.update(History::default().load(
+            &temp.0.join("missing"),
+            None,
+            history::HISTORY_PAGE,
+        ));
         assert!(history.commits.error().is_some());
         assert!(Arc::ptr_eq(history.commits.value().unwrap(), &original));
     }
@@ -435,7 +439,7 @@ mod tests {
         temp.git(&["commit", "--allow-empty", "-qm", "initial"]);
         temp.git(&["branch", "feature"]);
         let source = || HistorySource::new(&temp.0.join(".git"), &sg_git::status(&temp.0).unwrap());
-        let load = |previous: &History| previous.load(&temp.0, Some(&source()));
+        let load = |previous: &History| previous.load(&temp.0, Some(&source()), previous.limit());
         let initial = load(&History::default());
         std::fs::write(temp.0.join("work.txt"), "uncommitted edit").unwrap();
         let cached = load(&initial);
@@ -501,13 +505,46 @@ mod tests {
             ".",
         ]);
         let source = HistorySource::new(&clone.0.join(".git"), &sg_git::status(&clone.0).unwrap());
-        let initial = History::default().load(&clone.0, Some(&source));
+        let initial = History::default().load(&clone.0, Some(&source), history::HISTORY_PAGE);
         assert_eq!(initial.commits.value().unwrap().len(), 1);
         let before = sg_git::history_refs(&clone.0).unwrap();
         clone.git(&["fetch", "-q", "--deepen=1"]);
         assert_eq!(sg_git::history_refs(&clone.0).unwrap(), before);
-        let deepened = initial.load(&clone.0, Some(&source));
+        let deepened = initial.load(&clone.0, Some(&source), initial.limit());
         assert_eq!(deepened.commits.value().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn expanding_history_reads_more_even_with_the_same_refs() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "-b", "main"]);
+        repo.git(&["config", "user.email", "test@example.com"]);
+        repo.git(&["config", "user.name", "Tester"]);
+        repo.git(&["commit", "--allow-empty", "-qm", "older"]);
+        repo.git(&["commit", "--allow-empty", "-qm", "newer"]);
+        let source = HistorySource::new(&repo.0.join(".git"), &sg_git::status(&repo.0).unwrap());
+        let mut history = History::default().load(&repo.0, Some(&source), 1);
+        assert_eq!(history.commits.value().unwrap().len(), 1);
+        assert!(history.has_more);
+
+        let limit = history.next_limit();
+        history.update(history.load(&repo.0.join("missing"), None, limit));
+        assert_eq!(history.limit(), 1);
+        assert!(history.has_more);
+        assert_eq!(history.commits.value().unwrap().len(), 1);
+
+        history.update(history.load(&repo.0, Some(&source), 1));
+        history.update(history.load(&repo.0, Some(&source), limit));
+        let commits = history.commits.value().unwrap();
+        assert_eq!(
+            commits
+                .iter()
+                .map(|commit| commit.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
+        assert_eq!(history.limit(), limit);
+        assert!(!history.has_more);
     }
 
     #[test]
@@ -535,7 +572,7 @@ mod tests {
         assert!(details.patch.error().is_some());
         assert_eq!(
             History::default()
-                .load(&temp.0, None)
+                .load(&temp.0, None, history::HISTORY_PAGE)
                 .commits
                 .value()
                 .unwrap()

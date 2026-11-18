@@ -220,6 +220,7 @@ pub struct SuperGitApp {
     chat_layout: Entity<ResizableState>,
     changes_layout: Entity<ResizableState>,
     history_layout: Entity<ResizableState>,
+    history_search: Entity<InputState>,
     selected_commit: Option<String>,
     commit_diff: Entity<DiffState>,
     /// The same diffs through difftastic, loaded only while it is on.
@@ -314,6 +315,16 @@ impl SuperGitApp {
         );
         let changes_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
         let commit_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
+        let history_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search commits"));
+        let history_search_subscription = cx.subscribe_in(
+            &history_search,
+            window,
+            |this, _, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => this.open_history_match(cx),
+                _ => {}
+            },
+        );
         let filter_subscriptions = [&changes_filter, &commit_filter].map(|input| {
             cx.subscribe(input, |_, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -404,6 +415,7 @@ impl SuperGitApp {
             chat_layout: cx.new(|_| ResizableState::default()),
             changes_layout: cx.new(|_| ResizableState::default()),
             history_layout: cx.new(|_| ResizableState::default()),
+            history_search,
             selected_commit: None,
             commit_diff,
             changes_difft,
@@ -450,6 +462,7 @@ impl SuperGitApp {
                 quit_subscription,
                 release_subscription,
                 bounds_subscription,
+                history_search_subscription,
             ],
         };
         this._subscriptions.extend(filter_subscriptions);
@@ -1617,6 +1630,10 @@ impl SuperGitApp {
     }
 
     fn reload_history(&mut self, cx: &mut Context<Self>) {
+        self.load_history(self.history.limit(), cx);
+    }
+
+    fn load_history(&mut self, limit: usize, cx: &mut Context<Self>) {
         if self.tab != MainTab::History || self.history_task.is_some() {
             return;
         }
@@ -1634,7 +1651,7 @@ impl SuperGitApp {
             let selected = path.clone();
             let history = cx
                 .background_executor()
-                .spawn(async move { previous.load(&path, source.as_ref()) })
+                .spawn(async move { previous.load(&path, source.as_ref(), limit) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if generation == this.history_generation
@@ -1677,6 +1694,19 @@ impl SuperGitApp {
             self.select_commit(sha, cx);
         }
         cx.notify();
+    }
+
+    fn open_history_match(&mut self, cx: &mut Context<Self>) {
+        let terms = model::history::search_terms(&self.history_search.read(cx).value());
+        let Some(sha) = self.history.commits.value().and_then(|commits| {
+            commits
+                .iter()
+                .find(|commit| model::history::matches_commit(commit, &terms))
+                .map(|commit| commit.sha.clone())
+        }) else {
+            return;
+        };
+        self.select_commit(sha, cx);
     }
 
     fn reset_details(&mut self, cx: &mut Context<Self>) {
@@ -3966,11 +3996,21 @@ impl SuperGitApp {
             .map(|w| w.as_f32())
             .unwrap_or(self.repository_view().history_width)
             .min(commits_max);
-        let (graph, lanes) = graph::layout(
-            commits
-                .iter()
-                .map(|c| (c.sha.as_str(), c.parents.as_slice())),
-        );
+        let terms = model::history::search_terms(&self.history_search.read(cx).value());
+        let searching = !terms.is_empty();
+        let matches = commits
+            .iter()
+            .filter(|commit| model::history::matches_commit(commit, &terms))
+            .collect::<Vec<_>>();
+        let (graph, lanes) = if searching {
+            (Vec::new(), 0)
+        } else {
+            graph::layout(
+                commits
+                    .iter()
+                    .map(|c| (c.sha.as_str(), c.parents.as_slice())),
+            )
+        };
         let lanes = lanes.clamp(1, GRAPH_MAX_LANES);
         let base = self.history_base();
         // Branch and tag badges get at most 40% of the commit list.
@@ -3980,21 +4020,27 @@ impl SuperGitApp {
             .and_then(|fork| fork.parent.as_ref())
             .map(|parent| parent.merge_base.clone());
         let summary = fork.map(|fork| self.render_fork_summary(fork, theme, cx));
-        let rows = commits
-            .iter()
-            .zip(graph)
-            .enumerate()
-            .map(|(ix, (c, graph))| {
-                let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
-                let sha = c.sha.clone();
-                let avatar = self.avatars.get(&c.email.to_ascii_lowercase()).cloned();
-                let badges = ref_badges(("commit-refs", ix), &c.refs, base.as_deref(), 3, theme);
-                let fork_point = fork_point.as_deref() == Some(c.sha.as_str());
-                commit_row(
-                    ix, c, graph, lanes, avatar, badges, badge_room, fork_point, selected, theme,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)))
-            });
+        let matching_count = matches.len();
+        let mut graph = graph.into_iter();
+        let rows = matches.into_iter().enumerate().map(|(ix, c)| {
+            let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
+            let sha = c.sha.clone();
+            let avatar = self.avatars.get(&c.email.to_ascii_lowercase()).cloned();
+            let badges = ref_badges(("commit-refs", ix), &c.refs, base.as_deref(), 3, theme);
+            let fork_point = fork_point.as_deref() == Some(c.sha.as_str());
+            commit_row(
+                ix,
+                c,
+                graph.next().map(|row| (row, lanes)),
+                avatar,
+                badges,
+                badge_room,
+                fork_point,
+                selected,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)))
+        });
         let content = h_resizable("history-layout")
             .with_state(&self.history_layout)
             .on_resize(cx.listener(|this, state, _, cx| {
@@ -4010,14 +4056,79 @@ impl SuperGitApp {
                     .fixed()
                     .child(
                         v_flex()
-                            .id("commit-list")
-                            .w_full()
+                            .size_full()
                             .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
                             .border_r_1()
                             .border_color(theme.border)
-                            .children(rows),
+                            .child(
+                                v_flex()
+                                    .flex_none()
+                                    .p_2()
+                                    .gap_1()
+                                    .border_b_1()
+                                    .border_color(theme.border)
+                                    .child(
+                                        Input::new(&self.history_search)
+                                            .small()
+                                            .cleanable(true)
+                                            .prefix(
+                                                Icon::new(IconName::Search)
+                                                    .small()
+                                                    .text_color(theme.muted_foreground),
+                                            ),
+                                    )
+                                    .when(searching, |el| {
+                                        el.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!(
+                                                    "{matching_count} of {} loaded commits",
+                                                    commits.len()
+                                                )),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                v_flex()
+                                    .id("commit-list")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .when(matching_count == 0, |el| {
+                                        el.child(
+                                            div()
+                                                .p_3()
+                                                .text_sm()
+                                                .text_color(theme.muted_foreground)
+                                                .child("No loaded commits match"),
+                                        )
+                                    })
+                                    .children(rows),
+                            )
+                            .when(self.history.has_more, |el| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .p_2()
+                                        .border_t_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            Button::new("load-older-commits")
+                                                .small()
+                                                .outline()
+                                                .label("Load older commits")
+                                                .disabled(self.history_task.is_some())
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.load_history(
+                                                        this.history.next_limit(),
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -5597,8 +5708,7 @@ fn ref_badges(
 fn commit_row(
     ix: usize,
     c: &Commit,
-    graph: graph::GraphRow,
-    lanes: usize,
+    graph: Option<(graph::GraphRow, usize)>,
     avatar: Option<PathBuf>,
     badges: Vec<AnyElement>,
     badge_room: f32,
@@ -5616,7 +5726,9 @@ fn commit_row(
         .cursor_pointer()
         .when(selected, |el| el.bg(theme.list_active))
         .hover(|el| el.bg(theme.list_hover))
-        .child(commit_graph(graph, lanes, c.is_merge(), theme))
+        .when_some(graph, |el, (graph, lanes)| {
+            el.child(commit_graph(graph, lanes, c.is_merge(), theme))
+        })
         .child(author_avatar(ix, c, avatar, theme))
         .when(c.by_agent, |el| {
             el.child(
