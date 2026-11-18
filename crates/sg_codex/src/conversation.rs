@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 use sg_agents::chat::{
-    Conversation, Decision, InputResolution, Item, PermissionRequest, Status, ToolCall,
-    short_title, strip_ansi,
+    Conversation, Decision, InputResolution, Item, PermissionRequest, PlanStep, PlanStepStatus,
+    Status, ToolCall, TurnPlan, short_title, strip_ansi,
 };
 
 use crate::process::{History, request_id_text};
@@ -34,6 +34,8 @@ pub enum Reply {
 pub struct CodexFold {
     texts: HashMap<String, usize>,
     thinking: HashMap<String, usize>,
+    active_turn: Option<String>,
+    active_plan: Option<usize>,
 }
 
 impl CodexFold {
@@ -94,6 +96,8 @@ impl CodexFold {
         c.finish_streaming();
         self.texts.clear();
         self.thinking.clear();
+        self.active_turn = None;
+        self.active_plan = None;
         c.status = Status::Idle;
     }
 
@@ -141,6 +145,15 @@ impl CodexFold {
         match method {
             "thread/started" => self.on_thread(c, p.get("thread").unwrap_or(&Value::Null)),
             "turn/started" => {
+                let turn = p.pointer("/turn/id").and_then(Value::as_str);
+                if self.active_turn.as_deref() != turn {
+                    if let Some(index) = self.active_plan.take()
+                        && let Some(Item::Plan(previous)) = c.items.get_mut(index)
+                    {
+                        previous.finished = true;
+                    }
+                    self.active_turn = turn.map(str::to_owned);
+                }
                 if !matches!(c.status, Status::NeedsPermission | Status::NeedsInput) {
                     c.status = Status::Working;
                 }
@@ -155,7 +168,10 @@ impl CodexFold {
                 }
                 self.texts.clear();
                 self.thinking.clear();
+                self.active_turn = None;
+                self.active_plan = None;
             }
+            "turn/plan/updated" => self.on_plan(c, p),
             "item/started" => self.on_item(c, p.get("item").unwrap_or(&Value::Null), true, true),
             "item/completed" => self.on_item(c, p.get("item").unwrap_or(&Value::Null), false, true),
             "item/agentMessage/delta" => {
@@ -213,6 +229,59 @@ impl CodexFold {
     }
 
     /// An item started or completed, live or from history.
+    fn on_plan(&mut self, c: &mut Conversation, params: &Value) {
+        let thread = params.get("threadId").and_then(Value::as_str);
+        let turn = params.get("turnId").and_then(Value::as_str);
+        if turn.is_none()
+            || turn != self.active_turn.as_deref()
+            || c.session_id.as_deref().is_some_and(|id| thread != Some(id))
+            || !c.status.is_busy()
+        {
+            return;
+        }
+        let Some(items) = params.get("plan").and_then(Value::as_array) else {
+            return;
+        };
+        let steps = items
+            .iter()
+            .filter_map(|item| {
+                let text = item.get("step")?.as_str()?.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                let status = match item.get("status")?.as_str()? {
+                    "pending" => PlanStepStatus::Pending,
+                    "inProgress" => PlanStepStatus::InProgress,
+                    "completed" => PlanStepStatus::Completed,
+                    _ => return None,
+                };
+                Some(PlanStep {
+                    text: text.to_owned(),
+                    status,
+                })
+            })
+            .collect();
+        let explanation = params
+            .get("explanation")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+        let plan = TurnPlan {
+            explanation,
+            steps,
+            finished: false,
+        };
+        if let Some(index) = self.active_plan
+            && let Some(Item::Plan(previous)) = c.items.get_mut(index)
+        {
+            *previous = plan;
+        } else if !plan.steps.is_empty() {
+            self.active_plan = Some(c.items.len());
+            c.items.push(Item::Plan(plan));
+        }
+    }
+
     fn on_item(&mut self, c: &mut Conversation, item: &Value, started: bool, live: bool) {
         let ty = item.get("type").and_then(Value::as_str).unwrap_or_default();
         let id = item

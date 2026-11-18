@@ -93,6 +93,26 @@ pub struct UserInputRequest {
     pub resolution: InputResolution,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep {
+    pub text: String,
+    pub status: PlanStepStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnPlan {
+    pub explanation: Option<String>,
+    pub steps: Vec<PlanStep>,
+    pub finished: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     User {
@@ -108,6 +128,7 @@ pub enum Item {
     Tool(ToolCall),
     Permission(PermissionRequest),
     UserInput(UserInputRequest),
+    Plan(TurnPlan),
     Notice {
         text: String,
         is_error: bool,
@@ -355,8 +376,10 @@ impl Conversation {
         self.streaming_text = None;
         self.streaming_thinking = None;
         for item in &mut self.items {
-            if let Item::Text { streaming, .. } | Item::Thinking { streaming } = item {
-                *streaming = false;
+            match item {
+                Item::Text { streaming, .. } | Item::Thinking { streaming } => *streaming = false,
+                Item::Plan(plan) => plan.finished = true,
+                _ => {}
             }
         }
     }
