@@ -42,6 +42,7 @@ block2 = "0.6"
 notify-rust = "4.19"
 
 [features]
+git2-probe = ["sg_git/git2-probe"]
 # `SUPERGIT_SCREENSHOT=out.png supergit` renders the window to a PNG and quits.
 # Used to check the UI without screen-recording permission (agents, CI).
 screenshot = ["dep:gpui_platform_test_support"]

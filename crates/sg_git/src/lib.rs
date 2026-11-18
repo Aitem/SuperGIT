@@ -10,9 +10,17 @@ mod base;
 mod cleanup;
 mod comparison;
 pub mod difftastic;
+mod edit;
 mod log;
+#[cfg(feature = "git2-probe")]
+mod native_refs;
+#[cfg(feature = "git2-probe")]
+mod native_status;
+#[cfg(feature = "git2-probe")]
+pub use native_status::read_fixture as probe_native_status;
 mod rebase;
 mod runner;
+mod staging;
 mod status;
 mod submodule;
 mod worktree;
@@ -26,12 +34,19 @@ pub use cleanup::{
 pub use comparison::{
     BranchChanges, branch_changes, pr_merge_base, range_patch, resolve_branch, suggested_base,
 };
+pub use edit::{
+    IndexEdit, IndexHunk, commit, edit_file, edit_hunk, fetch, index_hunks, pull, squash,
+};
 pub use log::{
     Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
     commit_patch, fork, history, history_refs, log,
 };
+mod publish;
+
+pub use publish::{BranchPublication, branch_publication, publication_commits, publish_branch};
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
+pub use staging::{Staging, change_staging};
 pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};
 pub use submodule::{
     Inline, MAX_COMMITS, Patch, SubmoduleChange, SubmoduleCommit, SubmoduleFlags,
@@ -39,9 +54,32 @@ pub use submodule::{
 };
 pub use worktree::{Worktree, add_worktree, list_worktrees, remove_worktree};
 
+#[cfg(feature = "git2-probe")]
+fn use_git2_probe() -> bool {
+    std::env::var_os("SUPERGIT_GIT_BACKEND").as_deref() == Some(std::ffi::OsStr::new("git2"))
+        && [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_NO_REPLACE_OBJECTS",
+        ]
+        .iter()
+        .all(|key| std::env::var_os(key).is_none())
+}
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
+
+pub use status::polled_status;
 
 /// A repository as SuperGIT sees it: the main worktree plus the shared git dir.
 #[derive(Clone, Debug)]
@@ -81,6 +119,9 @@ impl Repo {
             .unwrap_or_else(|| self.root.display().to_string())
     }
 }
+
+mod clone_repository;
+pub use clone_repository::{clone_folder_name, clone_repository, clone_suggested_name};
 
 /// Human-friendly relative time ("5m", "3h", "2d") for a unix timestamp.
 pub fn relative_time(unix_secs: i64) -> String {
