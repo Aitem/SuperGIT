@@ -175,8 +175,8 @@ const TABS: [MainTab; 4] = [
 ];
 
 pub struct SuperGitApp {
-    issue_worktree: Option<issue_worktree::IssueWorktree>,
-    issue_handle: FocusHandle,
+    worktree_dialog: Option<issue_worktree::WorktreeDialog>,
+    worktree_dialog_handle: FocusHandle,
     creation_base: LoadState<sg_git::BaseInfo>,
     creation_base_task: Option<Task<()>>,
     base_update_error: Option<String>,
@@ -368,8 +368,8 @@ impl SuperGitApp {
             this.queue_persist(cx);
         });
         let mut this = Self {
-            issue_worktree: None,
-            issue_handle: cx.focus_handle(),
+            worktree_dialog: None,
+            worktree_dialog_handle: cx.focus_handle(),
             creation_base: LoadState::Loading,
             creation_base_task: None,
             base_update_error: None,
@@ -1905,7 +1905,7 @@ impl SuperGitApp {
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
-        self.issue_worktree = None;
+        self.worktree_dialog = None;
         self.creation_base = LoadState::Loading;
         self.base_update_error = None;
         self.observed_open_prs.clear();
@@ -4199,6 +4199,7 @@ impl SuperGitApp {
             )
         };
         let sha = commit.sha.clone();
+        let checkout = sha.clone();
         let parents = commit.parents.iter().enumerate().map(|(ix, parent)| {
             let parent = parent.clone();
             Button::new(("commit-parent", ix))
@@ -4289,6 +4290,17 @@ impl SuperGitApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()));
                                 this.flash("Copied commit SHA", false, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("worktree-from-commit")
+                            .label("New worktree…")
+                            .xsmall()
+                            .ghost()
+                            .tooltip("Create a branch and worktree at this commit")
+                            .disabled(self.git_operation_running())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_commit_worktree(&checkout, window, cx)
                             })),
                     )
                     .when(!commit.parents.is_empty(), |el| {
@@ -4976,8 +4988,8 @@ impl Render for SuperGitApp {
             .when(self.pulls.dialog_open(), |el| {
                 el.child(self.render_pr_dialog(cx))
             })
-            .when(self.issue_worktree.is_some(), |el| {
-                el.child(self.render_issue_worktree(cx))
+            .when(self.worktree_dialog.is_some(), |el| {
+                el.child(self.render_worktree_dialog(cx))
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
