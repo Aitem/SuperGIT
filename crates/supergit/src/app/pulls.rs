@@ -6,14 +6,16 @@
 //! the branch it pushes to) in the same repository, or when it was linked
 //! by hand; a hand-made unlink overrides both.
 
+mod checks;
+
 use std::time::Instant;
 
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::text::TextView;
 use sg_git::difftastic::Source;
 use sg_github::{
-    Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review, ReviewState,
-    ReviewThread,
+    Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrCommit, PrDetails, Review,
+    ReviewState, ReviewThread,
 };
 
 use super::*;
@@ -29,6 +31,8 @@ const PATCH_RETRY: Duration = Duration::from_secs(60);
 const SEARCH_DELAY: Duration = Duration::from_millis(400);
 const BRANCH_LIMIT: usize = 50;
 const SEARCH_LIMIT: usize = 50;
+
+mod review_context;
 
 /// What a worktree's own PR list was fetched for.
 #[derive(Clone, PartialEq, Eq)]
@@ -62,10 +66,11 @@ pub(super) struct Patch {
     submodules: Vec<sg_git::SubmoduleChange>,
 }
 
-/// The details column's two views, as on GitHub.
+/// The details column's views, as on GitHub.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DetailsTab {
     Conversation,
+    Commits,
     Files,
 }
 
@@ -93,10 +98,14 @@ pub(super) struct Pulls {
     search_task: Option<Task<()>>,
     details: HashMap<u64, Loaded>,
     details_task: Option<(u64, Task<()>)>,
+    commits: HashMap<(u64, String), LoadState<Vec<PrCommit>>>,
+    commits_task: Option<((u64, String), Task<()>)>,
     /// Review threads shown the other way round from their default
     /// (resolved ones start collapsed).
     toggled_threads: HashSet<String>,
     show_passed_checks: bool,
+    check_inspection: Option<checks::OpenCheck>,
+    check_inspection_task: Option<Task<()>>,
     /// The details column; back to the top when another PR is shown.
     details_scroll: ScrollHandle,
     shown: Option<u64>,
@@ -159,13 +168,21 @@ impl Pulls {
             search_task: None,
             details: HashMap::new(),
             details_task: None,
+            commits: HashMap::new(),
+            commits_task: None,
             toggled_threads: HashSet::new(),
             show_passed_checks: false,
+            check_inspection: None,
+            check_inspection_task: None,
             details_scroll: ScrollHandle::new(),
             shown: None,
             // Screenshot builds: `SUPERGIT_DEBUG_PR_FILES=1` starts on Files
             // (a background window only renders for the screenshot itself).
             tab: if cfg!(feature = "screenshot")
+                && std::env::var_os("SUPERGIT_DEBUG_PR_COMMITS").is_some()
+            {
+                DetailsTab::Commits
+            } else if cfg!(feature = "screenshot")
                 && std::env::var_os("SUPERGIT_DEBUG_PR_FILES").is_some()
             {
                 DetailsTab::Files
@@ -204,7 +221,10 @@ impl Pulls {
         self.search_task = None;
         self.details.clear();
         self.details_task = None;
+        self.commits.clear();
+        self.commits_task = None;
         self.toggled_threads.clear();
+        self.close_check_inspection();
         self.merge = None;
         self.publish = None;
         self.patches.clear();
@@ -593,6 +613,7 @@ impl SuperGitApp {
         let selected = self.selected_pr_number(&path, &visible);
         if self.pulls.shown != selected {
             self.pulls.shown = selected;
+            self.pulls.close_check_inspection();
             self.pulls.details_scroll.set_offset(point(px(0.), px(0.)));
         }
         if let Some(number) = selected {
@@ -610,13 +631,47 @@ impl SuperGitApp {
                 }
                 None => None,
             };
-            if self.pulls.tab == DetailsTab::Files
-                && let Some((pr, base_oid)) = target
-            {
-                self.ensure_pr_patch(root, &pr, base_oid, cx);
+            if let Some((pr, base_oid)) = target {
+                match self.pulls.tab {
+                    DetailsTab::Files => self.ensure_pr_patch(root, &pr, base_oid, cx),
+                    DetailsTab::Commits => self.ensure_pr_commits(root, &pr, cx),
+                    DetailsTab::Conversation => {}
+                }
             }
             self.show_pr_diff(number, cx);
         }
+    }
+
+    fn ensure_pr_commits(&mut self, root: PathBuf, pr: &PullRequest, cx: &mut Context<Self>) {
+        let key = (pr.number, pr.head_oid.clone());
+        if self.pulls.commits.contains_key(&key)
+            || self
+                .pulls
+                .commits_task
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == key)
+        {
+            return;
+        }
+        let request = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    sg_github::pr_commits(&root, request.0, &request.1)
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.pulls.commits_task = None;
+                this.pulls.commits.retain(|(number, _), _| *number != key.0);
+                this.pulls
+                    .commits
+                    .insert(key, LoadState::from_result(result));
+                cx.notify();
+            });
+        });
+        self.pulls.commits_task = Some(((pr.number, pr.head_oid.clone()), task));
     }
 
     fn ensure_pr_patch(
@@ -1020,6 +1075,8 @@ impl SuperGitApp {
                 });
                 loaded.at = Instant::now();
                 loaded.details.update(LoadState::from_result(result));
+                #[cfg(feature = "screenshot")]
+                this.debug_check_inspection(number, cx);
                 // The Files tab waits for the head and base commit: start
                 // its diff now rather than at the next frame.
                 if this.pulls.tab == DetailsTab::Files
@@ -1311,6 +1368,7 @@ impl SuperGitApp {
     /// then opens its merge dialog once the details are loaded,
     /// `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its conversation and
     /// `SUPERGIT_DEBUG_PR_FILES=1` opens its Files tab.
+    /// `SUPERGIT_DEBUG_PR_CHECK=<name>` inspects a check in Conversation.
     #[cfg(feature = "screenshot")]
     fn debug_pr_once(&mut self, info: &WorktreeInfo, cx: &mut Context<Self>) {
         let Some(number) = std::env::var("SUPERGIT_DEBUG_PR")
@@ -1682,19 +1740,21 @@ impl SuperGitApp {
             .px_2()
             .selected_index(match tab {
                 DetailsTab::Conversation => 0,
-                DetailsTab::Files => 1,
+                DetailsTab::Commits => 1,
+                DetailsTab::Files => 2,
             })
             .on_click(cx.listener(|this, ix: &usize, _, cx| {
                 this.set_details_tab(
-                    if *ix == 0 {
-                        DetailsTab::Conversation
-                    } else {
-                        DetailsTab::Files
-                    },
+                    [
+                        DetailsTab::Conversation,
+                        DetailsTab::Commits,
+                        DetailsTab::Files,
+                    ][*ix],
                     cx,
                 )
             }))
             .child(Tab::new().label(count("Conversation", conversation)))
+            .child(Tab::new().label(count("Commits", details.map(|d| d.commits))))
             .child(Tab::new().label(count("Files changed", files)));
         let body = match tab {
             DetailsTab::Conversation => div()
@@ -1731,6 +1791,7 @@ impl SuperGitApp {
                         }),
                 )
                 .into_any_element(),
+            DetailsTab::Commits => self.render_pr_commits(pr, cx),
             DetailsTab::Files => div()
                 .flex_1()
                 .min_h_0()
@@ -1751,6 +1812,109 @@ impl SuperGitApp {
                     .child(body),
             )
             .into_any_element()
+    }
+
+    fn render_pr_commits(&self, pr: &PullRequest, cx: &mut Context<Self>) -> AnyElement {
+        let key = (pr.number, pr.head_oid.clone());
+        match self.pulls.commits.get(&key) {
+            Some(LoadState::Ready(commits)) => {
+                let theme = cx.theme().clone();
+                v_flex()
+                    .id(("pr-commits", pr.number))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(commits.is_empty(), |list| {
+                        list.child(div().p_3().child("No commits"))
+                    })
+                    .children(commits.iter().map(|commit| {
+                        let (sha, url) = (commit.oid.clone(), commit.url.clone());
+                        let abbreviated: String = sha.chars().take(8).collect();
+                        let date = commit
+                            .committed_date
+                            .get(..10)
+                            .unwrap_or(&commit.committed_date);
+                        v_flex()
+                            .id(SharedString::from(sha.clone()))
+                            .min_w_0()
+                            .px_4()
+                            .py_3()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(commit.message_headline.clone()),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .flex_none()
+                                            .child(
+                                                Button::new("copy-pr-commit-sha")
+                                                    .label(abbreviated)
+                                                    .small()
+                                                    .ghost()
+                                                    .tooltip("Copy full commit SHA")
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            cx.write_to_clipboard(
+                                                                ClipboardItem::new_string(
+                                                                    sha.clone(),
+                                                                ),
+                                                            );
+                                                            this.flash(
+                                                                "Copied commit SHA",
+                                                                false,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("open-pr-commit")
+                                                    .label("Open")
+                                                    .small()
+                                                    .ghost()
+                                                    .tooltip("View the commit on GitHub")
+                                                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                                            ),
+                                    ),
+                            )
+                            .when(!commit.message_body.is_empty(), |row| {
+                                row.child(div().text_sm().child(commit.message_body.clone()))
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("{} · {date}", commit.author())),
+                            )
+                    }))
+                    .into_any_element()
+            }
+            Some(LoadState::Failed { error, .. }) => v_flex()
+                .child(self.render_data_notice("Commits unavailable", Some(error), false, cx))
+                .child(
+                    Button::new("retry-pr-commits")
+                        .label("Retry")
+                        .small()
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pulls.commits.remove(&key);
+                            this.ensure_pulls(cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+            _ => self.render_data_notice("Loading commits…", None, false, cx),
+        }
     }
 
     /// The Files tab: the PR's files beside its diff, like a commit in
@@ -2221,7 +2385,12 @@ impl SuperGitApp {
             .map(|(ix, check)| {
                 let (glyph, color) = check_glyph(check.status, theme);
                 let url = check.url.clone();
-                h_flex()
+                let open = self
+                    .pulls
+                    .check_inspection
+                    .as_ref()
+                    .filter(|open| Some(&open.id) == check.run_id.as_ref());
+                let row = h_flex()
                     .id(("pr-check", ix))
                     .gap_2()
                     .py_0p5()
@@ -2266,10 +2435,25 @@ impl SuperGitApp {
                                 None => check.detail.clone(),
                             }),
                     )
+                    .when_some(check.run_id.clone(), |el, id| {
+                        el.child(
+                            Button::new(("pr-check-inspect", ix))
+                                .label(if open.is_some() {
+                                    "Hide details"
+                                } else {
+                                    "Inspect"
+                                })
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_check_inspection(&id, cx);
+                                })),
+                        )
+                    })
                     .when_some(url, |el, url| {
                         el.child(
                             Button::new(("pr-check-open", ix))
-                                .label("Details")
+                                .label("GitHub")
                                 .xsmall()
                                 .ghost()
                                 .tooltip(url.clone())
@@ -2278,6 +2462,12 @@ impl SuperGitApp {
                                     this.report(r, "Opened in browser", cx);
                                 })),
                         )
+                    });
+                v_flex()
+                    .flex_none()
+                    .child(row)
+                    .when_some(open, |el, open| {
+                        el.child(self.render_check_inspection(open, check, theme, cx))
                     })
                     .into_any_element()
             })
@@ -2374,7 +2564,7 @@ impl SuperGitApp {
                         cx,
                     )
                 }
-                Activity::Thread(thread) => self.render_thread(number, ix, thread, theme, cx),
+                Activity::Thread(thread) => self.render_thread(&details.pr, ix, thread, theme, cx),
             })
             .collect();
         v_flex()
@@ -2412,12 +2602,13 @@ impl SuperGitApp {
 
     fn render_thread(
         &self,
-        number: u64,
+        pr: &PullRequest,
         ix: usize,
         thread: &ReviewThread,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let number = pr.number;
         let expanded = thread.resolved == self.pulls.toggled_threads.contains(&thread.id);
         let id = thread.id.clone();
         let location = match thread.line {
@@ -2503,8 +2694,11 @@ impl SuperGitApp {
             )
             .when(expanded, |el| {
                 el.child(diff_excerpt(&thread.diff_hunk, theme)).child(
-                    v_flex().px_3().py_2().gap_3().children(
-                        thread.comments.iter().enumerate().map(|(cix, comment)| {
+                    v_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_3()
+                        .children(thread.comments.iter().enumerate().map(|(cix, comment)| {
                             comment_body(
                                 SharedString::from(format!("pr-{number}-t{ix}-{cix}")),
                                 comment,
@@ -2512,8 +2706,8 @@ impl SuperGitApp {
                                 None,
                                 theme,
                             )
-                        }),
-                    ),
+                        }))
+                        .child(self.render_review_context_button(pr, ix, thread, cx)),
                 )
             })
             .into_any_element()

@@ -3,6 +3,7 @@
 //! remote itself.
 #![forbid(unsafe_code)]
 
+mod check_inspection;
 mod details;
 
 use std::ffi::OsStr;
@@ -12,9 +13,17 @@ use std::process::{Command, Stdio};
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
+pub use check_inspection::{CheckAnnotation, CheckInspection, check_inspection};
 pub use details::{
-    AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review,
-    ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_details,
+    AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrCommit, PrDetails, Review,
+    ReviewState, ReviewThread, disable_auto_merge, merge_pr, pr_commits, pr_details,
+};
+
+mod publish;
+
+pub use publish::{
+    DraftPullRequest, PublishBase, PublishRepository, create_draft_pr, open_pr_from_branch,
+    publish_repository,
 };
 
 mod publish;
