@@ -815,15 +815,27 @@ impl SuperGitApp {
     }
 
     /// Right-click on a file row: ask an agent about that file.
-    fn file_menu(row: Stateful<Div>, path: String, cx: &mut Context<Self>) -> AnyElement {
+    fn file_menu(
+        &self,
+        row: Stateful<Div>,
+        path: String,
+        list: FileList,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let viewed = if list == FileList::Pull {
+            self.pr_file_checkbox(&path, cx)
+        } else {
+            None
+        };
         let owner = cx.entity().downgrade();
-        row.context_menu(move |menu, _, cx| {
-            let Some(owner) = owner.upgrade() else {
-                return menu;
-            };
-            owner.update(cx, |this, cx| this.context_menu(menu, Some(&path), cx))
-        })
-        .into_any_element()
+        row.children(viewed)
+            .context_menu(move |menu, _, cx| {
+                let Some(owner) = owner.upgrade() else {
+                    return menu;
+                };
+                owner.update(cx, |this, cx| this.context_menu(menu, Some(&path), cx))
+            })
+            .into_any_element()
     }
 
     fn toggle_dir(&mut self, list: FileList, path: String, cx: &mut Context<Self>) {
@@ -3934,7 +3946,7 @@ impl SuperGitApp {
                     collapsed,
                     files: count,
                     entry: Some(ix),
-                } => Self::file_menu(
+                } => self.file_menu(
                     submodule_dir_row(
                         row,
                         &files[ix],
@@ -3951,6 +3963,7 @@ impl SuperGitApp {
                     .on_click(Self::open_file(list, files[ix].path.clone(), cx))
                     .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
+                    list,
                     cx,
                 ),
                 TreeRow::Dir {
@@ -3965,7 +3978,7 @@ impl SuperGitApp {
                         cx.listener(move |this, _, _, cx| this.toggle_dir(list, path.clone(), cx)),
                     )
                     .into_any_element(),
-                TreeRow::File { ix, name, depth } => Self::file_menu(
+                TreeRow::File { ix, name, depth } => self.file_menu(
                     change_row(
                         ix,
                         &files[ix],
@@ -3977,6 +3990,7 @@ impl SuperGitApp {
                     .on_click(Self::open_file(list, files[ix].path.clone(), cx))
                     .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
+                    list,
                     cx,
                 ),
             })
@@ -3986,7 +4000,7 @@ impl SuperGitApp {
                 .iter()
                 .map(|&ix| {
                     let file = &files[ix];
-                    Self::file_menu(
+                    self.file_menu(
                         change_row(
                             ix,
                             file,
@@ -3998,6 +4012,7 @@ impl SuperGitApp {
                         .on_click(Self::open_file(list, file.path.clone(), cx))
                         .children(self.staging_buttons(list, file, cx)),
                         file.path.clone(),
+                        list,
                         cx,
                     )
                 })
