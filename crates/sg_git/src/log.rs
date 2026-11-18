@@ -326,18 +326,19 @@ pub fn fork(path: &Path) -> Result<Option<Fork>> {
     }))
 }
 
-/// See [`ForkParent`]. Needs `%(ahead-behind)` (Git 2.41+); `None` without it.
+/// See [`ForkParent`]. Older Git lacks the batched ahead/behind atom.
 fn nearest_branch(path: &Path, current: Option<&str>, base: &str) -> Option<ForkParent> {
-    let out = git(
-        path,
-        [
-            "for-each-ref",
-            "--format=%(refname)%00%(refname:short)%00%(symref)%00%(ahead-behind:HEAD)",
-            "refs/heads/",
-            "refs/remotes/",
-        ],
-    )
-    .ok()?;
+    let list_refs = |format| {
+        git(
+            path,
+            ["for-each-ref", format, "refs/heads/", "refs/remotes/"],
+        )
+    };
+    let batched =
+        list_refs("--format=%(refname)%00%(refname:short)%00%(symref)%00%(ahead-behind:HEAD)");
+    let out = batched
+        .or_else(|_| list_refs("--format=%(refname)%00%(refname:short)%00%(symref)"))
+        .ok()?;
     let base_name = base.split_once('/').map_or(base, |(_, branch)| branch);
     let upstream = git(
         path,
@@ -355,12 +356,7 @@ fn nearest_branch(path: &Path, current: Option<&str>, base: &str) -> Option<Fork
         .lines()
         .filter_map(|line| {
             let mut fields = line.split('\0');
-            let (full, short, symref, counts) = (
-                fields.next()?,
-                fields.next()?,
-                fields.next()?,
-                fields.next()?,
-            );
+            let (full, short, symref) = (fields.next()?, fields.next()?, fields.next()?);
             let remote = full.starts_with("refs/remotes/");
             let branch = if remote {
                 short.split_once('/').map_or(short, |(_, branch)| branch)
@@ -372,7 +368,17 @@ fn nearest_branch(path: &Path, current: Option<&str>, base: &str) -> Option<Fork
                 return None;
             }
             // Commits of HEAD's own since the fork; 0: the ref contains HEAD.
-            let own: usize = counts.split_whitespace().nth(1)?.parse().ok()?;
+            let own: usize = match fields.next() {
+                Some(counts) => counts.split_whitespace().nth(1)?.parse().ok()?,
+                None => git(
+                    path,
+                    ["rev-list", "--count", "HEAD", &format!("^{full}"), "--"],
+                )
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?,
+            };
             let is_base = short == base || (!remote && short == base_name);
             (own > 0).then_some(((own, !is_base, remote, short), full))
         })
