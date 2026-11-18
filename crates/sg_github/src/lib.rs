@@ -434,6 +434,9 @@ fn parse_timestamp(value: &str) -> Option<std::time::SystemTime> {
         .map(std::time::SystemTime::from)
 }
 
+mod issues;
+pub use issues::{Issue, IssueReference, view_issue};
+
 /// Recognize canonical GitHub remotes without guessing a repository namespace.
 pub fn repository_identity(url: &str) -> Option<String> {
     let path = url
