@@ -31,10 +31,11 @@ use sg_agents::chat::{
 use sg_agents::process::{AgentProcess, ProcessEvent};
 use sg_claude::conversation::Reply;
 use sg_claude::{ClaudeEvents as _, ClaudeProcess, PermissionMode, SpawnOptions};
-use sg_codex::{CodexFold, CodexProcess, Policy};
+use sg_codex::{CodexFold, CodexProcess, CollaborationMode, Policy};
 
 mod questions;
 
+mod collaboration;
 mod turn_plan;
 
 /// Max lines of tool output shown when a tool row is expanded.
@@ -61,6 +62,7 @@ enum Backend {
         fold: CodexFold,
         /// Sent with every turn: Codex applies policies per turn.
         policy: Policy,
+        collaboration: Option<CollaborationMode>,
         /// History is being read; sending waits for it so new turns land
         /// after it.
         loading: bool,
@@ -84,6 +86,7 @@ impl Backend {
                 process: None,
                 fold: CodexFold::new(),
                 policy: Policy::default(),
+                collaboration: None,
                 loading: false,
                 history: None,
             },
@@ -225,6 +228,12 @@ impl ChatSession {
         {
             *policy = saved_policy;
         }
+        if let Backend::Codex { collaboration, .. } = &mut chat.backend {
+            *collaboration = saved
+                .codex_collaboration_mode
+                .as_deref()
+                .and_then(CollaborationMode::parse);
+        }
         chat.options.model = saved.model.clone();
         chat.options.effort = saved.effort.clone();
         chat.attention = saved.attention.clone().restored();
@@ -268,6 +277,12 @@ impl ChatSession {
             policy: match &self.backend {
                 Backend::Codex { policy, .. } => policy.as_str().into(),
                 Backend::Claude { .. } => String::new(),
+            },
+            codex_collaboration_mode: match &self.backend {
+                Backend::Codex { collaboration, .. } => {
+                    collaboration.map(|mode| mode.as_str().into())
+                }
+                Backend::Claude { .. } => None,
             },
         }
     }
@@ -759,17 +774,20 @@ impl ChatSession {
         let text = text.to_string();
         let before = self.convo.items.len();
         self.convo.push_user(&text);
-        let result = self.ensure_process(cx).and_then(|p| {
-            if let Backend::Codex {
-                process: Some(process),
-                ..
-            } = &self.backend
-            {
-                process.send_turn(&text, self.options.codex_turn(self.convo.model.as_deref()))
-            } else {
-                p.send_user(&text)
-            }
-        });
+        let result = self
+            .ensure_process(cx)
+            .and_then(|process| match &self.backend {
+                Backend::Codex {
+                    process: Some(codex),
+                    collaboration,
+                    ..
+                } => codex.send_turn_in_mode(
+                    &text,
+                    self.options.codex_turn(self.convo.model.as_deref()),
+                    *collaboration,
+                ),
+                _ => process.send_user(&text),
+            });
         if let Err(e) = &result {
             self.convo.push_notice(format!("{e:#}"), true);
             self.convo.status = Status::Idle;
@@ -1456,6 +1474,7 @@ impl ChatSession {
             })
             .child(self.render_model_options(cx))
             .child(Textarea::new(&self.input))
+            .children(self.render_codex_collaboration(cx))
             .child(
                 h_flex()
                     .justify_between()

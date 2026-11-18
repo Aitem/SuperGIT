@@ -72,6 +72,8 @@ pub struct SavedConversation {
     pub policy: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_collaboration_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
