@@ -60,11 +60,36 @@ use the linked executable and its gzip archive at level 6.
 | Clean build user + system CPU | 903.02 s | 939.90 s |
 | Executable | 33,786,992 B | 34,693,168 B |
 | Gzip | 11,975,470 B | 12,376,073 B |
+| Signed macOS app ZIP | 12,146,625 B | 12,541,884 B |
 
 The probe added 0.86 MiB to the executable and 0.38 MiB to gzip. Its CPU cost
 in this pair was about 4% higher. A separate run also finished sooner with
 the probe, which ran second both times. Elapsed time depends on build order
-and machine load. Linux and packaged app sizes require separate measurements.
+and machine load. The ZIP measurement used the same app resources and plist,
+ad-hoc signing, `codesign --verify --strict`, and `ditto -c -k --keepParent`.
+The signed archive grew by 395,259 bytes (3.3%).
+
+### Linux arm64 release
+
+Debian Bookworm in the official Rust 1.100 arm64 Docker image, Git 2.39.5,
+four Cargo jobs and empty target directories. Dependencies were fetched
+before timing. The first pair built CLI first, the second built libgit2
+first. Each pair built the same locked checkout with the feature toggled.
+
+| Metric | CLI | With libgit2 probe |
+| --- | ---: | ---: |
+| Pair 1 elapsed | 258.81 s | 399.02 s |
+| Pair 1 user + system CPU | 990.34 s | 1,497.00 s |
+| Pair 2 elapsed | 271.95 s | 308.30 s |
+| Pair 2 user + system CPU | 1,045.77 s | 1,188.33 s |
+| Executable, pair 2 | 67,107,888 B | 68,199,712 B |
+| Gzip, pair 2 | 23,073,110 B | 23,566,699 B |
+
+The observed Linux size increases were 1.04 MiB for the executable and
+0.47 MiB for gzip. `ldd` showed one additional system library, `libz.so.1`.
+The second pair added 36.35 s elapsed and 142.56 s CPU, about 13–14%.
+The larger first-pair difference coincided with other builds on the host.
+Use these timings as observations from one host and architecture.
 
 The default stays with CLI. Status gains vary with checkout conditions, the
 fresh 20-worktree fixture improved p95 by about 15%, and a global LFS filter
