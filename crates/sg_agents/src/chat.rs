@@ -62,6 +62,37 @@ pub struct PermissionRequest {
     pub decision: Option<Decision>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserQuestion {
+    pub id: String,
+    pub header: String,
+    pub prompt: String,
+    pub options: Vec<QuestionOption>,
+    pub allow_other: bool,
+    pub secret: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputResolution {
+    Pending,
+    Answered,
+    Expired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInputRequest {
+    pub request_id: String,
+    pub questions: Vec<UserQuestion>,
+    pub blocking: bool,
+    pub resolution: InputResolution,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     User {
@@ -76,6 +107,7 @@ pub enum Item {
     },
     Tool(ToolCall),
     Permission(PermissionRequest),
+    UserInput(UserInputRequest),
     Notice {
         text: String,
         is_error: bool,
@@ -97,13 +129,18 @@ pub enum Status {
     Working,
     /// A permission prompt is waiting for the user.
     NeedsPermission,
+    /// An interactive question is blocking the agent.
+    NeedsInput,
     /// The process ended (the next turn starts it again and resumes).
     Exited,
 }
 
 impl Status {
     pub fn is_busy(self) -> bool {
-        matches!(self, Self::Starting | Self::Working | Self::NeedsPermission)
+        matches!(
+            self,
+            Self::Starting | Self::Working | Self::NeedsPermission | Self::NeedsInput
+        )
     }
 }
 
@@ -186,7 +223,56 @@ impl Conversation {
                 break;
             }
         }
-        if self.pending_permission().is_none() && self.status == Status::NeedsPermission {
+        self.settle_pending_requests();
+    }
+
+    pub fn pending_user_input(&self) -> Option<&UserInputRequest> {
+        self.items.iter().rev().find_map(|item| match item {
+            Item::UserInput(request) if request.resolution == InputResolution::Pending => {
+                Some(request)
+            }
+            _ => None,
+        })
+    }
+
+    pub fn user_input(&self, request_id: &str) -> Option<&UserInputRequest> {
+        self.items.iter().rev().find_map(|item| match item {
+            Item::UserInput(request) if request.request_id == request_id => Some(request),
+            _ => None,
+        })
+    }
+
+    pub fn push_user_input(&mut self, request: UserInputRequest) {
+        if self
+            .user_input(&request.request_id)
+            .is_some_and(|current| current.resolution == InputResolution::Pending)
+        {
+            return;
+        }
+        self.items.push(Item::UserInput(request));
+        self.settle_pending_requests();
+    }
+
+    pub fn resolve_user_input(&mut self, request_id: &str, resolution: InputResolution) {
+        for item in self.items.iter_mut().rev() {
+            if let Item::UserInput(request) = item
+                && request.request_id == request_id
+                && request.resolution == InputResolution::Pending
+            {
+                request.resolution = resolution;
+                break;
+            }
+        }
+        self.settle_pending_requests();
+    }
+
+    fn settle_pending_requests(&mut self) {
+        if self.pending_permission().is_some() {
+            self.status = Status::NeedsPermission;
+        } else if self.items.iter().any(|item| matches!(item,
+            Item::UserInput(request) if request.blocking && request.resolution == InputResolution::Pending)) {
+            self.status = Status::NeedsInput;
+        } else if matches!(self.status, Status::NeedsPermission | Status::NeedsInput) {
             self.status = Status::Working;
         }
     }
@@ -287,6 +373,9 @@ impl Conversation {
         for item in &mut self.items {
             match item {
                 Item::Permission(p) if p.decision.is_none() => p.decision = Some(Decision::Denied),
+                Item::UserInput(request) if request.resolution == InputResolution::Pending => {
+                    request.resolution = InputResolution::Expired;
+                }
                 Item::Tool(t) => t.checking = false,
                 _ => {}
             }
@@ -301,10 +390,12 @@ impl Conversation {
             self.push_notice(reason.unwrap_or_else(|| format!("{agent} exited")), true);
         }
         for item in &mut self.items {
-            if let Item::Permission(p) = item
-                && p.decision.is_none()
-            {
-                p.decision = Some(Decision::Expired);
+            match item {
+                Item::Permission(p) if p.decision.is_none() => p.decision = Some(Decision::Expired),
+                Item::UserInput(request) if request.resolution == InputResolution::Pending => {
+                    request.resolution = InputResolution::Expired;
+                }
+                _ => {}
             }
         }
         self.status = Status::Exited;
@@ -409,6 +500,42 @@ mod tests {
         c.end_turn(Some(5), false, None);
         assert_eq!(c.status, Status::Idle);
         assert_eq!(c.permission("r1").unwrap().decision, Some(Decision::Denied));
+    }
+
+    #[test]
+    fn blocking_and_optional_questions_have_independent_lifetimes() {
+        let mut conversation = Conversation {
+            status: Status::Working,
+            ..Conversation::default()
+        };
+        let optional = UserInputRequest {
+            request_id: "optional".into(),
+            questions: Vec::new(),
+            blocking: false,
+            resolution: InputResolution::Pending,
+        };
+        let blocking = UserInputRequest {
+            request_id: "blocking".into(),
+            blocking: true,
+            ..optional.clone()
+        };
+        conversation.push_user_input(optional);
+        assert_eq!(conversation.status, Status::Working);
+        conversation.push_user_input(blocking.clone());
+        conversation.push_user_input(blocking);
+        assert_eq!(conversation.items.len(), 2);
+        assert_eq!(conversation.status, Status::NeedsInput);
+        conversation.resolve_user_input("blocking", InputResolution::Answered);
+        assert_eq!(conversation.status, Status::Working);
+        conversation.end_turn(None, false, None);
+        assert_eq!(
+            conversation.user_input("optional").unwrap().resolution,
+            InputResolution::Expired
+        );
+        assert_eq!(
+            conversation.user_input("blocking").unwrap().resolution,
+            InputResolution::Answered
+        );
     }
 
     #[test]
