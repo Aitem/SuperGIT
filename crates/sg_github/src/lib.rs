@@ -26,13 +26,6 @@ pub use publish::{
     publish_repository,
 };
 
-mod publish;
-
-pub use publish::{
-    DraftPullRequest, PublishBase, PublishRepository, create_draft_pr, open_pr_from_branch,
-    publish_repository,
-};
-
 /// Run `gh` in `repo` without prompts or colors; stdout on success, its
 /// stderr as the error otherwise.
 fn gh<I, S>(repo: &Path, args: I) -> Result<Vec<u8>>
