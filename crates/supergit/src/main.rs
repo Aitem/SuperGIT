@@ -210,6 +210,7 @@ fn main() -> Result<()> {
             ..TitleBar::window_options()
         };
         let (_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
+            window.set_window_title("SuperGIT");
             cx.new(|cx| app::SuperGitApp::new(repo, launch_dir, window, cx))
         })
         .expect("failed to open the main window");
