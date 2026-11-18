@@ -30,6 +30,47 @@ fn file_action(worktree: &Path, path: &str, action: Staging) -> anyhow::Result<(
 }
 
 #[test]
+fn stages_only_the_selected_conflict_resolution_by_literal_path() {
+    let temp = repository();
+    let root = temp.path();
+    for file in ["[a].txt", "a.txt"] {
+        std::fs::write(root.join(file), "base\n").unwrap();
+    }
+    git(root, ["add", "."]).unwrap();
+    git(root, ["commit", "-qm", "base"]).unwrap();
+    git(root, ["switch", "-qc", "incoming"]).unwrap();
+    for file in ["[a].txt", "a.txt"] {
+        std::fs::write(root.join(file), "incoming\n").unwrap();
+    }
+    git(root, ["commit", "-qam", "incoming"]).unwrap();
+    git(root, ["switch", "-q", "main"]).unwrap();
+    for file in ["[a].txt", "a.txt"] {
+        std::fs::write(root.join(file), "local\n").unwrap();
+    }
+    git(root, ["commit", "-qam", "local"]).unwrap();
+    assert!(git(root, ["merge", "--no-edit", "incoming"]).is_err());
+    let snapshot = status(root).unwrap();
+    assert_eq!(snapshot.conflicted_count(), 2);
+    let file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "[a].txt")
+        .unwrap();
+    assert!(Staging::Stage.available(file));
+    assert!(!Staging::Unstage.available(file));
+    assert!(!Staging::Stage.hunk_available(file));
+    std::fs::write(root.join("[a].txt"), "resolution\n").unwrap();
+    let untouched = std::fs::read(root.join("a.txt")).unwrap();
+    change_staging(root, &snapshot, file, Staging::Stage).unwrap();
+    assert_eq!(
+        git(root, ["show", ":[a].txt"]).unwrap().trim(),
+        "resolution"
+    );
+    assert_eq!(status(root).unwrap().conflicted_count(), 1);
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), untouched);
+}
+
+#[test]
 fn stages_literal_names_and_unstages_on_an_unborn_branch() {
     let temp = repository();
     let root = temp.path();
