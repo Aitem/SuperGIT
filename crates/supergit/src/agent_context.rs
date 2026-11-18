@@ -47,7 +47,7 @@ impl Attachment {
 
     pub fn prompt(&self) -> String {
         format!(
-            "Attached diff snapshot\nWorktree: {}\nFile: {}\nComparison: {}\nSelection: {}{}{}\n\n{}\nEnd of attached snapshot\n",
+            "Attached context snapshot\nWorktree: {}\nSource: {}\nComparison: {}\nSelection: {}{}{}\n\n{}\nEnd of attached snapshot\n",
             self.worktree.display(),
             self.path,
             self.comparison,
