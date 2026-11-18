@@ -3309,7 +3309,7 @@ impl SuperGitApp {
             let diff = Diff::new(state)
                 .line_number(true)
                 .soft_wrap(self.diff_layout == DiffLayout::Split);
-            with_submodule_cards(diff, self.submodules(list)).into_any_element()
+            self.with_review_cards(diff, list, cx).into_any_element()
         };
         v_flex()
             .size_full()
@@ -5227,41 +5227,6 @@ fn diff_mode(layout: DiffLayout) -> DiffMode {
         DiffLayout::Unified => DiffMode::Unified,
         DiffLayout::Split => DiffMode::Split,
     }
-}
-
-/// Submodule entries in `diff` get a `submodule` tag after their path and a
-/// card under their header: the recorded commits, the commits in between
-/// and the state of the checkout.
-fn with_submodule_cards(diff: Diff, submodules: &[SubmoduleChange]) -> Diff {
-    if submodules.is_empty() {
-        return diff;
-    }
-    let submodules = std::rc::Rc::new(submodules.to_vec());
-    let cards = submodules.clone();
-    let tags = submodules.clone();
-    diff.annotations(submodules.iter().map(|submodule| {
-        DiffAnnotation::file(
-            crate::submodules::card_id(submodule),
-            submodule.path.clone(),
-        )
-    }))
-    .render_annotation(move |annotation, _, cx| {
-        cards
-            .iter()
-            .find(|submodule| submodule.path == annotation.path().as_ref())
-            .map(|submodule| crate::submodules::card(submodule, cx.theme()))
-            .unwrap_or_else(div)
-    })
-    .render_header_title_suffix(move |file, _, cx| {
-        if tags
-            .iter()
-            .any(|submodule| submodule.path == file.path().as_ref())
-        {
-            crate::submodules::tag(cx.theme())
-        } else {
-            div()
-        }
-    })
 }
 
 /// A file of a parsed patch, as difftastic should compare it.
