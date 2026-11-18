@@ -75,6 +75,8 @@ actions!(
     ]
 );
 
+mod stashes;
+
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,6 +180,8 @@ pub struct SuperGitApp {
     cleanup_paths: std::collections::HashSet<PathBuf>,
     cleanup_results: Vec<(String, bool)>,
     cleanup_results_open: bool,
+    stash_dialog: Option<stashes::StashDialog>,
+    stash_handle: FocusHandle,
     observed_open_prs: HashMap<u64, worktrees::ObservedPr>,
     cleanup_attempted: std::collections::HashSet<String>,
     cleanup_preview: Option<worktrees::CleanupPreview>,
@@ -363,6 +367,8 @@ impl SuperGitApp {
             cleanup_paths: Default::default(),
             cleanup_results: Vec::new(),
             cleanup_results_open: false,
+            stash_dialog: None,
+            stash_handle: cx.focus_handle(),
             observed_open_prs: HashMap::new(),
             cleanup_attempted: Default::default(),
             cleanup_preview: None,
@@ -1848,6 +1854,7 @@ impl SuperGitApp {
         self.cleanup_results_open = false;
         self.cleanup_preview = None;
         self.rebase_dialog = None;
+        self.stash_dialog = None;
         self.prs_fetched_at = None;
         self.worktrees.clear();
         self.load_error = None;
@@ -3563,6 +3570,14 @@ impl SuperGitApp {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.change_comparison(true, None, ChangeScope::All, cx)
                     })),
+            )
+            .child(
+                Button::new("worktree-stashes")
+                    .label("Stashes…")
+                    .xsmall()
+                    .ghost()
+                    .disabled(self.git_operation_running())
+                    .on_click(cx.listener(|this, _, window, cx| this.open_stashes(window, cx))),
             );
         if let Some(base) = base {
             if !self.base_inputs.contains_key(&path) {
@@ -4911,6 +4926,9 @@ impl Render for SuperGitApp {
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))
+            })
+            .when(self.stash_dialog.is_some(), |el| {
+                el.child(self.render_stashes(cx))
             })
     }
 }
