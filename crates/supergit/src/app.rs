@@ -1,6 +1,8 @@
 //! The main window: worktrees on the left, the selected worktree's changes,
 //! history, agent sessions and pull requests on the right.
 
+mod sync;
+
 mod base;
 mod projects;
 mod pulls;
@@ -172,6 +174,8 @@ pub struct SuperGitApp {
     creation_base: LoadState<sg_git::BaseInfo>,
     creation_base_task: Option<Task<()>>,
     base_update_error: Option<String>,
+    sync_dialog: Option<sync::SyncDialog>,
+    sync_focus: FocusHandle,
     base_update_paths: std::collections::HashSet<PathBuf>,
     cleanup_task: Option<Task<()>>,
     cleanup_paths: std::collections::HashSet<PathBuf>,
@@ -357,6 +361,8 @@ impl SuperGitApp {
             creation_base: LoadState::Loading,
             creation_base_task: None,
             base_update_error: None,
+            sync_dialog: None,
+            sync_focus: cx.focus_handle(),
             base_update_paths: Default::default(),
             cleanup_task: None,
             cleanup_paths: Default::default(),
@@ -1837,6 +1843,7 @@ impl SuperGitApp {
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.creation_base = LoadState::Loading;
         self.base_update_error = None;
+        self.sync_dialog = None;
         self.observed_open_prs.clear();
         self.cleanup_attempted.clear();
         self.cleanup_results.clear();
@@ -2829,6 +2836,9 @@ impl SuperGitApp {
                                 }
                             })),
                     )
+                    .child(Button::new("sync-worktree").label("Sync…").small().ghost()
+                        .disabled(self.git_operation_running())
+                        .on_click(cx.listener(|this, _, window, cx| this.open_sync_dialog(window, cx))))
                     .when(!info.wt.is_main, |el| {
                         el.child(
                             Button::new("clean-up-worktree")
@@ -4869,6 +4879,9 @@ impl Render for SuperGitApp {
             })
             .when(self.rebase_dialog.is_some(), |el| {
                 el.child(self.render_rebase_dialog(cx))
+            })
+            .when(self.sync_dialog.is_some(), |el| {
+                el.child(self.render_sync_dialog(cx))
             })
             .when(self.pulls.dialog_open(), |el| {
                 el.child(self.render_pr_dialog(cx))

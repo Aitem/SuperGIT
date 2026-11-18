@@ -32,7 +32,9 @@ pub use log::{
 };
 mod publish;
 
-pub use publish::{BranchPublication, branch_publication, publication_commits, publish_branch};
+pub use publish::{
+    BranchPublication, branch_publication, fetch_remote, publication_commits, publish_branch,
+};
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
 pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};

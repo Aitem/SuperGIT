@@ -138,3 +138,32 @@ fn respects_the_selected_push_remote_and_the_tracking_branch() {
     assert_eq!(explicit.remote, "publish");
     assert_eq!(explicit.remote_branch, "feature/demo");
 }
+
+#[test]
+fn fetching_one_remote_updates_tracking_refs_and_preserves_the_worktree() {
+    let (local, remote) = fixture();
+    let path = local.path();
+    let base = object(remote.path(), "refs/heads/main");
+    let tip = object(path, "HEAD");
+    git(
+        remote.path(),
+        ["update-ref", "refs/heads/remote-only", &base],
+    )
+    .unwrap();
+    let fetch_head = path.join(".git/FETCH_HEAD");
+    std::fs::write(&fetch_head, "kept from a previous fetch\n").unwrap();
+    std::fs::write(path.join("draft.txt"), "working edit\n").unwrap();
+    sg_git::fetch_remote(path, "origin").unwrap();
+
+    assert_eq!(object(path, "refs/remotes/origin/remote-only"), base);
+    assert_eq!(object(path, "HEAD"), tip);
+    assert_eq!(
+        std::fs::read_to_string(fetch_head).unwrap(),
+        "kept from a previous fetch\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("draft.txt")).unwrap(),
+        "working edit\n"
+    );
+    assert!(sg_git::fetch_remote(path, "missing").is_err());
+}

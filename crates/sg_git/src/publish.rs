@@ -145,6 +145,28 @@ pub fn publication_commits(
     )))
 }
 
+/// Fetch one configured remote without replacing a worktree's FETCH_HEAD.
+pub fn fetch_remote(path: &Path, remote: &str) -> Result<()> {
+    let remotes = git(path, ["remote"])?;
+    ensure!(
+        remotes.lines().any(|name| name == remote),
+        "Remote '{remote}' no longer exists"
+    );
+    git_timeout(
+        path,
+        &[
+            "fetch",
+            "--atomic",
+            "--no-recurse-submodules",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+            remote,
+        ],
+        Duration::from_secs(120),
+    )
+}
+
 /// Push the confirmed commit by object ID, even if the branch moves after validation.
 /// The explicit refspec and options limit the write to its remote branch.
 pub fn publish_branch(path: &Path, expected: &BranchPublication) -> Result<()> {
