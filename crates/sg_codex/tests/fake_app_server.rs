@@ -2,14 +2,15 @@
 //! speaks just enough of the app-server protocol). No real Codex runs.
 #![expect(clippy::unwrap_used, reason = "tests")]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::TryRecvError;
-use serde_json::Value;
-use sg_agents::chat::{Conversation, Decision, Item, Status};
+use serde_json::{Value, json};
+use sg_agents::chat::{Conversation, Decision, InputResolution, Item, Status};
 use sg_agents::process::{AgentProcess, ProcessEvent};
-use sg_codex::{CodexFold, CodexProcess, Policy, Reply, SpawnOptions};
+use sg_codex::{CodexFold, CodexProcess, Policy, Reply, SpawnOptions, TurnOptions};
 
 const FAKE: &str = r#"#!/bin/sh
 # A fake `codex`: MODE and VERSION are substituted per test.
@@ -36,12 +37,21 @@ while IFS= read -r line; do
       echo "{\"id\":$id,\"result\":{\"turn\":{\"id\":\"tu-1\",\"status\":\"inProgress\",\"items\":[]}}}"
       echo '{"method":"turn/started","params":{"turn":{"id":"tu-1","status":"inProgress"}}}'
       if [ "$MODE" = crash ]; then echo "fatal: model stream died" >&2; exit 1; fi
+      if [ "$MODE" = questions ]; then
+        echo '{"method":"item/tool/requestUserInput","id":"choice-1","params":{"itemId":"q-1","isBlocking":true,"questions":[{"id":"base","header":"Target","question":"Which branch should receive the PR?","isOther":true,"options":[{"label":"main","description":"Default branch"},{"label":"develop","description":"Integration branch"}]},{"id":"note","header":"Notes","question":"Any rollout notes?","options":null}]}}'
+        continue
+      fi
       echo '{"method":"item/started","params":{"item":{"type":"commandExecution","id":"c1","command":"/bin/zsh -lc ls","status":"inProgress"}}}'
       echo '{"method":"item/commandExecution/requestApproval","id":0,"params":{"itemId":"c1","command":"/bin/zsh -lc ls","cwd":"/tmp","availableDecisions":["accept","acceptForSession","decline","cancel"]}}' ;;
     *'"method":"turn/interrupt"'*)
       echo "{\"id\":$id,\"result\":{}}"
       echo '{"method":"serverRequest/resolved","params":{"requestId":0}}'
       echo '{"method":"turn/completed","params":{"turn":{"id":"tu-1","status":"interrupted","error":null}}}' ;;
+
+    '{"id":"choice-1","result"'*)
+      echo '{"method":"serverRequest/resolved","params":{"requestId":"choice-1"}}'
+      echo '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m1","text":"Received your answers"}}}'
+      echo '{"method":"turn/completed","params":{"turn":{"id":"tu-1","status":"completed","error":null,"durationMs":5}}}' ;;
     '{"id":0,"result"'*)
       case "$line" in *'"decline"'*) status=declined ;; *) status=completed ;; esac
       echo "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"c1\",\"command\":\"ls\",\"status\":\"$status\",\"aggregatedOutput\":\"a.txt\",\"exitCode\":0}}}"
@@ -177,6 +187,49 @@ fn turn_end(c: &Conversation) -> Option<(bool, Option<String>)> {
 }
 
 #[test]
+fn answers_continue_the_same_turn_with_an_opaque_request_id() {
+    let fake = Fake::new("question", "questions", "0.157.1");
+    let mut session = Session::start(&fake.program, fake.worktree("wt"), None);
+    session.send("Prepare a release plan");
+    session.until("blocking question", |s| {
+        s.convo.status == Status::NeedsInput
+    });
+    let request = session.convo.pending_user_input().unwrap().clone();
+    assert_eq!(request.questions.len(), 2);
+    let answers = BTreeMap::from([
+        ("base".to_string(), "develop".to_string()),
+        ("note".to_string(), "Deploy after tests".to_string()),
+    ]);
+    session
+        .process
+        .respond_to_questions(&request.request_id, &answers)
+        .unwrap();
+    session
+        .convo
+        .resolve_user_input(&request.request_id, InputResolution::Answered);
+    session.until("original turn finishes", |s| turn_end(&s.convo).is_some());
+    assert_eq!(
+        session
+            .convo
+            .user_input(&request.request_id)
+            .unwrap()
+            .resolution,
+        InputResolution::Answered
+    );
+    assert_eq!(fake.sent("wt", "turn/start").len(), 1);
+    assert_eq!(
+        fake.sent("wt", "initialize")[0]["params"]["capabilities"]["experimentalApi"],
+        true
+    );
+    assert!(
+        fake.received("wt")
+            .contains(&json!({"id":"choice-1","result":{
+                "answers":{"base":{"answers":["develop"]},"note":{"answers":["Deploy after tests"]}}
+            }}))
+    );
+}
+
+#[test]
 fn approved_command_completes_the_turn() {
     let fake = Fake::new("approve", "normal", "0.157.1");
     let mut s = Session::start(&fake.program, fake.worktree("wt"), None);
@@ -229,13 +282,24 @@ fn denied_command_is_declined_and_policy_changes_apply_next_turn() {
     );
 
     s.process.set_policy(Policy::ReadOnly);
-    s.send("again");
+    s.convo.push_user("again");
+    s.process
+        .send_turn(
+            "again",
+            TurnOptions {
+                model: Some("second-model".into()),
+                effort: Some("high".into()),
+            },
+        )
+        .unwrap();
     s.until("the second prompt", |s| {
         s.convo.status == Status::NeedsPermission
     });
     let turns = fake.sent("wt", "turn/start");
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[1]["params"]["sandboxPolicy"]["type"], "readOnly");
+    assert_eq!(turns[1]["params"]["model"], "second-model");
+    assert_eq!(turns[1]["params"]["effort"], "high");
 }
 
 #[test]
