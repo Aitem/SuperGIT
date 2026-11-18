@@ -3384,6 +3384,11 @@ impl SuperGitApp {
             .border_b_1()
             .border_color(theme.border)
             .children(layouts)
+            .children(
+                (list == FileList::Pull)
+                    .then(|| self.line_comment_button(cx))
+                    .flatten(),
+            )
             .child(div().flex_1())
             .when_some(self.hunk_action_button(list, cx), |toolbar, action| {
                 toolbar.child(action)
@@ -5197,6 +5202,9 @@ impl Render for SuperGitApp {
             })
             .when(self.cleanup_preview.is_some(), |el| {
                 el.child(self.render_cleanup_preview(cx))
+            })
+            .when(self.line_comment_open(), |el| {
+                el.child(self.render_line_comment(cx))
             })
             .when(self.rebase_dialog.is_some(), |el| {
                 el.child(self.render_rebase_dialog(cx))
