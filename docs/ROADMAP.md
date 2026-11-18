@@ -21,7 +21,7 @@ while Claude works, copy buttons.
 
 ## 1a. Codex alongside Claude
 
-Done (v0.3): `sg_agents` holds the provider-neutral chat model and
+Done: `sg_agents` holds the provider-neutral chat model and
 `AgentProcess`; `sg_codex` drives `codex app-server` (version + login check,
 thread start/resume, queued turns, approvals, interrupt), folds its events,
 reads history via `thread/turns/list` and discovers rollouts. The panel picks
@@ -30,10 +30,11 @@ tabs, rails, sidebar and project activity by provider, and shows Codex's
 policies (Read only / Auto / Full access) instead of Claude's modes. Tested
 with recorded events, a fake app server and opt-in live tests.
 
-Next: Codex plan/todo updates (`turn/plan/updated`), streamed command output
-(`item/commandExecution/outputDelta`), model and reasoning-effort picker
-(`model/list`), answering `item/tool/requestUserInput` questions, token usage
-in the header (`thread/tokenUsage/updated`).
+The chat also shows live plan updates and context usage, answers Codex
+questions, and lets you pick the model, reasoning effort, and Default or
+Plan mode.
+
+Next: stream command output (`item/commandExecution/outputDelta`).
 
 Original plan:
 
@@ -75,8 +76,11 @@ Installing hooks touches `~/.claude/settings.json`: always ask first.
 
 ## 3. Commit graph
 
-Lane graph across all branches and worktrees (GitKraken-style), gix-based
-traversal for big repos, filters (branch, author, "by Claude"), search.
+Done: lane graph for branch history, commit search, and loading older commits
+on demand.
+
+Next: an all-branches view, filters by branch or author, and linking commits
+to agent sessions.
 
 Git backend: evaluate a hybrid before a full migration. Benchmark `gix` and
 `git2`/libgit2 for history, refs and status behind the existing `sg_git` API;
@@ -95,20 +99,25 @@ comments, reviews, inline review threads, checks, the diff (Files changed:
 Unified/Split, difftastic, local fallback for large diffs, agent context),
 and merge (method choice, confirmation, auto-merge).
 
-Next: failing job logs inline (`gh run view --log-failed`), review comments
-inline in the diff, create PR from a worktree (`gh pr create --fill`), "send
-review comments / failing check to the agent in this worktree", reply /
-resolve threads.
+You can also read failed job logs and send them to the worktree's agent,
+open a PR from a worktree, and attach a review thread to chat. In the diff,
+you can post line comments, reply to and resolve threads, and mark files
+as viewed. A PR from a fork can be checked out in its own worktree.
 
 ## 5. Commit & sync
 
-Stage/unstage files and hunks, commit (optionally AI-written message), fetch,
-pull, push buttons; ahead/behind refresh after fetch.
+Done: stage and unstage files and hunks, mark conflicts as resolved, commit
+staged changes, save and apply stashes, and cherry-pick from History. Fetch,
+pull by fast-forward, push, or rebase onto a local branch.
+
+Next: optional AI-written commit messages.
 
 ## 6. Worktree lifecycle
 
-Merged PR → offer cleanup (remove worktree + branch); bulk cleanup; setup hook
-after creation (copy `.env`, install deps), worktree from an issue/PR.
+Done: open a worktree from a GitHub issue, PR, or commit. Clean up merged
+worktrees and local branches.
+
+Next: setup hooks after creation (copy `.env`, install dependencies).
 
 ## 7. Commit ↔ session linkage
 
