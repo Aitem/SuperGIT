@@ -115,9 +115,19 @@ pub(crate) fn git_input(cwd: &Path, args: &[&str], input: &str) -> Result<()> {
 /// Run git with `input` on stdin and return raw stdout. Stdin is written on
 /// its own thread so a large request cannot deadlock against a full stdout.
 pub(crate) fn git_bytes_with_input(cwd: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>> {
+    git_bytes_with_env_and_input(cwd, args, &[], input)
+}
+
+pub(crate) fn git_bytes_with_env_and_input(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    input: Vec<u8>,
+) -> Result<Vec<u8>> {
     use std::io::Write as _;
     let (mut command, printable) = command(cwd, args);
     let mut child = command
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

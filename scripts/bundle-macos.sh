@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 install=0
 [[ "${1:-}" == "--install" ]] && install=1
 
-cargo build --release -p supergit
+cargo build --release --locked -p supergit
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 build=$(git rev-list --count HEAD 2>/dev/null || echo 1)
