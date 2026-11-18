@@ -108,6 +108,8 @@ pub(super) struct Pulls {
     show_passed_checks: bool,
     check_inspection: Option<checks::OpenCheck>,
     check_inspection_task: Option<Task<()>>,
+    job_retry: Option<checks::JobRetry>,
+    job_retry_task: Option<Task<()>>,
     /// The details column; back to the top when another PR is shown.
     details_scroll: ScrollHandle,
     shown: Option<u64>,
@@ -177,6 +179,8 @@ impl Pulls {
             show_passed_checks: false,
             check_inspection: None,
             check_inspection_task: None,
+            job_retry: None,
+            job_retry_task: None,
             details_scroll: ScrollHandle::new(),
             shown: None,
             // Screenshot builds: `SUPERGIT_DEBUG_PR_FILES=1` starts on Files
@@ -2470,7 +2474,7 @@ impl SuperGitApp {
                     .flex_none()
                     .child(row)
                     .when_some(open, |el, open| {
-                        el.child(self.render_check_inspection(open, check, theme, cx))
+                        el.child(self.render_check_inspection(open, check, &details.pr, theme, cx))
                     })
                     .into_any_element()
             })

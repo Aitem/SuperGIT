@@ -14,6 +14,7 @@ pub enum AttachmentKind {
     #[default]
     Diff,
     ReviewThread,
+    CheckDiagnostics,
 }
 
 impl AttachmentKind {
@@ -21,6 +22,7 @@ impl AttachmentKind {
         match self {
             Self::Diff => "diff snapshot",
             Self::ReviewThread => "GitHub review thread",
+            Self::CheckDiagnostics => "GitHub check diagnostics",
         }
     }
 }
