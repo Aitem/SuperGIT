@@ -278,7 +278,7 @@ fn interruption_failure_errors_and_unsupported_requests() {
         vec![
             Reply::Unsupported {
                 request_id: "\"q1\"".into(),
-                method: "item/tool/requestUserInput".into()
+                method: "malformed user-input request".into()
             },
             Reply::Respond {
                 request_id: "9".into(),

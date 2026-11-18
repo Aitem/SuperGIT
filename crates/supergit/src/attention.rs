@@ -10,16 +10,22 @@ pub enum Kind {
     Idle,
     Running,
     Approval,
+    Question,
     Completed,
     Failed,
 }
 
 impl Kind {
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Approval | Self::Question)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Running => "● running",
             Self::Approval => "! needs approval",
+            Self::Question => "? needs an answer",
             Self::Completed => "✓ unread",
             Self::Failed => "× failed",
         }
@@ -41,12 +47,15 @@ impl Attention {
             self.revision += 1;
             self.kind = kind;
             self.token = token;
-            self.unread = matches!(kind, Kind::Approval | Kind::Completed | Kind::Failed);
+            self.unread = matches!(
+                kind,
+                Kind::Approval | Kind::Question | Kind::Completed | Kind::Failed
+            );
         }
     }
 
     pub fn restored(mut self) -> Self {
-        if matches!(self.kind, Kind::Running | Kind::Approval) {
+        if self.kind.is_live() {
             self.set(Kind::Idle, None);
         }
         self
@@ -56,7 +65,7 @@ impl Attention {
         self.unread
             && !focused
             && match self.kind {
-                Kind::Approval => approvals,
+                Kind::Approval | Kind::Question => approvals,
                 Kind::Completed | Kind::Failed => completions,
                 _ => false,
             }

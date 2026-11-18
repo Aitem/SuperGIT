@@ -1,7 +1,7 @@
 use sg_github::{ActionsJob, CheckAnnotation, CheckInspection, JobLog};
 
 use super::*;
-use crate::agent_context::MAX_BYTES;
+use crate::agent_context::{AttachmentKind, MAX_BYTES};
 
 pub(super) struct OpenCheck {
     pub(super) id: String,
@@ -107,6 +107,7 @@ impl SuperGitApp {
         let log = open.log.as_ref().and_then(LoadState::value);
         let (body, truncated) = diagnostic_body(&copy_text(check, inspection), log);
         Some(Attachment {
+            kind: AttachmentKind::CheckDiagnostics,
             worktree: info.path().to_path_buf(),
             path: check.name.clone(),
             comparison: format!("PR #{number} · {}", details.pr.head_oid),
