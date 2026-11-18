@@ -80,6 +80,7 @@ pub struct SpawnOptions {
     /// user's settings, else `default`).
     pub permission_mode: Option<PermissionMode>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     /// The CLI binary, `claude` from PATH by default.
     pub program: Option<PathBuf>,
 }
@@ -119,6 +120,9 @@ impl ClaudeProcess {
         }
         if let Some(model) = &opts.model {
             cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &opts.effort {
+            cmd.args(["--effort", effort]);
         }
         cmd.current_dir(&opts.cwd)
             .env("PWD", &opts.cwd)

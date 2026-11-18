@@ -11,6 +11,7 @@ mod cleanup;
 mod commit;
 mod comparison;
 pub mod difftastic;
+mod edit;
 mod log;
 mod rebase;
 mod runner;
@@ -29,10 +30,16 @@ pub use commit::{CommitPreview, commit_staged, preview_commit};
 pub use comparison::{
     BranchChanges, branch_changes, pr_merge_base, range_patch, resolve_branch, suggested_base,
 };
+pub use edit::{
+    IndexEdit, IndexHunk, commit, edit_file, edit_hunk, fetch, index_hunks, pull, squash,
+};
 pub use log::{
     Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
     commit_patch, fork, history, log,
 };
+mod publish;
+
+pub use publish::{BranchPublication, branch_publication, publication_commits, publish_branch};
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
 pub use staging::{Staging, change_staging};
@@ -85,6 +92,9 @@ impl Repo {
             .unwrap_or_else(|| self.root.display().to_string())
     }
 }
+
+mod clone_repository;
+pub use clone_repository::{clone_folder_name, clone_repository, clone_suggested_name};
 
 /// Human-friendly relative time ("5m", "3h", "2d") for a unix timestamp.
 pub fn relative_time(unix_secs: i64) -> String {
