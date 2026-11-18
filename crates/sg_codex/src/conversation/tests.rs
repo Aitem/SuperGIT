@@ -45,6 +45,49 @@ fn started_session() -> (CodexFold, Conversation) {
 }
 
 #[test]
+fn keeps_reported_context_separate_from_thread_totals() {
+    let (mut fold, mut c) = started_session();
+    let usage = |thread: &str, turn: &str, used: u64, window: Option<u64>| {
+        json!({
+            "method":"thread/tokenUsage/updated", "params": {
+                "threadId":thread, "turnId":turn,
+                "tokenUsage": {
+                    "total": {"totalTokens":92800,"inputTokens":90000,"outputTokens":2800,"cachedInputTokens":32000},
+                    "last": {"totalTokens":used,"inputTokens":used,"outputTokens":0},
+                    "modelContextWindow":window
+                }
+            }
+        })
+    };
+    fold.apply(&mut c, &usage(THREAD, TURN, 12300, Some(192000)));
+    let current = fold.token_usage().unwrap();
+    assert_eq!(current.last.total_tokens, 12300);
+    assert_eq!(current.total.total_tokens, 92800);
+    assert_eq!(current.total.cached_input_tokens, 32000);
+    assert_eq!(current.model_context_window, Some(192000));
+
+    fold.apply(&mut c, &usage("fork-thread", TURN, 88888, None));
+    fold.apply(&mut c, &usage(THREAD, "old-turn", 88888, None));
+    assert_eq!(fold.token_usage().unwrap().last.total_tokens, 12300);
+    fold.apply(
+        &mut c,
+        &json!({"method":"turn/completed","params":{"turn":{"id":TURN,"status":"completed"}}}),
+    );
+    fold.apply(&mut c, &usage(THREAD, TURN, 12400, Some(192000)));
+    assert_eq!(fold.token_usage().unwrap().last.total_tokens, 12400);
+
+    fold.apply(
+        &mut c,
+        &json!({"method":"thread/compacted","params":{"threadId":THREAD,"turnId":"compact"}}),
+    );
+    assert!(fold.token_usage().is_none());
+    fold.apply(&mut c, &usage(THREAD, "compact", 3200, None));
+    let current = fold.token_usage().unwrap();
+    assert_eq!(current.last.total_tokens, 3200);
+    assert!(current.model_context_window.is_none());
+}
+
+#[test]
 fn streams_a_turn_with_approvals_and_tools() {
     let (mut fold, mut c) = started_session();
     assert_eq!(c.session_id.as_deref(), Some(THREAD));
