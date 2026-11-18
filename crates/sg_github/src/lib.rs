@@ -78,7 +78,6 @@ impl PrState {
     }
 }
 
-pub use check_inspection::{CheckAnnotation, CheckInspection, check_inspection};
 pub use job_log::{ActionsJob, JobLog};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
