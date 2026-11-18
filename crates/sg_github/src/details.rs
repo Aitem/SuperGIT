@@ -158,11 +158,19 @@ pub struct Review {
     pub url: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReviewSide {
+    Original,
+    #[default]
+    Modified,
+}
+
 /// Comments on a line of the diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewThread {
     pub id: String,
     pub path: String,
+    pub side: ReviewSide,
     /// The line in the current diff; `None` once outdated.
     pub line: Option<u64>,
     pub resolved: bool,
@@ -265,7 +273,7 @@ const DETAILS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int
       comments(last: 100) { totalCount nodes { author { login } body createdAt url } }
       reviews(last: 100) { nodes { author { login } body state submittedAt url } }
       reviewThreads(last: 100) { nodes {
-        id isResolved isOutdated path line originalLine
+        id isResolved isOutdated path diffSide line originalLine
         viewerCanReply viewerCanResolve viewerCanUnresolve
         original: comments(first: 1) { nodes { author { login } body createdAt url diffHunk } }
         comments(last: 50) { nodes { author { login } body createdAt url diffHunk } }
@@ -533,6 +541,7 @@ struct RawThread {
     is_outdated: bool,
     #[serde(default)]
     path: String,
+    diff_side: Option<String>,
     line: Option<u64>,
     original_line: Option<u64>,
     #[serde(flatten)]
@@ -751,6 +760,11 @@ fn parse_details(json: &[u8]) -> Result<PrDetails> {
                 ReviewThread {
                     id: t.id,
                     path: t.path,
+                    side: if t.diff_side.as_deref() == Some("LEFT") {
+                        ReviewSide::Original
+                    } else {
+                        ReviewSide::Modified
+                    },
                     line: t.line.or(t.original_line),
                     resolved: t.is_resolved,
                     outdated: t.is_outdated,
@@ -795,7 +809,7 @@ mod tests {
         ]}}}}]},
         "comments":{"totalCount":120,"nodes":[{"author":{"login":"bob"},"body":"LGTM?","createdAt":"2026-01-01T01:00:00Z","url":"u1"}]},
         "reviews":{"nodes":[{"author":null,"body":"","state":"CHANGES_REQUESTED","submittedAt":"2026-01-01T02:00:00Z","url":"u2"}]},
-        "reviewThreads":{"nodes":[{"id":"T1","isResolved":true,"isOutdated":true,"path":"src/lib.rs","line":null,"originalLine":7,
+        "reviewThreads":{"nodes":[{"id":"T1","isResolved":true,"isOutdated":true,"path":"src/lib.rs","diffSide":"LEFT","line":null,"originalLine":7,
           "comments":{"nodes":[{"author":{"login":"bob"},"body":"nit","createdAt":"2026-01-01T03:00:00Z","url":"u3","diffHunk":"@@ -1 +1 @@\n-a\n+b"}]}}]}
       }}}}"#;
 
@@ -824,6 +838,7 @@ mod tests {
             "outdated threads keep the original line"
         );
         assert!(thread.resolved && thread.outdated);
+        assert_eq!(thread.side, ReviewSide::Original);
         assert_eq!(thread.diff_hunk, "@@ -1 +1 @@\n-a\n+b");
     }
 

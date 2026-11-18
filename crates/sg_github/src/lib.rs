@@ -73,6 +73,8 @@ where
     Ok(out.stdout)
 }
 
+pub use details::ReviewSide;
+
 pub use details::review_actions::{
     ReviewThreadState, ThreadPermissions, reply_to_thread, set_thread_resolved,
 };
