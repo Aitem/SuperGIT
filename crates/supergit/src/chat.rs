@@ -5,6 +5,8 @@
 //! permission prompts as cards. Each provider keeps its own controls: Claude's
 //! permission modes, Codex's approval + sandbox policies.
 
+mod options;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,11 +25,15 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::Value;
 use sg_agents::Provider;
-use sg_agents::chat::{Conversation, Decision, Item, PermissionRequest, Status, ToolCall};
+use sg_agents::chat::{
+    Conversation, Decision, InputResolution, Item, PermissionRequest, Status, ToolCall,
+};
 use sg_agents::process::{AgentProcess, ProcessEvent};
 use sg_claude::conversation::Reply;
 use sg_claude::{ClaudeEvents as _, ClaudeProcess, PermissionMode, SpawnOptions};
 use sg_codex::{CodexFold, CodexProcess, Policy};
+
+mod questions;
 
 /// Max lines of tool output shown when a tool row is expanded.
 const OUTPUT_LINES: usize = 40;
@@ -124,9 +130,11 @@ pub struct ChatSession {
     transcript: Option<PathBuf>,
     convo: Conversation,
     backend: Backend,
+    options: options::AgentOptions,
     input: Entity<TextareaState>,
     scroller: Entity<MessageScrollerState>,
     diffs: HashMap<String, (Entity<DiffState>, usize)>,
+    question_forms: HashMap<String, Vec<questions::AnswerDraft>>,
     expanded: HashSet<usize>,
     stderr_tail: Vec<String>,
     reader: Option<Task<()>>,
@@ -215,6 +223,8 @@ impl ChatSession {
         {
             *policy = saved_policy;
         }
+        chat.options.model = saved.model.clone();
+        chat.options.effort = saved.effort.clone();
         chat.attention = saved.attention.clone().restored();
         chat.attachments = saved
             .attachments
@@ -250,6 +260,8 @@ impl ChatSession {
             transcript,
             cwd: self.cwd.clone(),
             title: self.title(),
+            model: self.options.model.clone(),
+            effort: self.options.effort.clone(),
             draft: self.input.read(cx).value().to_string(),
             policy: match &self.backend {
                 Backend::Codex { policy, .. } => policy.as_str().into(),
@@ -300,9 +312,11 @@ impl ChatSession {
             transcript: None,
             convo,
             backend,
+            options: Default::default(),
             input,
             scroller,
             diffs: HashMap::new(),
+            question_forms: HashMap::new(),
             expanded: HashSet::new(),
             stderr_tail: Vec::new(),
             reader: None,
@@ -325,6 +339,7 @@ impl ChatSession {
             return;
         }
         self.backend = Backend::new(provider, &self.convo);
+        self.options = Default::default();
         self.input.update(cx, |input, cx| {
             input.set_placeholder(placeholder(provider), window, cx)
         });
@@ -387,12 +402,15 @@ impl ChatSession {
 
     pub fn focus_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mark_seen(cx);
-        if let Some(ix) = self
-            .convo
-            .items
-            .iter()
-            .rposition(|item| matches!(item, Item::Permission(p) if p.decision.is_none()))
-        {
+        let approval = self.convo.items.iter().rposition(
+            |item| matches!(item, Item::Permission(request) if request.decision.is_none()),
+        );
+        let question = || {
+            self.convo.items.iter().rposition(|item| {
+            matches!(item, Item::UserInput(request) if request.resolution == InputResolution::Pending)
+        })
+        };
+        if let Some(ix) = approval.or_else(question) {
             self.scroller.update(cx, |scroller, cx| {
                 scroller.scroll_to_item(ix, cx);
             });
@@ -526,6 +544,8 @@ impl ChatSession {
                     cwd: self.cwd.clone(),
                     resume,
                     permission_mode: Some(*mode),
+                    model: self.options.model.clone(),
+                    effort: self.options.effort.clone(),
                     ..Default::default()
                 })?;
                 *process = Some(Arc::new(p));
@@ -636,11 +656,8 @@ impl ChatSession {
                         },
                         None,
                     );
-                } else if let Some(request) = self.convo.pending_permission() {
-                    self.attention
-                        .set(Kind::Approval, Some(request.request_id.clone()));
-                } else if self.convo.status.is_busy() {
-                    self.attention.set(Kind::Running, None);
+                } else {
+                    self.sync_pending_attention();
                 }
             }
             ProcessEvent::Stderr(line) => {
@@ -657,12 +674,34 @@ impl ChatSession {
                 let label = self.provider().label();
                 self.convo.on_exit(self.stderr_tail.last().cloned(), label);
                 self.backend.clear_process();
+                if !was_busy {
+                    self.sync_pending_attention();
+                }
             }
         }
         self.items_changed(before, cx);
     }
 
+    fn sync_pending_attention(&mut self) {
+        if let Some(request) = self.convo.pending_permission() {
+            self.attention
+                .set(Kind::Approval, Some(request.request_id.clone()));
+        } else if let Some(request) = self.convo.pending_user_input() {
+            self.attention
+                .set(Kind::Question, Some(request.request_id.clone()));
+        } else if self.convo.status.is_busy() {
+            self.attention.set(Kind::Running, None);
+        } else if matches!(self.attention.kind, Kind::Approval | Kind::Question) {
+            self.attention.set(Kind::Idle, None);
+        }
+    }
+
     fn items_changed(&mut self, before: usize, cx: &mut Context<Self>) {
+        self.question_forms.retain(|id, _| {
+            self.convo
+                .user_input(id)
+                .is_some_and(|request| request.resolution == InputResolution::Pending)
+        });
         let after = self.convo.items.len();
         self.scroller.update(cx, |s, cx| {
             if after > before {
@@ -718,7 +757,17 @@ impl ChatSession {
         let text = text.to_string();
         let before = self.convo.items.len();
         self.convo.push_user(&text);
-        let result = self.ensure_process(cx).and_then(|p| p.send_user(&text));
+        let result = self.ensure_process(cx).and_then(|p| {
+            if let Backend::Codex {
+                process: Some(process),
+                ..
+            } = &self.backend
+            {
+                process.send_turn(&text, self.options.codex_turn(self.convo.model.as_deref()))
+            } else {
+                p.send_user(&text)
+            }
+        });
         if let Err(e) = &result {
             self.convo.push_notice(format!("{e:#}"), true);
             self.convo.status = Status::Idle;
@@ -787,9 +836,7 @@ impl ChatSession {
         match process.answer(&request, decision) {
             Ok(()) => {
                 self.convo.resolve_permission(&request_id, decision);
-                if self.convo.pending_permission().is_none() {
-                    self.attention.set(Kind::Running, None);
-                }
+                self.sync_pending_attention();
             }
             Err(e) => self.convo.push_notice(format!("{e:#}"), true),
         }
@@ -887,10 +934,65 @@ impl ChatSession {
 
     // ---- rendering -------------------------------------------------------
 
+    fn render_latest_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (ix, text) = self
+            .convo
+            .items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, item)| {
+                if let Item::User { text } = item {
+                    Some((ix, text))
+                } else {
+                    None
+                }
+            })?;
+        if ix + 1 == self.convo.items.len() {
+            return None;
+        }
+        let prompt = text
+            .split(crate::agent_context::CONTEXT_MARKER)
+            .next()
+            .unwrap_or_default();
+        let title = sg_agents::chat::short_title(prompt);
+        let theme = cx.theme().clone();
+        Some(
+            h_flex()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .flex_none()
+                .min_w_0()
+                .bg(theme.muted)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_xs()
+                        .flex_none()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Latest prompt"),
+                )
+                .child(div().text_xs().flex_1().min_w_0().truncate().child(title))
+                .child(
+                    Button::new("jump-to-latest-prompt")
+                        .label("Jump")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scroller
+                                .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_item(
         &mut self,
         ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(item) = self.convo.items.get(ix).cloned() else {
@@ -918,7 +1020,16 @@ impl ChatSession {
                             .rounded_lg()
                             .bg(theme.secondary)
                             .text_color(theme.secondary_foreground)
-                            .child(display)
+                            .child(message_label(
+                                "You",
+                                ("copy-user", ix),
+                                display.clone(),
+                                &theme,
+                            ))
+                            .child(
+                                TextView::html(("user-message", ix), plain_message_html(&display))
+                                    .selectable(true),
+                            )
                             .when(attached.is_some(), |bubble| {
                                 bubble.child(
                                     Button::new(("message-context", ix))
@@ -937,9 +1048,17 @@ impl ChatSession {
                     )
                     .into_any_element()
             }
-            Item::Text { text, streaming } => div()
+            Item::Text { text, streaming } => v_flex()
+                .min_w_0()
+                .gap_1()
                 .text_sm()
-                .child(TextView::markdown(("md", ix), text))
+                .child(message_label(
+                    self.provider().label(),
+                    ("copy-response", ix),
+                    text.clone(),
+                    &theme,
+                ))
+                .child(TextView::markdown(("md", ix), text).selectable(true))
                 .when(streaming, |el| {
                     el.child(div().text_color(theme.muted_foreground).child("▍"))
                 })
@@ -954,6 +1073,7 @@ impl ChatSession {
                 .into_any_element(),
             Item::Tool(tool) => self.render_tool(ix, &tool, &theme, cx).into_any_element(),
             Item::Permission(p) => self.render_permission(&p, &theme, cx).into_any_element(),
+            Item::UserInput(request) => self.render_user_input(&request, window, cx),
             Item::Notice { text, is_error } => div()
                 .text_xs()
                 .text_color(if is_error {
@@ -1331,6 +1451,7 @@ impl ChatSession {
                         })),
                 )
             })
+            .child(self.render_model_options(cx))
             .child(Textarea::new(&self.input))
             .child(
                 h_flex()
@@ -1345,7 +1466,7 @@ impl ChatSession {
                     } else {
                         Button::new("send")
                             .label(if self.git_busy {
-                                "Updating base…"
+                                "Git operation…"
                             } else if loading {
                                 "Loading history…"
                             } else {
@@ -1362,41 +1483,37 @@ impl ChatSession {
 
 impl Render for ChatSession {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.load_models(cx);
         let theme = cx.theme().clone();
         let status = match self.convo.status {
             Status::Idle => None,
             Status::Starting => Some(("starting…", theme.muted_foreground)),
             Status::Working => Some(("working…", theme.blue)),
             Status::NeedsPermission => Some(("needs your approval", theme.warning)),
+            Status::NeedsInput => Some(("needs your answer", theme.warning)),
             Status::Exited => Some((
                 "stopped — your next message resumes",
                 theme.muted_foreground,
             )),
         };
-        let info = [
-            Some(self.provider().label().to_string()),
-            self.convo.model.clone(),
-            self.convo.total_cost_usd.map(|c| format!("${c:.2}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
-
+        let cost = self.convo.total_cost_usd.map(|c| format!("${c:.2}"));
         v_flex()
             .size_full()
-            .child(
-                h_flex()
-                    .px_4()
-                    .py_1()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(div().flex_1().min_w_0().truncate().child(info))
-                    .when_some(status, |el, (label, color)| {
-                        el.child(div().text_color(color).child(label))
-                    }),
-            )
+            .when(cost.is_some() || status.is_some(), |chat| {
+                chat.child(
+                    h_flex()
+                        .px_4()
+                        .py_1()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(div().flex_1().children(cost))
+                        .when_some(status, |el, (label, color)| {
+                            el.child(div().text_color(color).child(label))
+                        }),
+                )
+            })
+            .children(self.render_latest_prompt(cx))
             .child(if self.convo.items.is_empty() {
                 let provider = self.provider();
                 let fresh = self.is_fresh();
@@ -1459,6 +1576,43 @@ impl Render for ChatSession {
             })
             .child(self.render_composer(cx))
     }
+}
+
+fn message_label(
+    label: &str,
+    id: (&'static str, usize),
+    text: String,
+    theme: &Theme,
+) -> impl IntoElement {
+    h_flex()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            Button::new(id)
+                .label("Copy")
+                .xsmall()
+                .ghost()
+                .tooltip("Copy message")
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                }),
+        )
+}
+
+fn plain_message_html(text: &str) -> String {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\n', "<br>");
+    format!("<p>{escaped}</p>")
 }
 
 fn diff_box(state: &Entity<DiffState>, lines: usize, theme: &Theme) -> impl IntoElement {

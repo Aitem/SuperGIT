@@ -187,10 +187,33 @@ pub struct Details {
     pub patch: LoadState<String>,
     /// The submodules `patch` changes, their own diffs inlined in it.
     pub submodules: Vec<sg_git::SubmoduleChange>,
-    pub commits: LoadState<Vec<Commit>>,
-    /// Commits since the branch forked from the base branch; `None` on the
-    /// base branch itself or when there is none.
+}
+
+/// History refreshes separately from the working copy and diff.
+#[derive(Clone, Debug, Default)]
+pub struct History {
+    pub commits: LoadState<Arc<Vec<Commit>>>,
+    /// Commits since the branch forked from the base branch.
     pub fork: Option<Fork>,
+}
+
+impl History {
+    pub fn update(&mut self, next: Self) {
+        if next.commits.error().is_none() {
+            self.fork = next.fork;
+        }
+        self.commits.update(next.commits);
+    }
+}
+
+pub fn load_history(path: &Path) -> History {
+    let commits = sg_git::history(path, 400)
+        .map(Arc::new)
+        .map_err(git_error_message);
+    History {
+        commits: LoadState::from_result(commits),
+        fork: sg_git::fork(path).ok().flatten(),
+    }
 }
 
 impl Details {
@@ -208,8 +231,6 @@ impl Details {
             self.submodules = next.submodules;
         }
         self.patch.update(next.patch);
-        self.commits.update(next.commits);
-        self.fork = next.fork;
     }
 }
 
@@ -264,7 +285,6 @@ pub fn load_details(
         Ok(_) => Ok(String::new()),
         Err(error) => Err(error.clone()),
     };
-    let commits = sg_git::history(path, 400).map_err(git_error_message);
     Details {
         path: path.to_path_buf(),
         scope,
@@ -275,8 +295,6 @@ pub fn load_details(
         status: LoadState::from_result(status),
         patch: LoadState::from_result(patch),
         submodules,
-        commits: LoadState::from_result(commits),
-        fork: sg_git::fork(path).ok().flatten(),
     }
 }
 
@@ -392,10 +410,10 @@ mod tests {
         let details = load_details(&temp.0, status, None, sg_git::ChangeScope::All);
         assert!(details.status.error().is_some());
         assert!(details.patch.error().is_some());
-        assert!(details.commits.error().is_some());
+        assert!(load_history(&temp.0).commits.error().is_some());
         assert!(details.status.value().is_none());
         assert!(details.patch.value().is_none());
-        assert!(details.commits.value().is_none());
+        assert!(load_history(&temp.0).commits.value().is_none());
     }
 
     #[test]
@@ -411,7 +429,23 @@ mod tests {
         );
         assert!(details.status.value().unwrap().is_clean());
         assert_eq!(details.patch.value().map(String::as_str), Some(""));
-        assert!(matches!(details.commits, LoadState::Ready(commits) if commits.is_empty()));
+        assert!(
+            matches!(load_history(&temp.0).commits, LoadState::Ready(commits) if commits.is_empty())
+        );
+    }
+
+    #[test]
+    fn failed_history_refresh_keeps_its_previous_commits() {
+        let temp = TempDir::new();
+        temp.git(&["init", "-q", "-b", "main"]);
+        temp.git(&["config", "user.email", "test@example.com"]);
+        temp.git(&["config", "user.name", "Tester"]);
+        temp.git(&["commit", "--allow-empty", "-qm", "initial"]);
+        let mut history = load_history(&temp.0);
+        let original = history.commits.value().unwrap().clone();
+        history.update(load_history(&temp.0.join("missing")));
+        assert!(history.commits.error().is_some());
+        assert!(Arc::ptr_eq(history.commits.value().unwrap(), &original));
     }
 
     #[test]
@@ -438,7 +472,7 @@ mod tests {
         );
         assert!(details.status.error().is_none());
         assert!(details.patch.error().is_some());
-        assert_eq!(details.commits.value().unwrap().len(), 1);
+        assert_eq!(load_history(&temp.0).commits.value().unwrap().len(), 1);
 
         temp.git(&["config", "--unset", "diff.broken.textconv"]);
         details.update(load_details(

@@ -19,11 +19,14 @@ use std::path::PathBuf;
 pub mod conversation;
 pub mod install;
 pub mod process;
+mod questions;
 pub mod sessions;
 pub mod tools;
 
 pub use conversation::{CodexFold, Reply};
-pub use process::{CodexProcess, History, Policy, SpawnOptions, read_history};
+pub use process::{
+    CodexProcess, History, Model, Policy, SpawnOptions, TurnOptions, list_models, read_history,
+};
 pub use sessions::CodexSessionIndex;
 
 /// `~/.codex`, honouring `CODEX_HOME`.
