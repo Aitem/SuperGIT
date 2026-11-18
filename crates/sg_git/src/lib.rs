@@ -6,6 +6,9 @@
 //! agents that run git in the same worktrees. Hot paths can move to `gix`
 //! later without changing this API.
 
+mod stash;
+pub use stash::{Stash, apply_stash, can_save_stash, list_stashes, save_stash};
+
 mod base;
 mod cleanup;
 mod commit;
