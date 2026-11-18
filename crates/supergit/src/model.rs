@@ -181,6 +181,7 @@ impl<T: Clone> LoadState<T> {
 #[derive(Clone, Debug, Default)]
 pub struct Details {
     pub path: PathBuf,
+    pub scope: sg_git::ChangeScope,
     pub base: Option<String>,
     pub suggested_base: Option<String>,
     pub merge_base: Option<String>,
@@ -193,7 +194,7 @@ pub struct Details {
 
 impl Details {
     pub fn update(&mut self, next: Self) {
-        if self.path != next.path || self.base != next.base {
+        if self.path != next.path || self.base != next.base || self.scope != next.scope {
             *self = next;
             return;
         }
@@ -213,11 +214,18 @@ pub fn load_details(
     path: &Path,
     status: Result<WorktreeStatus, String>,
     base: Option<String>,
+    scope: sg_git::ChangeScope,
 ) -> Details {
     let suggested_base = sg_git::suggested_base(path);
     let mut files = status
         .as_ref()
-        .map(|status| status.files.clone())
+        .map(|status| {
+            status
+                .files
+                .iter()
+                .filter_map(|file| scope.project(file))
+                .collect::<Vec<_>>()
+        })
         .map_err(Clone::clone);
     let mut merge_base = None;
     let mut submodules = Vec::new();
@@ -238,11 +246,11 @@ pub fn load_details(
                 }
             }
         }
-        Ok(st) if !st.is_clean() => match sg_git::worktree_patch(path, st) {
+        Ok(st) if !st.is_clean() => match sg_git::scoped_worktree_patch(path, st, scope) {
             Ok(patch) => {
                 // Each changed submodule's files follow its entry.
                 files = Ok(sg_git::with_submodule_files(
-                    st.files.clone(),
+                    files.unwrap_or_default(),
                     &patch.submodules,
                 ));
                 submodules = patch.submodules;
@@ -255,6 +263,7 @@ pub fn load_details(
     };
     Details {
         path: path.to_path_buf(),
+        scope,
         base,
         suggested_base,
         merge_base,
@@ -374,7 +383,7 @@ mod tests {
         let temp = TempDir::new();
         let status = sg_git::status(&temp.0).map_err(|e| e.to_string());
         assert!(status.is_err());
-        let details = load_details(&temp.0, status, None);
+        let details = load_details(&temp.0, status, None, sg_git::ChangeScope::All);
         assert!(details.status.error().is_some());
         assert!(details.patch.error().is_some());
         assert!(
@@ -404,6 +413,7 @@ mod tests {
             &temp.0,
             sg_git::status(&temp.0).map_err(|e| e.to_string()),
             None,
+            sg_git::ChangeScope::All,
         );
         assert!(details.status.value().unwrap().is_clean());
         assert_eq!(details.patch.value().map(String::as_str), Some(""));
@@ -530,6 +540,7 @@ mod tests {
             &temp.0,
             sg_git::status(&temp.0).map_err(|e| e.to_string()),
             None,
+            sg_git::ChangeScope::All,
         );
         assert!(details.status.error().is_none());
         assert!(details.patch.error().is_some());
@@ -548,6 +559,7 @@ mod tests {
             &temp.0,
             sg_git::status(&temp.0).map_err(|e| e.to_string()),
             None,
+            sg_git::ChangeScope::All,
         ));
         assert!(details.patch.error().is_none());
         assert!(details.patch.value().unwrap().contains("+after"));

@@ -10,6 +10,7 @@ mod base;
 mod cleanup;
 mod commit;
 mod comparison;
+mod diff_hunk;
 pub mod difftastic;
 mod edit;
 mod log;
@@ -36,6 +37,7 @@ pub use commit::{CommitPreview, commit_staged, preview_commit};
 pub use comparison::{
     BranchChanges, branch_changes, pr_merge_base, range_patch, resolve_branch, suggested_base,
 };
+pub use diff_hunk::hunk_patch;
 pub use edit::{
     IndexEdit, IndexHunk, commit, edit_file, edit_hunk, fetch, index_hunks, pull, squash,
 };
@@ -48,8 +50,11 @@ mod publish;
 pub use publish::{BranchPublication, branch_publication, publication_commits, publish_branch};
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
-pub use staging::{Staging, change_staging};
-pub use status::{FileChange, FileState, WorktreeStatus, status, worktree_patch};
+pub use staging::{Staging, change_staging, change_staging_hunk, text_hunk};
+pub use status::{
+    ChangeScope, FileChange, FileState, WorktreeStatus, scoped_worktree_patch, status,
+    worktree_patch,
+};
 pub use submodule::{
     Inline, MAX_COMMITS, Patch, SubmoduleChange, SubmoduleCommit, SubmoduleFlags,
     inline_submodules, submodule_of, with_submodule_files,

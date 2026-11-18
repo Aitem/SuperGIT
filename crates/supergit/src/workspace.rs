@@ -43,6 +43,7 @@ pub struct ReviewPosition {
 pub struct WorktreeView {
     pub kept: bool,
     pub branch_changes: bool,
+    pub change_scope: sg_git::ChangeScope,
     pub base: String,
     pub commit: Option<String>,
     pub changes_position: Option<ReviewPosition>,
