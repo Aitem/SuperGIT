@@ -28,6 +28,44 @@ use sg_agents::process::{AgentProcess, ProcessEvent};
 
 use crate::install;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CollaborationMode {
+    #[default]
+    Default,
+    Plan,
+}
+
+impl CollaborationMode {
+    pub const ALL: [Self; 2] = [Self::Default, Self::Plan];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == value)
+    }
+}
+
+struct ThreadSettings {
+    model: String,
+    effort: Option<String>,
+}
+
+impl ThreadSettings {
+    fn read(result: &Value) -> Option<Self> {
+        let model = result.get("model")?.as_str()?.to_owned();
+        let effort = result
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Some(Self { model, effort })
+    }
+}
+
 /// How much Codex may do without asking: its approval policy plus sandbox,
 /// mirroring the CLI's `/approvals` presets. These are Codex's own concepts —
 /// they do not map onto Claude's permission modes.
@@ -126,10 +164,16 @@ pub struct TurnOptions {
     pub effort: Option<String>,
 }
 
+struct Prompt {
+    text: String,
+    options: TurnOptions,
+    mode: Option<CollaborationMode>,
+}
+
 enum Input {
     Line(Value),
     Closed,
-    Send(String, TurnOptions),
+    Send(Prompt),
     Interrupt,
     Respond { id: Value, result: Value },
     Fail { id: Value, message: String },
@@ -168,6 +212,7 @@ impl CodexProcess {
             next_id: 1,
             pending: HashMap::new(),
             thread_id: None,
+            thread_settings: None,
             turn_id: None,
             turn_active: false,
             interrupt_pending: false,
@@ -187,12 +232,26 @@ impl CodexProcess {
     }
 
     pub fn send_turn(&self, text: &str, options: TurnOptions) -> Result<()> {
-        self.input(Input::Send(text.to_string(), options))
+        self.send_turn_in_mode(text, options, None)
     }
 
     /// Applies from the next turn on (Codex takes policy overrides per turn).
     pub fn set_policy(&self, policy: Policy) {
         *self.policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
+    }
+
+    /// Capture the selected model, effort and mode for this queued turn.
+    pub fn send_turn_in_mode(
+        &self,
+        text: &str,
+        options: TurnOptions,
+        mode: Option<CollaborationMode>,
+    ) -> Result<()> {
+        self.input(Input::Send(Prompt {
+            text: text.to_owned(),
+            options,
+            mode,
+        }))
     }
 
     /// Answer a server request directly (requests the fold resolves without
@@ -296,6 +355,7 @@ struct Driver {
     next_id: u64,
     pending: HashMap<u64, &'static str>,
     thread_id: Option<String>,
+    thread_settings: Option<ThreadSettings>,
     turn_id: Option<String>,
     /// `turn/start` sent and the turn has not completed.
     turn_active: bool,
@@ -303,7 +363,7 @@ struct Driver {
     interrupt_pending: bool,
     /// The thread is started or resumed: turns can go out.
     ready: bool,
-    queued: VecDeque<(String, TurnOptions)>,
+    queued: VecDeque<Prompt>,
 }
 
 impl Driver {
@@ -317,8 +377,8 @@ impl Driver {
             match input {
                 Input::Line(v) => self.on_line(v),
                 Input::Closed => break,
-                Input::Send(text, options) => {
-                    self.queued.push_back((text, options));
+                Input::Send(prompt) => {
+                    self.queued.push_back(prompt);
                     self.start_next_turn();
                 }
                 Input::Interrupt => self.interrupt(),
@@ -507,6 +567,7 @@ impl Driver {
                     .and_then(|r| r.pointer("/thread/id"))
                     .and_then(Value::as_str)
                     .map(String::from);
+                self.thread_settings = result.and_then(ThreadSettings::read);
                 self.ready = self.thread_id.is_some();
                 self.start_next_turn();
             }
@@ -557,27 +618,56 @@ impl Driver {
         if !self.ready || self.turn_active {
             return;
         }
-        let (Some(thread_id), Some((text, options))) =
-            (self.thread_id.clone(), self.queued.pop_front())
-        else {
+        let Some(thread_id) = self.thread_id.clone() else {
             return;
         };
         let policy = *self.policy.lock().unwrap_or_else(|e| e.into_inner());
-        self.turn_active = true;
-        self.turn_id = None;
-        let mut params = json!({
-            "threadId": thread_id,
-            "input": [{ "type": "text", "text": text, "text_elements": [] }],
-            "approvalPolicy": policy.approval_policy(),
-            "sandboxPolicy": policy.sandbox_policy(),
-        });
-        if let Some(model) = options.model {
-            params["model"] = json!(model);
+        while let Some(prompt) = self.queued.pop_front() {
+            let mut params = json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": prompt.text, "text_elements": [] }],
+                "approvalPolicy": policy.approval_policy(),
+                "sandboxPolicy": policy.sandbox_policy(),
+            });
+            if let Some(mode) = prompt.mode {
+                let model = prompt.options.model.as_deref().or_else(|| {
+                    self.thread_settings
+                        .as_ref()
+                        .map(|settings| settings.model.as_str())
+                });
+                let Some(model) = model else {
+                    self.emit_error(
+                        "turn/start",
+                        "Codex did not report a model for this collaboration mode",
+                    );
+                    continue;
+                };
+                let effort = prompt.options.effort.as_deref().or_else(|| {
+                    self.thread_settings
+                        .as_ref()
+                        .and_then(|settings| settings.effort.as_deref())
+                });
+                params["collaborationMode"] = json!({
+                    "mode": mode.as_str(),
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "developer_instructions": null,
+                    }
+                });
+            } else {
+                if let Some(model) = prompt.options.model {
+                    params["model"] = json!(model);
+                }
+                if let Some(effort) = prompt.options.effort {
+                    params["effort"] = json!(effort);
+                }
+            }
+            self.turn_active = true;
+            self.turn_id = None;
+            self.request("turn/start", params);
+            break;
         }
-        if let Some(effort) = options.effort {
-            params["effort"] = json!(effort);
-        }
-        self.request("turn/start", params);
     }
 
     fn interrupt(&mut self) {

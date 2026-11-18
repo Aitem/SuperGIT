@@ -10,7 +10,9 @@ use futures::channel::mpsc::TryRecvError;
 use serde_json::{Value, json};
 use sg_agents::chat::{Conversation, Decision, InputResolution, Item, Status};
 use sg_agents::process::{AgentProcess, ProcessEvent};
-use sg_codex::{CodexFold, CodexProcess, Policy, Reply, SpawnOptions, TurnOptions};
+use sg_codex::{
+    CodexFold, CodexProcess, CollaborationMode, Policy, Reply, SpawnOptions, TurnOptions,
+};
 
 const FAKE: &str = r#"#!/bin/sh
 # A fake `codex`: MODE and VERSION are substituted per test.
@@ -32,11 +34,15 @@ while IFS= read -r line; do
         echo "{\"id\":$id,\"result\":{\"account\":{\"type\":\"apiKey\"},\"requiresOpenaiAuth\":true}}"
       fi ;;
     *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
-      echo "{\"id\":$id,\"result\":{\"thread\":{\"id\":\"$THREAD\",\"cwd\":\"$PWD\"},\"model\":\"fake-model\"}}" ;;
+      echo "{\"id\":$id,\"result\":{\"thread\":{\"id\":\"$THREAD\",\"cwd\":\"$PWD\"},\"model\":\"fake-model\",\"reasoningEffort\":\"high\"}}" ;;
     *'"method":"turn/start"'*)
       echo "{\"id\":$id,\"result\":{\"turn\":{\"id\":\"tu-1\",\"status\":\"inProgress\",\"items\":[]}}}"
       echo '{"method":"turn/started","params":{"turn":{"id":"tu-1","status":"inProgress"}}}'
       if [ "$MODE" = crash ]; then echo "fatal: model stream died" >&2; exit 1; fi
+      if [ "$MODE" = collaboration ]; then
+        echo '{"method":"turn/completed","params":{"turn":{"id":"tu-1","status":"completed","error":null}}}'
+        continue
+      fi
       if [ "$MODE" = questions ]; then
         echo '{"method":"item/tool/requestUserInput","id":"choice-1","params":{"itemId":"q-1","isBlocking":true,"questions":[{"id":"base","header":"Target","question":"Which branch should receive the PR?","isOther":true,"options":[{"label":"main","description":"Default branch"},{"label":"develop","description":"Integration branch"}]},{"id":"note","header":"Notes","question":"Any rollout notes?","options":null}]}}'
         continue
@@ -187,6 +193,52 @@ fn turn_end(c: &Conversation) -> Option<(bool, Option<String>)> {
 }
 
 #[test]
+fn collaboration_mode_combines_thread_defaults_and_per_prompt_overrides() {
+    let fake = Fake::new("modes", "collaboration", "0.157.1");
+    let mut session = Session::start(&fake.program, fake.worktree("wt"), None);
+    session.process.set_policy(Policy::ReadOnly);
+    session
+        .process
+        .send_turn_in_mode(
+            "Plan the work",
+            TurnOptions::default(),
+            Some(CollaborationMode::Plan),
+        )
+        .unwrap();
+    session
+        .process
+        .send_turn_in_mode(
+            "Implement it",
+            TurnOptions {
+                model: Some("second-model".into()),
+                effort: Some("low".into()),
+            },
+            Some(CollaborationMode::Default),
+        )
+        .unwrap();
+    session.until("both turn starts", |_| {
+        fake.sent("wt", "turn/start").len() == 2
+    });
+    let turns = fake.sent("wt", "turn/start");
+    for (turn, (mode, model, effort)) in turns.iter().zip([
+        ("plan", "fake-model", "high"),
+        ("default", "second-model", "low"),
+    ]) {
+        assert_eq!(
+            turn["params"]["collaborationMode"],
+            json!({
+                "mode": mode,
+                "settings": {"model": model, "reasoning_effort": effort, "developer_instructions": null}
+            })
+        );
+        assert_eq!(turn["params"]["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(turn["params"]["approvalPolicy"], "on-request");
+    }
+    assert_eq!(turns[0]["params"]["input"][0]["text"], "Plan the work");
+    assert_eq!(turns[1]["params"]["input"][0]["text"], "Implement it");
+}
+
+#[test]
 fn answers_continue_the_same_turn_with_an_opaque_request_id() {
     let fake = Fake::new("question", "questions", "0.157.1");
     let mut session = Session::start(&fake.program, fake.worktree("wt"), None);
@@ -252,6 +304,7 @@ fn approved_command_completes_the_turn() {
     assert_eq!(start["params"]["approvalPolicy"], "on-request");
     assert_eq!(start["params"]["sandbox"], "workspace-write");
     let turn = &fake.sent("wt", "turn/start")[0];
+    assert!(turn["params"].get("collaborationMode").is_none());
     assert_eq!(turn["params"]["threadId"], "th-wt");
     assert_eq!(turn["params"]["input"][0]["text"], "list the files");
     assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");

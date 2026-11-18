@@ -25,7 +25,8 @@ pub mod tools;
 
 pub use conversation::{CodexFold, Reply};
 pub use process::{
-    CodexProcess, History, Model, Policy, SpawnOptions, TurnOptions, list_models, read_history,
+    CodexProcess, CollaborationMode, History, Model, Policy, SpawnOptions, TurnOptions,
+    list_models, read_history,
 };
 pub use sessions::CodexSessionIndex;
 
