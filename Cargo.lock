@@ -6180,6 +6180,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures",
+ "serde",
  "serde_json",
  "sg_agents",
 ]
