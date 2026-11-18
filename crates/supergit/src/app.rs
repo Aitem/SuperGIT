@@ -2,6 +2,7 @@
 //! history, agent sessions and pull requests on the right.
 
 mod base;
+mod edit;
 mod projects;
 mod pulls;
 mod sidebar;
@@ -238,6 +239,7 @@ pub struct SuperGitApp {
     commit_generation: u64,
 
     branch_input: Entity<InputState>,
+    git_editor: edit::GitEditor,
     /// Filters the Changes tab's file list by path.
     changes_filter: Entity<InputState>,
     /// Folders collapsed in the Changes tab's tree view.
@@ -412,6 +414,7 @@ impl SuperGitApp {
             details_generation: 0,
             commit_generation: 0,
             branch_input,
+            git_editor: Default::default(),
             changes_filter,
             changes_collapsed: HashSet::new(),
             commit_filter,
@@ -1633,6 +1636,7 @@ impl SuperGitApp {
     }
 
     fn reset_details(&mut self, cx: &mut Context<Self>) {
+        self.reset_edit_selection();
         self.details_generation += 1;
         self.commit_generation += 1;
         self.details_task = None;
@@ -1649,6 +1653,9 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.selected.as_ref() != Some(&path) {
+            self.reset_edit_selection();
+        }
         if self.cleanup_paths.contains(&path) || self.base_update_paths.contains(&path) {
             self.flash("A Git operation is in progress for this worktree", true, cx);
             return;
@@ -2639,16 +2646,27 @@ impl SuperGitApp {
         let (_, main_width) = self.pane_widths(window, cx);
         let content = match self.tab {
             MainTab::Changes => {
-                let comparison = self.render_comparison(window, cx);
+                #[cfg(feature = "screenshot")]
+                self.debug_staging_once(cx);
+                let switch = self.render_staging_switch(cx).into_any_element();
+                let body = if self.git_editor.staging {
+                    self.render_index_editor(&info, window, cx)
+                } else {
+                    v_flex()
+                        .size_full()
+                        .child(self.render_comparison(window, cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(self.render_changes(&info, main_width, &theme, cx)),
+                        )
+                        .into_any_element()
+                };
                 v_flex()
                     .size_full()
-                    .child(comparison)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .child(self.render_changes(&info, main_width, &theme, cx)),
-                    )
+                    .child(switch)
+                    .child(div().flex_1().min_h_0().child(body))
                     .into_any_element()
             }
             MainTab::History => self
@@ -2667,6 +2685,14 @@ impl SuperGitApp {
             .min_w_0()
             .h_full()
             .child(self.render_header(&info, &theme, cx))
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(self.render_sync(&info, cx)),
+            )
             .child(
                 TabBar::new("main-tabs")
                     .underline()
@@ -3971,6 +3997,7 @@ impl SuperGitApp {
             .size_full()
             .children(notice)
             .children(summary)
+            .child(self.render_squash(commits, cx))
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
