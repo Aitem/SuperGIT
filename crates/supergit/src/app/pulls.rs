@@ -2303,7 +2303,7 @@ impl SuperGitApp {
                     .flex_none()
                     .child(row)
                     .when_some(open, |el, open| {
-                        el.child(self.render_check_inspection(open, check, theme, cx))
+                        el.child(self.render_check_inspection(open, check, &details.pr, theme, cx))
                     })
                     .into_any_element()
             })
