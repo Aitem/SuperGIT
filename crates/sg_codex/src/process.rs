@@ -656,7 +656,7 @@ pub struct Model {
 pub fn list_models(cwd: &Path) -> Result<Vec<Model>> {
     let program = install::locate()?.program;
     let mut client = Client::start(&program, cwd)?;
-    client.call("initialize", initialize_params())?;
+    client.call("initialize", initialize_params(false))?;
     client.notify(&json!({ "method": "initialized" }))?;
     let mut models = Vec::new();
     let mut cursor = Value::Null;
