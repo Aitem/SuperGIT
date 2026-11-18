@@ -47,7 +47,9 @@ pub use log::{
 };
 mod publish;
 
-pub use publish::{BranchPublication, branch_publication, publication_commits, publish_branch};
+pub use publish::{
+    BranchPublication, branch_publication, fetch_remote, publication_commits, publish_branch,
+};
 pub use rebase::{RebaseOutcome, RebasePlan, plan_rebase, rebase};
 pub use runner::{GitError, git, git_bytes};
 pub use staging::{Staging, change_staging, change_staging_hunk, text_hunk};
