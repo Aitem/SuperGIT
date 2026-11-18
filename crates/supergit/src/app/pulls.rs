@@ -30,6 +30,7 @@ const SEARCH_LIMIT: usize = 50;
 
 mod file_review;
 mod inline_review;
+mod line_comment;
 mod review_actions;
 mod review_context;
 
@@ -110,6 +111,8 @@ pub(super) struct Pulls {
     patches: HashMap<u64, Patch>,
     patch_task: Option<(u64, Task<()>)>,
     file_review: file_review::ReviewProgress,
+    line_comment: Option<line_comment::LineComment>,
+    line_comment_task: Option<Task<()>>,
     pub(super) diff: Entity<DiffState>,
     /// The same diff through difftastic, while it is on.
     pub(super) difft: Entity<DifftView>,
@@ -124,7 +127,7 @@ pub(super) struct Pulls {
     merge: Option<MergeDialog>,
     merge_task: Option<Task<()>>,
     merge_handle: FocusHandle,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl Pulls {
@@ -148,6 +151,12 @@ impl Pulls {
         let files_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
         let filter_subscription = cx.subscribe(&files_filter, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let diff = new_diff_state(layout, cx);
+        let selection_subscription = cx.subscribe(&diff, |_, _, event: &DiffEvent, cx| {
+            if matches!(event, DiffEvent::SelectionChanged(_)) {
                 cx.notify();
             }
         });
@@ -179,7 +188,9 @@ impl Pulls {
             patches: HashMap::new(),
             patch_task: None,
             file_review: file_review::ReviewProgress::default(),
-            diff: new_diff_state(layout, cx),
+            line_comment: None,
+            line_comment_task: None,
+            diff,
             difft: cx.new(|_| DifftView::new(diff_mode(layout))),
             diff_shown: None,
             files_filter,
@@ -190,7 +201,7 @@ impl Pulls {
             merge: None,
             merge_task: None,
             merge_handle: cx.focus_handle(),
-            _subscriptions: [subscription, filter_subscription],
+            _subscriptions: [subscription, filter_subscription, selection_subscription],
         }
     }
 
@@ -211,6 +222,7 @@ impl Pulls {
         self.patches.clear();
         self.patch_task = None;
         self.file_review = file_review::ReviewProgress::default();
+        self.line_comment = None;
         self.diff_shown = None;
         self.diff
             .update(cx, |diff, cx| diff.set_files(Vec::new(), cx));

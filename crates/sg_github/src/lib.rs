@@ -14,6 +14,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 mod file_review;
+mod line_comment;
 
 pub use details::{
     AutoMerge, Check, CheckStatus, Comment, MergeMethod, MergeStatus, PrDetails, Review,
@@ -77,6 +78,7 @@ where
 
 pub use details::ReviewSide;
 pub use file_review::{FileReview, FileViewedState, pr_file_review, set_pr_file_viewed};
+pub use line_comment::{ReviewLine, post_review_line};
 
 pub use details::review_actions::{
     ReviewThreadState, ThreadPermissions, reply_to_thread, set_thread_resolved,
