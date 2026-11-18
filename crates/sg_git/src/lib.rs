@@ -8,6 +8,7 @@
 
 mod base;
 mod cleanup;
+mod commit;
 mod comparison;
 pub mod difftastic;
 mod edit;
@@ -31,6 +32,7 @@ pub use cleanup::{
     cleanup_base_branch, cleanup_worktree, delete_cleanup_branch, fetch_cleanup_base,
     worktree_identity,
 };
+pub use commit::{CommitPreview, commit_staged, preview_commit};
 pub use comparison::{
     BranchChanges, branch_changes, pr_merge_base, range_patch, resolve_branch, suggested_base,
 };
