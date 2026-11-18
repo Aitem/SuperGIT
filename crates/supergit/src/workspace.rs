@@ -70,6 +70,8 @@ pub struct SavedConversation {
     /// Codex's approval + sandbox policy (`sg_codex::Policy`); empty for
     /// Claude, whose mode the CLI reports itself.
     pub policy: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
