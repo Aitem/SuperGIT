@@ -2,10 +2,14 @@
 //! history, agent sessions and pull requests on the right.
 
 mod base;
+mod edit;
 mod projects;
 mod pulls;
 mod sidebar;
+mod staging;
 mod worktrees;
+
+mod clone_repository;
 
 use crate::MOD;
 use std::collections::{HashMap, HashSet};
@@ -42,7 +46,7 @@ use crate::difft_view::{self, DifftView};
 use crate::file_tree::{self, TreeRow};
 use crate::graph;
 use crate::launch::{self, TerminalApp};
-use crate::model::{self, Details, LoadState, SharedSessionIndex, WorktreeInfo};
+use crate::model::{self, Details, History, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::notifications;
 use crate::settings::{Appearance, DiffLayout};
 use crate::switcher::{self, Destination, Entry};
@@ -145,6 +149,7 @@ enum ContextScope {
 
 struct ReviewView {
     details: Details,
+    history: History,
     selected_commit: Option<String>,
     commit_patch: LoadState<String>,
     commit_submodules: Vec<SubmoduleChange>,
@@ -197,6 +202,8 @@ pub struct SuperGitApp {
     /// `None` shows the welcome screen (e.g. first launch from the Dock).
     repo: Option<Repo>,
     recent: Vec<PathBuf>,
+    clone_repository: Option<clone_repository::CloneForm>,
+    clone_focus: FocusHandle,
     launch_dir: PathBuf,
     terminal: TerminalApp,
     index: SharedSessionIndex,
@@ -212,6 +219,7 @@ pub struct SuperGitApp {
     selected: Option<PathBuf>,
     tab: MainTab,
     details: Details,
+    history: History,
     changes_diff: Entity<DiffState>,
     /// The sidebar's width (window-wide, not per project).
     sidebar_layout: Entity<ResizableState>,
@@ -238,6 +246,7 @@ pub struct SuperGitApp {
     commit_generation: u64,
 
     branch_input: Entity<InputState>,
+    git_editor: edit::GitEditor,
     /// Filters the Changes tab's file list by path.
     changes_filter: Entity<InputState>,
     /// Folders collapsed in the Changes tab's tree view.
@@ -269,6 +278,8 @@ pub struct SuperGitApp {
     poll_task: Option<Task<()>>,
     prs_task: Option<Task<()>>,
     details_task: Option<Task<()>>,
+    history_task: Option<Task<()>>,
+    history_generation: u64,
     commit_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     /// Commit authors' GitHub avatars, loaded once per repository.
@@ -382,6 +393,8 @@ impl SuperGitApp {
             switcher: None,
             repo,
             recent: crate::recent::load(),
+            clone_repository: None,
+            clone_focus: cx.focus_handle(),
             launch_dir,
             terminal: TerminalApp::detect(),
             index: Default::default(),
@@ -394,6 +407,7 @@ impl SuperGitApp {
             selected: None,
             tab: initial_tab(),
             details: Details::default(),
+            history: History::default(),
             changes_diff,
             sidebar_layout: cx.new(|_| ResizableState::default()),
             chat_layout: cx.new(|_| ResizableState::default()),
@@ -412,6 +426,7 @@ impl SuperGitApp {
             details_generation: 0,
             commit_generation: 0,
             branch_input,
+            git_editor: Default::default(),
             changes_filter,
             changes_collapsed: HashSet::new(),
             commit_filter,
@@ -431,6 +446,8 @@ impl SuperGitApp {
             poll_task: None,
             prs_task: None,
             details_task: None,
+            history_task: None,
+            history_generation: 0,
             commit_task: None,
             action_task: None,
             avatars: avatars::Avatars::new(),
@@ -588,6 +605,7 @@ impl SuperGitApp {
                 path.clone(),
                 ReviewView {
                     details: self.details.clone(),
+                    history: self.history.clone(),
                     selected_commit: self.selected_commit.clone(),
                     commit_patch: self.commit_patch.clone(),
                     commit_submodules: self.commit_submodules.clone(),
@@ -609,6 +627,7 @@ impl SuperGitApp {
         self.tab = initial_tab();
         if let Some(cached) = self.review_views.remove(&path) {
             self.details = cached.details;
+            self.history = cached.history;
             self.selected_commit = cached.selected_commit;
             self.commit_patch = cached.commit_patch;
             self.commit_submodules = cached.commit_submodules;
@@ -1358,6 +1377,7 @@ impl SuperGitApp {
             self.queue_persist(cx);
         }
         self.reload_details(cx);
+        self.reload_history(cx);
         if let Some(target) = self.pending_notification.take() {
             let this = cx.entity();
             if let Some(window) = cx.windows().first().copied() {
@@ -1385,7 +1405,7 @@ impl SuperGitApp {
             return;
         };
         let Some(sha) = self
-            .details
+            .history
             .commits
             .value()
             .and_then(|commits| commits.iter().find(|c| c.sha.starts_with(&prefix)))
@@ -1583,20 +1603,6 @@ impl SuperGitApp {
                 }
             }
         }
-        // A failed history refresh must not clear the current review selection.
-        if let LoadState::Ready(commits) = &details.commits
-            && let Some(sha) = &self.selected_commit
-            && !commits.iter().any(|c| &c.sha == sha)
-        {
-            self.selected_commit = None;
-            self.commit_task = None;
-            self.commit_generation += 1;
-            self.commit_patch = LoadState::Loading;
-            self.commit_submodules.clear();
-            self.commit_diff
-                .update(cx, |state, cx| state.set_files(Vec::new(), cx));
-            self.commit_difft.update(cx, |view, cx| view.clear(cx));
-        }
         self.details.update(details);
         if patch_changed {
             self.refresh_difft(FileList::Changes, cx);
@@ -1617,10 +1623,56 @@ impl SuperGitApp {
                 });
             }
         }
-        if self.commit_task.is_none()
+        cx.notify();
+    }
+
+    fn reload_history(&mut self, cx: &mut Context<Self>) {
+        if self.tab != MainTab::History || self.history_task.is_some() {
+            return;
+        }
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        self.history_generation += 1;
+        let generation = self.history_generation;
+        self.history_task = Some(cx.spawn(async move |this, cx| {
+            let selected = path.clone();
+            let history = cx
+                .background_executor()
+                .spawn(async move { model::load_history(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if generation == this.history_generation
+                    && this.selected.as_ref() == Some(&selected)
+                {
+                    this.history_task = None;
+                    this.apply_history(history, cx);
+                }
+            });
+        }));
+    }
+
+    fn apply_history(&mut self, history: History, cx: &mut Context<Self>) {
+        // A failed history refresh must not clear the current review selection.
+        if let LoadState::Ready(commits) = &history.commits
+            && let Some(sha) = &self.selected_commit
+            && !commits.iter().any(|c| &c.sha == sha)
+        {
+            self.selected_commit = None;
+            self.commit_task = None;
+            self.commit_generation += 1;
+            self.commit_patch = LoadState::Loading;
+            self.commit_submodules.clear();
+            self.commit_diff
+                .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+            self.commit_difft.update(cx, |view, cx| view.clear(cx));
+        }
+        self.history.update(history);
+        if self.tab == MainTab::History
+            && self.commit_task.is_none()
             && self.commit_patch.is_loading()
             && let Some(sha) = self.selected_commit.clone().or_else(|| {
-                self.details
+                self.history
                     .commits
                     .value()
                     .and_then(|commits| commits.first())
@@ -1633,11 +1685,15 @@ impl SuperGitApp {
     }
 
     fn reset_details(&mut self, cx: &mut Context<Self>) {
+        self.reset_edit_selection();
         self.details_generation += 1;
         self.commit_generation += 1;
+        self.history_generation += 1;
         self.details_task = None;
+        self.history_task = None;
         self.commit_task = None;
         self.details = Details::default();
+        self.history = History::default();
         self.selected_commit = None;
         self.commit_patch = LoadState::Loading;
         self.commit_submodules.clear();
@@ -1649,6 +1705,9 @@ impl SuperGitApp {
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.selected.as_ref() != Some(&path) {
+            self.reset_edit_selection();
+        }
         if self.cleanup_paths.contains(&path) || self.base_update_paths.contains(&path) {
             self.flash("A Git operation is in progress for this worktree", true, cx);
             return;
@@ -1673,6 +1732,7 @@ impl SuperGitApp {
         self.refresh_difft(FileList::Changes, cx);
         self.refresh_difft(FileList::Commit, cx);
         self.reload_details(cx);
+        self.reload_history(cx);
         self.queue_persist(cx);
         cx.notify();
     }
@@ -2533,6 +2593,17 @@ impl SuperGitApp {
                         )
                         .when(self.repo.is_some(), |el| {
                             el.child(
+                                Button::new("clone-repo")
+                                    .label("Clone…")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_clone_form(window, cx)
+                                    })),
+                            )
+                        })
+                        .when(self.repo.is_some(), |el| {
+                            el.child(
                                 Button::new("close-repo")
                                     .label("Recent")
                                     .ghost()
@@ -2616,8 +2687,8 @@ impl SuperGitApp {
         };
         let sessions = info.sessions.len();
         // Commits since the branch forked from main; none on main itself.
-        let history = match &self.details.fork {
-            Some(fork) if self.details.path == info.wt.path => {
+        let history = match &self.history.fork {
+            Some(fork) if self.tab == MainTab::History => {
                 format!("History · {}", fork.commits)
             }
             _ => "History".to_string(),
@@ -2631,16 +2702,27 @@ impl SuperGitApp {
         let (_, main_width) = self.pane_widths(window, cx);
         let content = match self.tab {
             MainTab::Changes => {
-                let comparison = self.render_comparison(window, cx);
+                #[cfg(feature = "screenshot")]
+                self.debug_staging_once(cx);
+                let switch = self.render_staging_switch(cx).into_any_element();
+                let body = if self.git_editor.staging {
+                    self.render_index_editor(&info, window, cx)
+                } else {
+                    v_flex()
+                        .size_full()
+                        .child(self.render_comparison(window, cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(self.render_changes(&info, main_width, &theme, cx)),
+                        )
+                        .into_any_element()
+                };
                 v_flex()
                     .size_full()
-                    .child(comparison)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .child(self.render_changes(&info, main_width, &theme, cx)),
-                    )
+                    .child(switch)
+                    .child(div().flex_1().min_h_0().child(body))
                     .into_any_element()
             }
             MainTab::History => self
@@ -2660,12 +2742,21 @@ impl SuperGitApp {
             .h_full()
             .child(self.render_header(&info, &theme, cx))
             .child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(self.render_sync(&info, cx)),
+            )
+            .child(
                 TabBar::new("main-tabs")
                     .underline()
                     .px_2()
                     .selected_index(tab_ix)
                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
                         this.tab = TABS[*ix];
+                        this.reload_history(cx);
                         this.queue_persist(cx);
                         cx.notify();
                     }))
@@ -3004,6 +3095,7 @@ impl SuperGitApp {
             ("File diff".into(), raw.to_string())
         };
         Ok(Attachment {
+            kind: agent_context::AttachmentKind::Diff,
             worktree: path,
             path: relative,
             comparison: format!(
@@ -3034,7 +3126,7 @@ impl SuperGitApp {
     ) {
         if self.selected.as_ref() != Some(&item.worktree) {
             self.flash(
-                "This selection belongs to another worktree. Reopen its diff to attach it.",
+                "This context belongs to another worktree. Switch back before attaching it.",
                 true,
                 cx,
             );
@@ -3722,11 +3814,8 @@ impl SuperGitApp {
                             this.toggle_dir(list, path.clone(), cx)
                         }),
                     )
-                    .on_click(Self::open_file(
-                        list,
-                        files[ix].path.clone(),
-                        cx,
-                    )),
+                    .on_click(Self::open_file(list, files[ix].path.clone(), cx))
+                    .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
                     cx,
                 ),
@@ -3751,11 +3840,8 @@ impl SuperGitApp {
                         tree_indent(depth),
                         theme,
                     )
-                    .on_click(Self::open_file(
-                        list,
-                        files[ix].path.clone(),
-                        cx,
-                    )),
+                    .on_click(Self::open_file(list, files[ix].path.clone(), cx))
+                    .children(self.staging_buttons(list, &files[ix], cx)),
                     files[ix].path.clone(),
                     cx,
                 ),
@@ -3775,11 +3861,8 @@ impl SuperGitApp {
                             px(12.),
                             theme,
                         )
-                        .on_click(Self::open_file(
-                            list,
-                            file.path.clone(),
-                            cx,
-                        )),
+                        .on_click(Self::open_file(list, file.path.clone(), cx))
+                        .children(self.staging_buttons(list, file, cx)),
                         file.path.clone(),
                         cx,
                     )
@@ -3856,8 +3939,8 @@ impl SuperGitApp {
         let error = self
             .load_error
             .as_deref()
-            .or_else(|| self.details.commits.error());
-        let Some(commits) = self.details.commits.value() else {
+            .or_else(|| self.history.commits.error());
+        let Some(commits) = self.history.commits.value() else {
             return if let Some(error) = error {
                 self.render_data_notice("History unavailable", Some(error), false, cx)
             } else {
@@ -3963,16 +4046,14 @@ impl SuperGitApp {
             .size_full()
             .children(notice)
             .children(summary)
+            .child(self.render_squash(commits, cx))
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
 
     /// The selected worktree's fork data, once it is loaded for it.
     fn selected_fork(&self) -> Option<&sg_git::Fork> {
-        self.details
-            .fork
-            .as_ref()
-            .filter(|_| self.selected.as_ref() == Some(&self.details.path))
+        self.history.fork.as_ref()
     }
 
     /// The branch new work forks from (`origin/main`), for ordering badges.
@@ -4762,14 +4843,24 @@ impl SuperGitApp {
                     "Worktrees, Claude and Codex sessions, commits and pull requests in one place.",
                 ))
                 .child(
-                    h_flex().child(
-                        Button::new("welcome-open")
-                            .label("Open Repository…")
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_repository(&OpenRepository, window, cx)
-                            })),
-                    ),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("welcome-open")
+                                .label("Open Repository…")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_repository(&OpenRepository, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("welcome-clone")
+                                .label("Clone Repository…")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_clone_form(window, cx)
+                                })),
+                        ),
                 )
                 .when(!self.recent.is_empty(), |el| {
                     el.child(
@@ -4856,6 +4947,9 @@ impl Render for SuperGitApp {
                 el.child(self.render_switcher(cx))
             })
             .when(self.settings_open, |el| el.child(self.render_settings(cx)))
+            .when(self.clone_repository.is_some(), |el| {
+                el.child(self.render_clone_form(cx))
+            })
             .when(self.cleanup_preview.is_some(), |el| {
                 el.child(self.render_cleanup_preview(cx))
             })
@@ -4863,7 +4957,7 @@ impl Render for SuperGitApp {
                 el.child(self.render_rebase_dialog(cx))
             })
             .when(self.pulls.dialog_open(), |el| {
-                el.child(self.render_merge_dialog(cx))
+                el.child(self.render_pr_dialog(cx))
             })
             .when(self.cleanup_results_open, |el| {
                 el.child(self.render_cleanup_results(cx))

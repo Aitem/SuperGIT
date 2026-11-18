@@ -10,7 +10,7 @@ use futures::channel::mpsc::TryRecvError;
 use serde_json::{Value, json};
 use sg_agents::chat::{Conversation, Decision, InputResolution, Item, Status};
 use sg_agents::process::{AgentProcess, ProcessEvent};
-use sg_codex::{CodexFold, CodexProcess, Policy, Reply, SpawnOptions};
+use sg_codex::{CodexFold, CodexProcess, Policy, Reply, SpawnOptions, TurnOptions};
 
 const FAKE: &str = r#"#!/bin/sh
 # A fake `codex`: MODE and VERSION are substituted per test.
@@ -282,13 +282,24 @@ fn denied_command_is_declined_and_policy_changes_apply_next_turn() {
     );
 
     s.process.set_policy(Policy::ReadOnly);
-    s.send("again");
+    s.convo.push_user("again");
+    s.process
+        .send_turn(
+            "again",
+            TurnOptions {
+                model: Some("second-model".into()),
+                effort: Some("high".into()),
+            },
+        )
+        .unwrap();
     s.until("the second prompt", |s| {
         s.convo.status == Status::NeedsPermission
     });
     let turns = fake.sent("wt", "turn/start");
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[1]["params"]["sandboxPolicy"]["type"], "readOnly");
+    assert_eq!(turns[1]["params"]["model"], "second-model");
+    assert_eq!(turns[1]["params"]["effort"], "high");
 }
 
 #[test]

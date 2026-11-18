@@ -120,10 +120,16 @@ pub struct SpawnOptions {
     pub program: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnOptions {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 enum Input {
     Line(Value),
     Closed,
-    Send(String),
+    Send(String, TurnOptions),
     Interrupt,
     Respond { id: Value, result: Value },
     Fail { id: Value, message: String },
@@ -180,6 +186,10 @@ impl CodexProcess {
         )
     }
 
+    pub fn send_turn(&self, text: &str, options: TurnOptions) -> Result<()> {
+        self.input(Input::Send(text.to_string(), options))
+    }
+
     /// Applies from the next turn on (Codex takes policy overrides per turn).
     pub fn set_policy(&self, policy: Policy) {
         *self.policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
@@ -212,7 +222,7 @@ impl CodexProcess {
 
 impl AgentProcess for CodexProcess {
     fn send_user(&self, text: &str) -> Result<()> {
-        self.input(Input::Send(text.to_string()))
+        self.send_turn(text, TurnOptions::default())
     }
 
     fn interrupt(&self) -> Result<()> {
@@ -293,7 +303,7 @@ struct Driver {
     interrupt_pending: bool,
     /// The thread is started or resumed: turns can go out.
     ready: bool,
-    queued: VecDeque<String>,
+    queued: VecDeque<(String, TurnOptions)>,
 }
 
 impl Driver {
@@ -307,8 +317,8 @@ impl Driver {
             match input {
                 Input::Line(v) => self.on_line(v),
                 Input::Closed => break,
-                Input::Send(text) => {
-                    self.queued.push_back(text);
+                Input::Send(text, options) => {
+                    self.queued.push_back((text, options));
                     self.start_next_turn();
                 }
                 Input::Interrupt => self.interrupt(),
@@ -547,22 +557,27 @@ impl Driver {
         if !self.ready || self.turn_active {
             return;
         }
-        let (Some(thread_id), Some(text)) = (self.thread_id.clone(), self.queued.pop_front())
+        let (Some(thread_id), Some((text, options))) =
+            (self.thread_id.clone(), self.queued.pop_front())
         else {
             return;
         };
         let policy = *self.policy.lock().unwrap_or_else(|e| e.into_inner());
         self.turn_active = true;
         self.turn_id = None;
-        self.request(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": text, "text_elements": [] }],
-                "approvalPolicy": policy.approval_policy(),
-                "sandboxPolicy": policy.sandbox_policy(),
-            }),
-        );
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": text, "text_elements": [] }],
+            "approvalPolicy": policy.approval_policy(),
+            "sandboxPolicy": policy.sandbox_policy(),
+        });
+        if let Some(model) = options.model {
+            params["model"] = json!(model);
+        }
+        if let Some(effort) = options.effort {
+            params["effort"] = json!(effort);
+        }
+        self.request("turn/start", params);
     }
 
     fn interrupt(&mut self) {
@@ -627,6 +642,66 @@ const HISTORY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Turns per page, and a bound on how much history is loaded.
 const HISTORY_PAGE: u64 = 50;
 const HISTORY_PAGES: usize = 20;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Model {
+    pub id: String,
+    pub label: String,
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+    pub is_default: bool,
+}
+
+/// Read the configured provider's catalog without starting a thread.
+pub fn list_models(cwd: &Path) -> Result<Vec<Model>> {
+    let program = install::locate()?.program;
+    let mut client = Client::start(&program, cwd)?;
+    client.call("initialize", initialize_params())?;
+    client.notify(&json!({ "method": "initialized" }))?;
+    let mut models = Vec::new();
+    let mut cursor = Value::Null;
+    loop {
+        let result = client.call(
+            "model/list",
+            json!({ "cursor": cursor, "includeHidden": false }),
+        )?;
+        let page = result
+            .get("data")
+            .and_then(Value::as_array)
+            .context("Missing Codex model catalog")?;
+        models.extend(page.iter().filter_map(|model| {
+            let id = model.get("model")?.as_str()?.to_string();
+            Some(Model {
+                label: model
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_string(),
+                id,
+                efforts: model
+                    .get("supportedReasoningEfforts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("reasoningEffort")?.as_str().map(str::to_string))
+                    .collect(),
+                default_effort: model
+                    .get("defaultReasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                is_default: model
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }));
+        let next = result.get("nextCursor").filter(|value| !value.is_null());
+        match next {
+            Some(next) if *next != cursor => cursor = next.clone(),
+            _ => return Ok(models),
+        }
+    }
+}
 
 /// Read a thread's history through a short-lived app server: the thread is
 /// not resumed and no agent runs. Blocking — call off the UI thread.
