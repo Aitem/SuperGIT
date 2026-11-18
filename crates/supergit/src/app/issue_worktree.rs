@@ -6,8 +6,17 @@ use super::projects::project_name;
 use super::*;
 
 enum Source {
-    Issue { base_branch: String },
-    Commit { subject: String },
+    Issue {
+        base_branch: String,
+    },
+    Commit {
+        subject: String,
+    },
+    ForkPull {
+        number: u64,
+        subject: String,
+        repository: String,
+    },
 }
 
 pub(super) struct WorktreeDialog {
@@ -25,7 +34,7 @@ pub(super) struct WorktreeDialog {
 
 impl WorktreeDialog {
     fn ready_to_create(&self) -> bool {
-        self.issue.is_some() || matches!(self.source, Source::Commit { .. })
+        self.issue.is_some() || !matches!(self.source, Source::Issue { .. })
     }
 }
 
@@ -76,6 +85,30 @@ impl SuperGitApp {
         self.open_worktree_dialog(root, sha.to_owned(), source, window, cx);
     }
 
+    pub(super) fn open_fork_pr_worktree(
+        &mut self,
+        pr: &PullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.active_root().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(repository) = sg_github::pull_request_repository(pr) else {
+            return;
+        };
+        if pr.head_oid.is_empty() {
+            self.flash("Wait for the pull request commit to load", true, cx);
+            return;
+        }
+        let source = Source::ForkPull {
+            number: pr.number,
+            subject: pr.title.clone(),
+            repository,
+        };
+        self.open_worktree_dialog(root, pr.head_oid.clone(), source, window, cx);
+    }
+
     fn open_worktree_dialog(
         &mut self,
         root: PathBuf,
@@ -89,9 +122,14 @@ impl SuperGitApp {
         }
         let placeholder = match source {
             Source::Issue { .. } => "#42 or a GitHub issue URL",
-            Source::Commit { .. } => "feature/new-branch",
+            Source::Commit { .. } | Source::ForkPull { .. } => "feature/new-branch",
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        if let Source::ForkPull { number, .. } = &source {
+            input.update(cx, |state, cx| {
+                state.set_value(format!("review/pr-{number}"), window, cx)
+            });
+        }
         let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.submit_worktree_dialog(window, cx);
@@ -203,6 +241,13 @@ impl SuperGitApp {
             return;
         }
         let issue = dialog.issue.clone();
+        let pull = match &dialog.source {
+            Source::ForkPull {
+                number, repository, ..
+            } => Some((*number, repository.clone())),
+            _ => None,
+        };
+        let pull_number = pull.as_ref().map(|(number, _)| *number);
         let path = model::default_worktree_path(repo, &branch);
         let root = dialog.root.clone();
         let tip = dialog.base_tip.clone();
@@ -213,7 +258,7 @@ impl SuperGitApp {
             let request = root.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { create_at_tip(&request, &target, &branch, &tip) })
+                .spawn(async move { create_at_tip(&request, &target, &branch, &tip, pull) })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.action_task = None;
@@ -229,6 +274,9 @@ impl SuperGitApp {
                         }
                         if here {
                             this.select_worktree(path.clone(), cx);
+                            if let Some(number) = pull_number {
+                                this.set_pr_link(path.clone(), number, true, cx);
+                            }
                             if this.selected.as_ref() == Some(&path)
                                 && let Some(issue) = &issue
                             {
@@ -242,6 +290,11 @@ impl SuperGitApp {
                         }
                         let message = issue
                             .map(|issue| format!("Created a worktree for issue #{}", issue.number))
+                            .or_else(|| {
+                                pull_number.map(|number| {
+                                    format!("Created a review worktree for PR #{number}")
+                                })
+                            })
                             .unwrap_or_else(|| {
                                 "Created a worktree from the selected commit".into()
                             });
@@ -281,6 +334,12 @@ impl SuperGitApp {
             Source::Commit { subject } => {
                 ("Worktree from commit", format!("{base_tip} · {subject}"))
             }
+            Source::ForkPull {
+                number, subject, ..
+            } => (
+                "Review fork pull request",
+                format!("#{number} · {subject} · {base_tip}"),
+            ),
         };
         let action = if dialog.creating {
             "Creating worktree…"
@@ -402,13 +461,39 @@ impl SuperGitApp {
     }
 }
 
-fn create_at_tip(root: &Path, path: &Path, branch: &str, tip: &str) -> anyhow::Result<()> {
+fn github_fetch_url(root: &Path, repository: &str) -> anyhow::Result<Option<String>> {
+    let names = sg_git::git(root, ["remote"])?;
+    // Prefer origin when several remotes point to the repository as seen by GitHub.
+    let mut remotes = names.lines().collect::<Vec<_>>();
+    remotes.sort_by_key(|remote| *remote != "origin");
+    for name in remotes {
+        if let Ok(urls) = sg_git::git(root, ["config", "--get-all", &format!("remote.{name}.url")])
+            && let Some(url) = urls.lines().next()
+            && sg_github::repository_identity(url).as_deref() == Some(repository)
+        {
+            return Ok(Some(url.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn create_at_tip(
+    root: &Path,
+    path: &Path,
+    branch: &str,
+    tip: &str,
+    pull: Option<(u64, String)>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         !branch.is_empty() && !branch.starts_with('-'),
         "Enter a valid new branch name"
     );
     sg_git::git(root, ["check-ref-format", &format!("refs/heads/{branch}")])
         .map_err(|_| anyhow::anyhow!("Invalid Git branch name '{branch}'"))?;
+    if let Some((number, repository)) = pull {
+        let remote = github_fetch_url(root, &repository)?;
+        sg_git::require_pull_commit(root, remote.as_deref(), number, tip)?;
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

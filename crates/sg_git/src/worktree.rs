@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, ensure};
 
-use crate::git_bytes;
+use crate::{git, git_bytes, runner::git_timeout};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Worktree {
@@ -114,6 +115,47 @@ pub fn add_worktree(
         args.push(base.into());
     }
     git_bytes(repo_root, &args)?;
+    Ok(())
+}
+
+/// Get the reviewed PR commit from a GitHub pull ref when it is missing locally.
+/// The explicit refspec, empty refmap and no FETCH_HEAD keep local refs intact.
+pub fn require_pull_commit(
+    root: &Path,
+    remote: Option<&str>,
+    number: u64,
+    head: &str,
+) -> Result<()> {
+    ensure!(
+        number > 0
+            && matches!(head.len(), 40 | 64)
+            && head.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "The pull request did not provide a valid commit ID"
+    );
+    let exists = || git(root, ["cat-file", "-t", head]).is_ok_and(|kind| kind.trim() == "commit");
+    if exists() {
+        return Ok(());
+    }
+    let remote = remote.context("Add a fetch remote for the pull request’s GitHub repository")?;
+    let reference = format!("refs/pull/{number}/head");
+    git_timeout(
+        root,
+        &[
+            "fetch",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--refmap=",
+            "--",
+            remote,
+            &reference,
+        ],
+        Duration::from_secs(120),
+    )?;
+    ensure!(
+        exists(),
+        "The pull request head changed. Refresh its details and review the new commit."
+    );
     Ok(())
 }
 

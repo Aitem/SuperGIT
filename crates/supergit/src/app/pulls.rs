@@ -477,6 +477,21 @@ impl SuperGitApp {
             .is_some_and(|v| v.linked_prs.contains(&number))
     }
 
+    pub(super) fn pr_worktree(&self, pr: &PullRequest) -> Option<PathBuf> {
+        let same_repository = sg_github::head_in_same_repository(pr);
+        self.worktrees
+            .iter()
+            .filter(|info| info.wt.prunable.is_none())
+            .find(|info| {
+                if same_repository {
+                    info.wt.branch.as_deref() == Some(pr.head_branch.as_str())
+                } else {
+                    self.pr_linked_by_hand(info, pr.number)
+                }
+            })
+            .map(|info| info.wt.path.clone())
+    }
+
     fn pr_from_branch(&self, info: &WorktreeInfo, pr: &PullRequest) -> bool {
         if !sg_github::head_in_same_repository(pr) {
             return false;
@@ -1151,7 +1166,13 @@ impl SuperGitApp {
 
     /// Link `number` to the worktree at `path`, or undo the link (also one
     /// made by its branch).
-    fn set_pr_link(&mut self, path: PathBuf, number: u64, link: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_pr_link(
+        &mut self,
+        path: PathBuf,
+        number: u64,
+        link: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(root) = self.active_root().map(Path::to_path_buf) else {
             return;
         };
@@ -2090,15 +2111,15 @@ impl SuperGitApp {
         let linked = self.pr_linked(info, pr);
         let by_hand = self.pr_linked_by_hand(info, number);
         let from_branch = self.pr_from_branch(info, pr);
-        let worktree = self
-            .worktrees
-            .iter()
-            .find(|w| w.wt.branch.as_deref() == Some(pr.head_branch.as_str()))
-            .map(|w| w.wt.path.clone());
+        let worktree = self.pr_worktree(pr);
+        let same_repository = sg_github::head_in_same_repository(pr);
+        let can_review_fork = !same_repository
+            && !pr.head_oid.is_empty()
+            && sg_github::pull_request_repository(pr).is_some();
         let on_this_worktree = worktree.as_deref() == Some(info.path());
         let checkout = (!on_this_worktree
-            && (worktree.is_some() || (pr.is_open() && sg_github::head_in_same_repository(pr))))
-        .then(|| pr.clone());
+            && (worktree.is_some() || (pr.is_open() && same_repository) || can_review_fork))
+            .then(|| pr.clone());
         let link_tooltip = if linked && from_branch && !by_hand {
             format!(
                 "Its head is {}'s branch. Unlink to hide it from {name}",
@@ -2211,19 +2232,23 @@ impl SuperGitApp {
                             Button::new("pr-worktree")
                                 .label(if exists {
                                     "Go to worktree"
+                                } else if can_review_fork {
+                                    "Review in worktree…"
                                 } else {
                                     "Check out as worktree"
                                 })
                                 .xsmall()
                                 .ghost()
                                 .tooltip(if exists {
-                                    format!("Select the worktree on {}", pr.head_branch)
+                                    "Select the pull request’s worktree".into()
+                                } else if can_review_fork {
+                                    "Create a local review branch at this fork’s commit".into()
                                 } else {
                                     format!("Create a worktree on {}", pr.head_branch)
                                 })
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.checkout_pr(&pr, cx)),
-                                ),
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.checkout_pr(&pr, window, cx)
+                                })),
                         )
                     })
                     .child(
