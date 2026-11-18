@@ -69,7 +69,7 @@ pub use submodule::{
     Inline, MAX_COMMITS, Patch, SubmoduleChange, SubmoduleCommit, SubmoduleFlags,
     inline_submodules, submodule_of, with_submodule_files,
 };
-pub use worktree::{Worktree, add_worktree, list_worktrees, remove_worktree};
+pub use worktree::{Worktree, add_worktree, list_worktrees, remove_worktree, require_pull_commit};
 
 #[cfg(feature = "git2-probe")]
 fn use_git2_probe() -> bool {

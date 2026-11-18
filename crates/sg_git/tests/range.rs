@@ -3,7 +3,7 @@
     reason = "test helpers fail the test by panicking"
 )]
 
-use sg_git::{pr_merge_base, range_patch};
+use sg_git::{pr_merge_base, range_patch, require_pull_commit};
 use std::path::Path;
 use std::process::Command;
 
@@ -70,6 +70,44 @@ fn a_pull_request_diff_is_its_head_against_the_merge_base() {
     git(root, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
     assert_eq!(pr_merge_base(root, "", "trunk", &head).unwrap(), head);
     assert_eq!(pr_merge_base(root, &moved, "trunk", &head).unwrap(), fork);
+}
+
+#[test]
+fn fetches_the_reviewed_pull_commit_without_changing_local_refs() {
+    let remote = repository();
+    let checkout = tempfile::tempdir().unwrap();
+    let url = remote.path().to_str().unwrap();
+    git(checkout.path(), &["clone", "-q", "--no-local", url, "."]);
+    let head_before = git(checkout.path(), &["rev-parse", "HEAD"]);
+    let refs_before = git(checkout.path(), &["for-each-ref"]);
+    let fetch_head = checkout.path().join(".git/FETCH_HEAD");
+    std::fs::write(&fetch_head, "previous fetch\n").unwrap();
+    std::fs::write(checkout.path().join("shared.txt"), "local edits\n").unwrap();
+
+    git(remote.path(), &["switch", "-qc", "fork-change"]);
+    let commit = commit(remote.path(), "fork.txt", "new fork\n", "fork changes");
+    git(remote.path(), &["update-ref", "refs/pull/42/head", &commit]);
+    assert!(require_pull_commit(checkout.path(), None, 42, &commit).is_err());
+    require_pull_commit(checkout.path(), Some(url), 42, &commit).unwrap();
+    require_pull_commit(checkout.path(), None, 42, &commit).unwrap();
+    assert_eq!(
+        git(checkout.path(), &["show", &format!("{commit}:fork.txt")]),
+        "new fork"
+    );
+    assert_eq!(git(checkout.path(), &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git(checkout.path(), &["for-each-ref"]), refs_before);
+    assert_eq!(
+        std::fs::read_to_string(fetch_head).unwrap(),
+        "previous fetch\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.path().join("shared.txt")).unwrap(),
+        "local edits\n"
+    );
+
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    let stale = require_pull_commit(checkout.path(), Some(url), 42, missing).unwrap_err();
+    assert!(stale.to_string().contains("head changed"));
 }
 
 #[test]

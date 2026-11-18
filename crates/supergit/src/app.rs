@@ -135,7 +135,9 @@ impl<'a> Scope<'a> {
     fn pr_for_branch(&self, branch: Option<&str>) -> Option<&'a PullRequest> {
         let branch = branch?;
         // Open pull requests come first, so one wins over an old merged one.
-        self.prs.iter().find(|pr| pr.head_branch == branch)
+        self.prs
+            .iter()
+            .find(|pr| pr.head_branch == branch && sg_github::head_in_same_repository(pr))
     }
 }
 
@@ -1598,7 +1600,9 @@ impl SuperGitApp {
     fn pr_for_branch(&self, branch: Option<&str>) -> Option<&PullRequest> {
         let branch = branch?;
         // `prs` lists open ones first, so an open PR wins over an old merged one.
-        self.prs.iter().find(|pr| pr.head_branch == branch)
+        self.prs
+            .iter()
+            .find(|pr| pr.head_branch == branch && sg_github::head_in_same_repository(pr))
     }
 
     fn reload_details(&mut self, cx: &mut Context<Self>) {
@@ -2554,14 +2558,13 @@ impl SuperGitApp {
         );
     }
 
-    fn checkout_pr(&mut self, pr: &PullRequest, cx: &mut Context<Self>) {
-        if let Some(existing) = self
-            .worktrees
-            .iter()
-            .find(|w| w.wt.branch.as_deref() == Some(pr.head_branch.as_str()))
-        {
-            let path = existing.wt.path.clone();
+    fn checkout_pr(&mut self, pr: &PullRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.pr_worktree(pr) {
             self.select_worktree(path, cx);
+            return;
+        }
+        if !sg_github::head_in_same_repository(pr) {
+            self.open_fork_pr_worktree(pr, window, cx);
             return;
         }
         let Some(repo) = self.repo.clone() else {
