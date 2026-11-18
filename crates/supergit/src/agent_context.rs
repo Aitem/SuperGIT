@@ -221,6 +221,7 @@ mod tests {
             resolved: false,
             outdated: true,
             permissions: Default::default(),
+            side: sg_github::ReviewSide::Modified,
             diff_hunk: "@@ -22 +22 @@\n-read()\n+readWithExpiry()".into(),
             comments: vec![sg_github::Comment {
                 author: "alex".into(),

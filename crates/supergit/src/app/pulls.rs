@@ -32,6 +32,7 @@ const SEARCH_DELAY: Duration = Duration::from_millis(400);
 const BRANCH_LIMIT: usize = 50;
 const SEARCH_LIMIT: usize = 50;
 
+mod inline_review;
 mod review_actions;
 mod review_context;
 
@@ -126,7 +127,8 @@ pub(super) struct Pulls {
     pub(super) files_collapsed: HashSet<String>,
     files_layout: Entity<ResizableState>,
     /// A review thread's file and line to show once the diff is ready.
-    pending_jump: Option<(u64, String, Option<u64>)>,
+    pending_jump: Option<inline_review::ThreadJump>,
+    expanded_diff_threads: HashSet<String>,
     merge: Option<MergeDialog>,
     publish: Option<publish::PublishDialog>,
     publish_task: Option<Task<()>>,
@@ -205,6 +207,7 @@ impl Pulls {
             files_collapsed: HashSet::new(),
             files_layout: cx.new(|_| ResizableState::default()),
             pending_jump: None,
+            expanded_diff_threads: HashSet::new(),
             merge: None,
             publish: None,
             publish_task: None,
@@ -243,6 +246,7 @@ impl Pulls {
         self.files_collapsed.clear();
         self.files_layout = cx.new(|_| ResizableState::default());
         self.pending_jump = None;
+        self.expanded_diff_threads.clear();
     }
 
     pub(super) fn dialog_open(&self) -> bool {
@@ -823,15 +827,19 @@ impl SuperGitApp {
             self.pulls.diff_shown = Some(key);
             self.refresh_difft(FileList::Pull, cx);
         }
-        if let Some((_, path, line)) = self.pulls.pending_jump.take_if(|(n, _, _)| *n == number) {
+        if let Some(jump) = self
+            .pulls
+            .pending_jump
+            .take_if(|jump| jump.number == number)
+        {
+            let inline_review::ThreadJump { path, line, .. } = jump;
             self.pulls
                 .difft
                 .update(cx, |view, cx| view.scroll_to_file(&path, cx));
             self.pulls.diff.update(cx, |diff, cx| match line {
-                Some(line) => diff.scroll_to_line(
-                    DiffLinePosition::new(path, DiffSide::Modified, line as usize),
-                    cx,
-                ),
+                Some((side, line)) => {
+                    diff.scroll_to_line(DiffLinePosition::new(path, side, line), cx)
+                }
                 None => diff.scroll_to_file(&path, cx),
             });
         }
@@ -1215,14 +1223,15 @@ impl SuperGitApp {
     }
 
     /// From a review thread to its line in the Files tab.
-    fn jump_to_thread(
-        &mut self,
-        number: u64,
-        path: String,
-        line: Option<u64>,
-        cx: &mut Context<Self>,
-    ) {
-        self.pulls.pending_jump = Some((number, path, line));
+    fn jump_to_thread(&mut self, number: u64, thread: &ReviewThread, cx: &mut Context<Self>) {
+        if !thread.outdated {
+            self.pulls.expanded_diff_threads.insert(thread.id.clone());
+        }
+        self.pulls.pending_jump = Some(inline_review::ThreadJump {
+            number,
+            path: thread.path.clone(),
+            line: inline_review::thread_line(thread),
+        });
         self.pulls.tab = DetailsTab::Files;
         self.show_pr_diff(number, cx);
         cx.notify();
@@ -2596,7 +2605,9 @@ impl SuperGitApp {
                         cx,
                     )
                 }
-                Activity::Thread(thread) => self.render_thread(&details.pr, ix, thread, theme, cx),
+                Activity::Thread(thread) => {
+                    self.render_thread(&details.pr, ix, thread, false, theme, cx)
+                }
             })
             .collect();
         v_flex()
@@ -2637,11 +2648,16 @@ impl SuperGitApp {
         pr: &PullRequest,
         ix: usize,
         thread: &ReviewThread,
+        in_diff: bool,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let number = pr.number;
-        let expanded = thread.resolved == self.pulls.toggled_threads.contains(&thread.id);
+        let expanded = if in_diff {
+            self.pulls.expanded_diff_threads.contains(&thread.id)
+        } else {
+            thread.resolved == self.pulls.toggled_threads.contains(&thread.id)
+        };
         let id = thread.id.clone();
         let location = match thread.line {
             Some(line) => format!("{}:{line}", thread.path),
@@ -2673,7 +2689,16 @@ impl SuperGitApp {
                     .items_center()
                     .bg(theme.muted)
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_thread(id.clone(), cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if in_diff {
+                            if !this.pulls.expanded_diff_threads.remove(&id) {
+                                this.pulls.expanded_diff_threads.insert(id.clone());
+                            }
+                            cx.notify();
+                        } else {
+                            this.toggle_thread(id.clone(), cx);
+                        }
+                    }))
                     .child(
                         Icon::new(if expanded {
                             IconName::ChevronDown
@@ -2698,18 +2723,18 @@ impl SuperGitApp {
                         el.child(tag("outdated", theme.warning))
                     })
                     .child(div().flex_1())
-                    .child({
-                        let path = thread.path.clone();
-                        // An outdated line may be gone: show the file then.
-                        let line = thread.line.filter(|_| !thread.outdated);
-                        Button::new(("pr-thread-diff", ix))
-                            .label("View in diff")
-                            .xsmall()
-                            .ghost()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.jump_to_thread(number, path.clone(), line, cx)
-                            }))
+                    .when(!in_diff, |header| {
+                        let thread = thread.clone();
+                        header.child(
+                            Button::new(("pr-thread-diff", ix))
+                                .label("View in diff")
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.jump_to_thread(number, &thread, cx);
+                                })),
+                        )
                     })
                     .when(!expanded, |el| {
                         el.child(
@@ -2725,7 +2750,10 @@ impl SuperGitApp {
                     }),
             )
             .when(expanded, |el| {
-                el.child(diff_excerpt(&thread.diff_hunk, theme)).child(
+                el.when(!in_diff, |card| {
+                    card.child(diff_excerpt(&thread.diff_hunk, theme))
+                })
+                .child(
                     v_flex()
                         .px_3()
                         .py_2()
