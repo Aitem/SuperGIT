@@ -52,11 +52,16 @@ pub(super) struct Activity {
 }
 
 /// The title bar's order: the first needs the user most.
-pub(super) const ATTENTION_ORDER: [Kind; 4] =
-    [Kind::Approval, Kind::Failed, Kind::Completed, Kind::Running];
+pub(super) const ATTENTION_ORDER: [Kind; 5] = [
+    Kind::Approval,
+    Kind::Question,
+    Kind::Failed,
+    Kind::Completed,
+    Kind::Running,
+];
 
 fn wants_attention(kind: Kind, state: &crate::attention::Attention) -> bool {
-    state.kind == kind && (matches!(kind, Kind::Running | Kind::Approval) || state.unread)
+    state.kind == kind && (kind.is_live() || state.unread)
 }
 
 /// The repository's folder name.
@@ -302,6 +307,7 @@ impl SuperGitApp {
                 sg_agents::chat::Status::Working
                     | sg_agents::chat::Status::Starting
                     | sg_agents::chat::Status::NeedsPermission
+                    | sg_agents::chat::Status::NeedsInput
             )
         });
         if busy {
@@ -397,16 +403,17 @@ impl SuperGitApp {
                 }));
             }
         }
-        let agent = self
-            .project_chats(root)
-            .filter_map(|(_, chat)| match chat.read(cx).status() {
-                sg_agents::chat::Status::NeedsPermission => Some(AgentState::NeedsAttention),
-                sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
-                    Some(AgentState::Working)
-                }
-                _ => None,
-            })
-            .min();
+        let agent =
+            self.project_chats(root)
+                .filter_map(|(_, chat)| match chat.read(cx).status() {
+                    sg_agents::chat::Status::NeedsPermission
+                    | sg_agents::chat::Status::NeedsInput => Some(AgentState::NeedsAttention),
+                    sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
+                        Some(AgentState::Working)
+                    }
+                    _ => None,
+                })
+                .min();
         let attention = ATTENTION_ORDER.into_iter().find_map(|kind| {
             let mut matching = states
                 .iter()
