@@ -177,7 +177,7 @@ fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> bool {
     .is_ok()
 }
 
-fn git_dir(worktree: &Path) -> Result<PathBuf> {
+pub(crate) fn git_dir(worktree: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(
         git(worktree, ["rev-parse", "--absolute-git-dir"])?.trim(),
     ))

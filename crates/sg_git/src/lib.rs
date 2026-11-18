@@ -30,7 +30,12 @@ mod status;
 mod submodule;
 mod worktree;
 
+mod cherry_pick;
+
 pub use base::{BaseInfo, Upstream, load_base, update_base};
+pub use cherry_pick::{
+    CherryPickAction, CherryPickPlan, CherryPickState, inspect_cherry_pick, run_cherry_pick,
+};
 pub use cleanup::{
     BranchDeletion, CleanupOutcome, CleanupPlan, CleanupPolicy, WorktreeIdentity,
     cleanup_base_branch, cleanup_worktree, delete_cleanup_branch, fetch_cleanup_base,
