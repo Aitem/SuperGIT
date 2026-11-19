@@ -76,6 +76,26 @@ pub enum DiffLayout {
     Split,
 }
 
+/// How the agent panel shows a conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentView {
+    /// SuperGIT's native chat (stream-json / app-server).
+    #[default]
+    Chat,
+    /// The agent's own TUI (`claude`, `codex`) in an embedded terminal.
+    Terminal,
+}
+
+impl AgentView {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Terminal => "Terminal",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -89,6 +109,8 @@ pub struct Settings {
     /// Show Changes and History diffs through difftastic (`difft`), when it
     /// is installed.
     pub difftastic: bool,
+    /// What New / Resume open: the native chat or the agent's TUI.
+    pub agent_view: AgentView,
 }
 
 fn file() -> Option<PathBuf> {
@@ -163,6 +185,9 @@ mod tests {
             serde_json::from_str(r#"{"diff_layout":"split","difftastic":true}"#).unwrap();
         assert_eq!(s.diff_layout, DiffLayout::Split);
         assert!(s.difftastic);
+        assert_eq!(s.agent_view, AgentView::Chat);
+        let s: Settings = serde_json::from_str(r#"{"agent_view":"terminal"}"#).unwrap();
+        assert_eq!(s.agent_view, AgentView::Terminal);
         assert_eq!(Appearance::System.next().next().next(), Appearance::System);
     }
 

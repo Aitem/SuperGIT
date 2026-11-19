@@ -1,3 +1,11 @@
 [alias]
 # CI's clippy job, verbatim: `cargo lint`.
 lint = "clippy --workspace --all-targets --all-features --locked -- -D warnings"
+
+[env]
+# libghostty-vt (crates/sg_terminal) builds from these Ghostty sources with
+# Zig 0.17.x; `scripts/fetch-ghostty.sh` downloads them. A GHOSTTY_SOURCE_DIR
+# in the environment wins.
+GHOSTTY_SOURCE_DIR = { value = "vendor/ghostty", relative = true }
+# Like the other dependencies in dev builds: fast (Zig would build Debug).
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"

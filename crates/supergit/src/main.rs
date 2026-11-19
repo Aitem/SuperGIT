@@ -22,6 +22,7 @@ mod single_instance;
 mod submodules;
 mod switcher;
 mod syntax;
+mod terminal;
 mod workspace;
 
 use std::path::PathBuf;
@@ -71,6 +72,36 @@ ENV:
     SUPERGIT_NEW_INSTANCE  Linux: start a separate instance instead of handing
                         the folder to the running one
 ";
+
+/// Keys inside the embedded terminal. Copy and paste are its own actions;
+/// keys that outer bindings would take (Tab moves focus, and on Linux the
+/// app's `ctrl-` shortcuts and `ctrl-c`) are released to the program:
+/// `NoAction` in the deeper context outranks them.
+fn bind_terminal_keys(cx: &mut App) {
+    let context = Some(terminal::KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction {}, context),
+        KeyBinding::new("shift-tab", NoAction {}, context),
+    ]);
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-c", terminal::Copy, context),
+            KeyBinding::new("cmd-v", terminal::Paste, context),
+        ]);
+    } else {
+        // Ctrl+Shift+C/V copy and paste; plain Ctrl+letters reach the TUI.
+        cx.bind_keys([
+            KeyBinding::new("ctrl-shift-c", terminal::Copy, context),
+            KeyBinding::new("ctrl-shift-v", terminal::Paste, context),
+        ]);
+        cx.bind_keys(
+            [
+                "ctrl-c", "ctrl-v", "ctrl-r", "ctrl-o", "ctrl-l", "ctrl-b", "ctrl-n", "ctrl-p",
+            ]
+            .map(|keys| KeyBinding::new(keys, NoAction {}, context)),
+        );
+    }
+}
 
 fn main() -> Result<()> {
     // Before anything else (and before any thread): a Dock/Finder launch has
@@ -166,6 +197,7 @@ fn main() -> Result<()> {
             KeyBinding::new("down", app::SwitcherNext, Some("Switcher")),
             KeyBinding::new("escape", app::CloseSwitcher, Some("Switcher")),
         ]);
+        bind_terminal_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         set_app_menus(cx);
         cx.on_window_closed(|cx, _| {

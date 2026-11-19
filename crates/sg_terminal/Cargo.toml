@@ -1,0 +1,27 @@
+[package]
+name = "sg_terminal"
+description = "Embedded terminal for SuperGIT: a PTY plus Ghostty's terminal emulation (libghostty-vt), drawn by the app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+# Ghostty's VT parser, screen state, scrollback and key/mouse/paste encoders
+# (libghostty-vt 1.0.1, stable C ABI). The Rust bindings come from git: the
+# crates.io release still pins a pre-1.0 Ghostty that needs Zig 0.15. Built
+# from source with Zig 0.17.x: `scripts/fetch-ghostty.sh` puts the sources
+# (the commit these bindings pin) where `.cargo/config.toml` points
+# GHOSTTY_SOURCE_DIR. No Kitty graphics: the panel does not draw images.
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", default-features = false }
+# PTY: open, size, controlling terminal (already in the tree via GPUI).
+rustix = { version = "1", features = ["pty", "termios", "process", "fs", "stdio"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+futures = { workspace = true, features = ["executor"] }
