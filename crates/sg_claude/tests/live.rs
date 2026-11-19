@@ -133,3 +133,93 @@ fn permission_round_trip_with_real_claude() {
     process.kill();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `AskUserQuestion` arrives as a question form; the answer reaches Claude.
+#[test]
+#[ignore]
+fn ask_user_question_round_trip_with_real_claude() {
+    use sg_claude::AgentProcess as _;
+    use sg_claude::conversation::{Answers, InputResolution};
+
+    let dir = std::env::temp_dir().join(format!("sg_claude_ask_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = SpawnOptions {
+        cwd: dir.clone(),
+        permission_mode: Some(PermissionMode::Default),
+        ..Default::default()
+    };
+    let (process, mut events) = ClaudeProcess::spawn(&opts).expect("spawn claude");
+    let mut convo = Conversation::new();
+    let prompt = "Use the AskUserQuestion tool exactly once to ask me which fruit I prefer, \
+                  with the options Apple and Banana (single choice). After I answer, reply \
+                  with only the name of the fruit I chose.";
+    convo.push_user(prompt);
+    process.send_user(prompt).unwrap();
+
+    futures::executor::block_on(async {
+        while let Some(ev) = events.next().await {
+            match ev {
+                ProcessEvent::Message(v) => {
+                    if let Some(Reply::Unsupported {
+                        request_id,
+                        subtype,
+                    }) = convo.apply(&v)
+                    {
+                        process
+                            .control_error(&request_id, &format!("unsupported: {subtype}"))
+                            .unwrap();
+                    }
+                    if let Some(form) = convo.pending_user_input().cloned() {
+                        let question = &form.questions[0];
+                        let banana = question
+                            .options
+                            .iter()
+                            .find(|o| o.label.contains("Banana"))
+                            .expect("a Banana option")
+                            .label
+                            .clone();
+                        let answers = Answers::from([(question.id.clone(), vec![banana])]);
+                        process.answer_questions(&form, &answers).unwrap();
+                        convo.record_answers(&form.request_id, answers);
+                    }
+                    if let Some(p) = convo.pending_permission().cloned() {
+                        process.deny(&p.request_id, "not in this test").unwrap();
+                        convo.resolve_permission(&p.request_id, Decision::Denied);
+                    }
+                    if convo.status == Status::Idle {
+                        break;
+                    }
+                }
+                ProcessEvent::Stderr(_) => {}
+                ProcessEvent::Exited => panic!("claude exited early"),
+            }
+        }
+    });
+
+    assert!(convo.items.iter().any(|i| matches!(
+        i,
+        Item::UserInput(form) if form.resolution == InputResolution::Answered
+    )));
+    let result = convo
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Tool(t) if t.name == "AskUserQuestion" => t.result.clone(),
+            _ => None,
+        })
+        .expect("the AskUserQuestion result");
+    assert!(!result.is_error, "{}", result.text);
+    assert!(result.text.contains("Banana"), "{}", result.text);
+    let reply = convo
+        .items
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            Item::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(reply.contains("Banana"), "reply: {reply}");
+    process.kill();
+    std::fs::remove_dir_all(&dir).ok();
+}

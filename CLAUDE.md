@@ -73,6 +73,12 @@ Same protocol as the Agent SDKs and the VS Code extension:
   (`decision_reason_type: "classifier"`), slow checks as
   `system/permission_check_status` (`checking`/`done`), escalations as
   ordinary `can_use_tool` with `decision_reason` (may carry ANSI escapes).
+- `AskUserQuestion` asks permission like any tool; `sg_claude::questions`
+  turns it into a question form (`Item::UserInput`, shared with Codex).
+  Answer = allow with `updatedInput` = the input plus `answers` {question
+  text → label or typed text, an array for `multiSelect`}; Decline = deny.
+  The CLI adds no "Other" option: the form always offers free text.
+  Malformed input stays an ordinary permission prompt.
 - `Conversation::from_transcript` replays a session jsonl for history.
 - Live test against the real CLI (costs cents): `cargo test -p sg_claude -- --ignored`.
 - UI checks: `SUPERGIT_DEBUG_CHAT=resume` or `SUPERGIT_DEBUG_CHAT='prompt:…'`

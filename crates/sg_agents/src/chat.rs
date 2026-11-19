@@ -6,6 +6,7 @@
 //! the provider's raw `input`/`meta` — each adapter also owns the helpers that
 //! summarize them for display.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -76,21 +77,34 @@ pub struct UserQuestion {
     pub options: Vec<QuestionOption>,
     pub allow_other: bool,
     pub secret: bool,
+    /// Any number of the options may be picked (checkboxes, not radios).
+    pub multi_select: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputResolution {
     Pending,
     Answered,
+    /// The user refused to answer (the agent was told so).
+    Declined,
     Expired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Answers by question id: the chosen option labels and/or typed text, in
+/// the order the user gave them.
+pub type Answers = BTreeMap<String, Vec<String>>;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct UserInputRequest {
     pub request_id: String,
     pub questions: Vec<UserQuestion>,
     pub blocking: bool,
     pub resolution: InputResolution,
+    /// Provider data the answer must echo (Claude's `AskUserQuestion`
+    /// input); `Null` when not needed.
+    pub input: Value,
+    /// What the user answered, once sent.
+    pub answers: Answers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +286,20 @@ impl Conversation {
         }
         self.items.push(Item::UserInput(request));
         self.settle_pending_requests();
+    }
+
+    /// The user's answers reached the agent.
+    pub fn record_answers(&mut self, request_id: &str, answers: Answers) {
+        for item in self.items.iter_mut().rev() {
+            if let Item::UserInput(request) = item
+                && request.request_id == request_id
+                && request.resolution == InputResolution::Pending
+            {
+                request.answers = answers;
+                break;
+            }
+        }
+        self.resolve_user_input(request_id, InputResolution::Answered);
     }
 
     pub fn resolve_user_input(&mut self, request_id: &str, resolution: InputResolution) {
@@ -536,6 +564,8 @@ mod tests {
             questions: Vec::new(),
             blocking: false,
             resolution: InputResolution::Pending,
+            input: Value::Null,
+            answers: Answers::new(),
         };
         let blocking = UserInputRequest {
             request_id: "blocking".into(),
@@ -548,8 +578,13 @@ mod tests {
         conversation.push_user_input(blocking);
         assert_eq!(conversation.items.len(), 2);
         assert_eq!(conversation.status, Status::NeedsInput);
-        conversation.resolve_user_input("blocking", InputResolution::Answered);
+        let answers = Answers::from([("q".to_string(), vec!["a".to_string(), "b".to_string()])]);
+        conversation.record_answers("blocking", answers.clone());
         assert_eq!(conversation.status, Status::Working);
+        assert_eq!(
+            conversation.user_input("blocking").unwrap().answers,
+            answers
+        );
         conversation.end_turn(None, false, None);
         assert_eq!(
             conversation.user_input("optional").unwrap().resolution,

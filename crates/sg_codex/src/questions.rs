@@ -1,10 +1,10 @@
 //! Conversion between Codex's interactive questions and the shared chat model.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sg_agents::chat::{InputResolution, QuestionOption, UserInputRequest, UserQuestion};
+use sg_agents::chat::{Answers, InputResolution, QuestionOption, UserInputRequest, UserQuestion};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +48,8 @@ pub(crate) fn request(request_id: &str, value: &Value) -> Option<UserInputReques
         request_id: request_id.to_string(),
         blocking: params.is_blocking.unwrap_or(true),
         resolution: InputResolution::Pending,
+        input: Value::Null,
+        answers: Answers::new(),
         questions: params
             .questions
             .into_iter()
@@ -57,6 +59,7 @@ pub(crate) fn request(request_id: &str, value: &Value) -> Option<UserInputReques
                 prompt: question.question,
                 allow_other: question.is_other,
                 secret: question.is_secret,
+                multi_select: false,
                 options: question
                     .options
                     .unwrap_or_default()
@@ -71,10 +74,10 @@ pub(crate) fn request(request_id: &str, value: &Value) -> Option<UserInputReques
     })
 }
 
-pub(crate) fn response(answers: &BTreeMap<String, String>) -> Value {
+pub(crate) fn response(answers: &Answers) -> Value {
     let answers: serde_json::Map<_, _> = answers
         .iter()
-        .map(|(id, answer)| (id.clone(), json!({"answers": [answer]})))
+        .map(|(id, values)| (id.clone(), json!({ "answers": values })))
         .collect();
     json!({"answers": answers})
 }
@@ -83,7 +86,7 @@ pub(crate) fn response(answers: &BTreeMap<String, String>) -> Value {
 mod tests {
     use super::{request, response};
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use sg_agents::chat::Answers;
 
     #[test]
     fn maps_metadata_for_choices_and_free_text() {
@@ -97,7 +100,10 @@ mod tests {
         assert_eq!(input.questions[0].options[0].label, "main");
         assert!(input.questions[1].secret && input.questions[1].options.is_empty());
         assert_eq!(
-            response(&BTreeMap::from([("base".to_string(), "main".to_string())])),
+            response(&Answers::from([(
+                "base".to_string(),
+                vec!["main".to_string()]
+            )])),
             json!({"answers":{"base":{"answers":["main"]}}})
         );
     }

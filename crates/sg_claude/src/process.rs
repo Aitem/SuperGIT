@@ -11,7 +11,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use serde_json::{Value, json};
 pub use sg_agents::process::ProcessEvent;
 use sg_agents::{
-    chat::{Decision, PermissionRequest},
+    chat::{Answers, Decision, PermissionRequest, UserInputRequest},
     process::AgentProcess,
 };
 
@@ -258,6 +258,18 @@ impl AgentProcess for ClaudeProcess {
                 self.deny(&request.request_id, "The user denied this action.")
             }
         }
+    }
+
+    fn answer_questions(&self, request: &UserInputRequest, answers: &Answers) -> Result<()> {
+        let input = crate::questions::answered_input(request, answers);
+        self.allow(&request.request_id, &input, None)
+    }
+
+    fn decline_questions(&self, request: &UserInputRequest) -> Result<()> {
+        self.deny(
+            &request.request_id,
+            "The user declined to answer these questions.",
+        )
     }
 
     fn reject(&self, request_id: &str, error: &str) -> Result<()> {

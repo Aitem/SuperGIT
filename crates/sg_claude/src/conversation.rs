@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 pub use sg_agents::chat::{
-    Conversation, Decision, Item, PermissionRequest, Status, ToolCall, ToolResult, strip_ansi,
+    Answers, Conversation, Decision, InputResolution, Item, PermissionRequest, Status, ToolCall,
+    ToolResult, UserInputRequest, strip_ansi,
 };
 
 /// Label for the "allow and remember" button, if the CLI offered a rule.
@@ -263,6 +264,13 @@ fn on_control_request(c: &mut Conversation, v: &Value) -> Option<Reply> {
     if let Some(id) = s("tool_use_id") {
         c.set_checking(&id, false);
     }
+    let input = req.get("input").cloned().unwrap_or(Value::Null);
+    if tool_name == crate::questions::TOOL
+        && let Some(form) = crate::questions::request(&request_id, &input)
+    {
+        c.push_user_input(form);
+        return None;
+    }
     let display_name = s("display_name").unwrap_or_else(|| tool_name.clone());
     let suggestions = req
         .get("permission_suggestions")
@@ -278,7 +286,7 @@ fn on_control_request(c: &mut Conversation, v: &Value) -> Option<Reply> {
         reason: s("decision_reason")
             .map(|r| strip_ansi(&r).trim().to_string())
             .filter(|r| !r.is_empty()),
-        input: req.get("input").cloned().unwrap_or(Value::Null),
+        input,
         suggestions,
         tool_use_id: s("tool_use_id"),
         decision: None,
@@ -457,6 +465,29 @@ mod tests {
         let t = c.tool("t1").unwrap();
         assert_eq!(t.result.as_ref().unwrap().text, "File created");
         assert!(t.result.as_ref().unwrap().meta.is_some());
+    }
+
+    #[test]
+    fn ask_user_question_becomes_a_question_form() {
+        let mut c = Conversation::new();
+        let ask = |id: &str, input: Value| json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":input,"tool_use_id":format!("t-{id}")}});
+        let replies = feed(
+            &mut c,
+            &[ask(
+                "r1",
+                json!({"questions":[{"question":"Which base?","header":"Base","options":[{"label":"main","description":"default"}],"multiSelect":false}]}),
+            )],
+        );
+        assert!(replies.is_empty());
+        assert_eq!(c.status, Status::NeedsInput);
+        assert!(c.pending_permission().is_none());
+        let form = c.pending_user_input().unwrap();
+        assert_eq!(form.request_id, "r1");
+        assert_eq!(form.questions[0].prompt, "Which base?");
+
+        // Not a form after all: the user still gets to allow or deny it.
+        feed(&mut c, &[ask("r2", json!({"questions": "?"}))]);
+        assert_eq!(c.pending_permission().unwrap().tool_name, "AskUserQuestion");
     }
 
     #[test]
