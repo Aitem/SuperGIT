@@ -2,13 +2,12 @@
 //! speaks just enough of the app-server protocol). No real Codex runs.
 #![expect(clippy::unwrap_used, reason = "tests")]
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::TryRecvError;
 use serde_json::{Value, json};
-use sg_agents::chat::{Conversation, Decision, InputResolution, Item, Status};
+use sg_agents::chat::{Answers, Conversation, Decision, InputResolution, Item, Status};
 use sg_agents::process::{AgentProcess, ProcessEvent};
 use sg_codex::{
     CodexFold, CodexProcess, CollaborationMode, Policy, Reply, SpawnOptions, TurnOptions,
@@ -248,9 +247,9 @@ fn answers_continue_the_same_turn_with_an_opaque_request_id() {
     });
     let request = session.convo.pending_user_input().unwrap().clone();
     assert_eq!(request.questions.len(), 2);
-    let answers = BTreeMap::from([
-        ("base".to_string(), "develop".to_string()),
-        ("note".to_string(), "Deploy after tests".to_string()),
+    let answers = Answers::from([
+        ("base".to_string(), vec!["develop".to_string()]),
+        ("note".to_string(), vec!["Deploy after tests".to_string()]),
     ]);
     session
         .process

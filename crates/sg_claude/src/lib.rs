@@ -10,11 +10,13 @@
 //!
 //! This crate is UI-agnostic: [`process`] owns the child process and the wire
 //! protocol, [`conversation`] folds events into the shared chat model
-//! (`sg_agents::chat`), [`tools`] summarizes Claude's tool calls.
+//! (`sg_agents::chat`), [`tools`] summarizes Claude's tool calls and
+//! [`questions`] turns `AskUserQuestion` into a question form.
 #![forbid(unsafe_code)]
 
 pub mod conversation;
 pub mod process;
+pub mod questions;
 pub mod tools;
 
 pub use conversation::{

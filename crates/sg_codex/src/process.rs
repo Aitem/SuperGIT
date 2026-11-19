@@ -11,7 +11,7 @@
 //! `{"response": "<method>", "result" | "error": …}` (see
 //! [`crate::conversation`]).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use serde_json::{Value, json};
-use sg_agents::chat::{Decision, PermissionRequest};
+use sg_agents::chat::{Answers, Decision, PermissionRequest, UserInputRequest};
 use sg_agents::process::{AgentProcess, ProcessEvent};
 
 use crate::install;
@@ -264,11 +264,7 @@ impl CodexProcess {
     }
 
     /// Send a response to an interactive question using its original request ID.
-    pub fn respond_to_questions(
-        &self,
-        request_id: &str,
-        answers: &BTreeMap<String, String>,
-    ) -> Result<()> {
+    pub fn respond_to_questions(&self, request_id: &str, answers: &Answers) -> Result<()> {
         self.respond(request_id, crate::questions::response(answers))
     }
 
@@ -307,6 +303,10 @@ impl AgentProcess for CodexProcess {
             id: request_id_value(&request.request_id),
             result,
         })
+    }
+
+    fn answer_questions(&self, request: &UserInputRequest, answers: &Answers) -> Result<()> {
+        self.respond_to_questions(&request.request_id, answers)
     }
 
     fn reject(&self, request_id: &str, error: &str) -> Result<()> {

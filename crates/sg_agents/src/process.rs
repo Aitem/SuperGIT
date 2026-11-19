@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::chat::{Decision, PermissionRequest};
+use crate::chat::{Answers, Decision, PermissionRequest, UserInputRequest};
 
 /// One event from an agent process, read on a background thread.
 #[derive(Debug)]
@@ -24,6 +24,16 @@ pub trait AgentProcess: Send + Sync {
     fn interrupt(&self) -> anyhow::Result<()>;
     /// Answer a permission prompt the adapter put in the conversation.
     fn answer(&self, request: &PermissionRequest, decision: Decision) -> anyhow::Result<()>;
+    /// Send the answers to a question form the adapter put in the
+    /// conversation.
+    fn answer_questions(&self, request: &UserInputRequest, answers: &Answers)
+    -> anyhow::Result<()>;
+    /// Tell the agent the user will not answer. Agents that cannot hear
+    /// "no" to a question (Codex) refuse; stop the turn instead.
+    fn decline_questions(&self, request: &UserInputRequest) -> anyhow::Result<()> {
+        let _ = request;
+        anyhow::bail!("This agent's questions can't be declined; stop the turn instead")
+    }
     /// Refuse a request the host does not support, so the agent does not
     /// wait forever.
     fn reject(&self, request_id: &str, error: &str) -> anyhow::Result<()>;
