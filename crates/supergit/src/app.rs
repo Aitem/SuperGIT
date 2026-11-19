@@ -2615,7 +2615,7 @@ impl SuperGitApp {
 
     // ---- rendering -------------------------------------------------------
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let menu_bar = crate::menu_bar(cx);
         let indicators = projects::ATTENTION_ORDER.into_iter().filter_map(|kind| {
             let count = self.attention_count(kind, cx);
@@ -2645,79 +2645,84 @@ impl SuperGitApp {
             })
         });
         let theme = cx.theme();
-        TitleBar::new().child(
-            h_flex()
-                .w_full()
-                .pr_2()
-                .justify_between()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .when_some(menu_bar, |el, bar| el.child(div().h_full().child(bar)))
-                        .child(div().font_weight(FontWeight::BOLD).child("SuperGIT"))
-                        .when_some(self.repo.as_ref().map(Repo::name), |el, name| {
-                            el.child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("· {name}")),
-                            )
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .text_xs()
-                        .child(
-                            Button::new("open-switcher")
-                                .label("Switch…")
-                                .small()
-                                .ghost()
-                                .tooltip(format!(
-                                    "Switch worktree, conversation or project ({MOD}-p)"
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_switcher(&OpenSwitcher, window, cx)
-                                })),
-                        )
-                        .children(indicators)
-                        .child(
-                            Button::new("open-repo")
-                                .label("Open…")
-                                .ghost()
-                                .small()
-                                .tooltip(format!("Open a repository as a project ({MOD}-o)"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_repository(&OpenRepository, window, cx)
-                                })),
-                        )
-                        .when(self.repo.is_some(), |el| {
-                            el.child(
-                                Button::new("clone-repo")
-                                    .label("Clone…")
-                                    .ghost()
+        TitleBar::new()
+            // The bar keeps 80px on the left for the window buttons, which a
+            // full-screen window does not show: start at the edge there (the
+            // bar's own 12px inset remains).
+            .when(window.is_fullscreen(), |bar| bar.pl(px(0.)))
+            .child(
+                h_flex()
+                    .w_full()
+                    .pr_2()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .when_some(menu_bar, |el, bar| el.child(div().h_full().child(bar)))
+                            .child(div().font_weight(FontWeight::BOLD).child("SuperGIT"))
+                            .when_some(self.repo.as_ref().map(Repo::name), |el, name| {
+                                el.child(
+                                    div()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("· {name}")),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .text_xs()
+                            .child(
+                                Button::new("open-switcher")
+                                    .label("Switch…")
                                     .small()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_clone_form(window, cx)
-                                    })),
-                            )
-                        })
-                        .when(self.repo.is_some(), |el| {
-                            el.child(
-                                Button::new("close-repo")
-                                    .label("Recent")
                                     .ghost()
-                                    .small()
                                     .tooltip(format!(
-                                        "Switch to a recent repository ({MOD}-shift-o)"
+                                        "Switch worktree, conversation or project ({MOD}-p)"
                                     ))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_repository(&CloseRepository, window, cx)
+                                        this.open_switcher(&OpenSwitcher, window, cx)
                                     })),
                             )
-                        })
-                        .child({
-                            let current = crate::appearance::current(cx);
-                            Button::new("appearance")
+                            .children(indicators)
+                            .child(
+                                Button::new("open-repo")
+                                    .label("Open…")
+                                    .ghost()
+                                    .small()
+                                    .tooltip(format!("Open a repository as a project ({MOD}-o)"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_repository(&OpenRepository, window, cx)
+                                    })),
+                            )
+                            .when(self.repo.is_some(), |el| {
+                                el.child(
+                                    Button::new("clone-repo")
+                                        .label("Clone…")
+                                        .ghost()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_clone_form(window, cx)
+                                        })),
+                                )
+                            })
+                            .when(self.repo.is_some(), |el| {
+                                el.child(
+                                    Button::new("close-repo")
+                                        .label("Recent")
+                                        .ghost()
+                                        .small()
+                                        .tooltip(format!(
+                                            "Switch to a recent repository ({MOD}-shift-o)"
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_repository(&CloseRepository, window, cx)
+                                        })),
+                                )
+                            })
+                            .child({
+                                let current = crate::appearance::current(cx);
+                                Button::new("appearance")
                                 .label(format!(
                                     "{} {}",
                                     match current {
@@ -2736,19 +2741,19 @@ impl SuperGitApp {
                                     crate::appearance::set(current.next(), cx);
                                     cx.notify();
                                 }))
-                        })
-                        .child(
-                            Button::new("refresh")
-                                .label("Refresh")
-                                .ghost()
-                                .small()
-                                .tooltip(format!("Refresh now ({MOD}-r)"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.refresh(&Refresh, window, cx)
-                                })),
-                        ),
-                ),
-        )
+                            })
+                            .child(
+                                Button::new("refresh")
+                                    .label("Refresh")
+                                    .ghost()
+                                    .small()
+                                    .tooltip(format!("Refresh now ({MOD}-r)"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.refresh(&Refresh, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -5217,7 +5222,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::ask_agent_new))
             .on_action(cx.listener(Self::toggle_keep_worktree))
             .on_action(cx.listener(Self::clean_up_worktree))
-            .child(self.render_title_bar(cx))
+            .child(self.render_title_bar(window, cx))
             .child(self.render_body(window, cx))
             .child(self.render_status_bar(cx))
             .when(self.cherry_pick.is_some(), |el| {
