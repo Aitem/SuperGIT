@@ -190,3 +190,110 @@ fn synchronized_output_holds_the_frame() {
     term.end_render_hold();
     assert!(!term.render_held());
 }
+
+/// Cells of 10×20 px after 6 px of padding, as the view lays them out.
+const SURFACE: sg_terminal::term::Surface = sg_terminal::term::Surface {
+    padding: 6.,
+    cell_width: 10.,
+    cell_height: 20.,
+    height: 6. + 20. * 6.,
+};
+
+/// A point in a cell, in view pixels: `at` near its left edge (where a
+/// press starts a selection), `past` beyond its middle (where a drag takes
+/// the cell in, as with native text).
+fn at(col: u16, row: u16) -> (f32, f32) {
+    point(col, row, 0.2)
+}
+
+fn past(col: u16, row: u16) -> (f32, f32) {
+    point(col, row, 0.8)
+}
+
+fn point(col: u16, row: u16, x: f32) -> (f32, f32) {
+    (
+        SURFACE.padding + (f32::from(col) + x) * SURFACE.cell_width,
+        SURFACE.padding + (f32::from(row) + 0.5) * SURFACE.cell_height,
+    )
+}
+
+#[test]
+fn dragging_selects_and_copies_text() {
+    let mut term = Terminal::new(SIZE, &Colors::default()).unwrap();
+    term.feed(b"hello world\r\nsecond line");
+    assert_eq!(term.selection_text().unwrap(), None);
+    let (x, y) = at(0, 0);
+    term.select_press(x, y, &SURFACE).unwrap();
+    let (x, y) = past(4, 0);
+    assert_eq!(term.select_drag(x, y, false, &SURFACE).unwrap(), None);
+    term.select_release(x, y, &SURFACE).unwrap();
+    assert_eq!(term.selection_text().unwrap().as_deref(), Some("hello"));
+    // The screen marks the selected cells.
+    let screen = term.screen().unwrap();
+    let selected: String = screen.lines[0]
+        .iter()
+        .filter(|run| run.selected)
+        .map(|run| run.text.as_str())
+        .collect();
+    assert_eq!(selected, "hello");
+    // Across lines.
+    let (x, y) = at(6, 0);
+    term.select_press(x, y, &SURFACE).unwrap();
+    let (x, y) = past(5, 1);
+    term.select_drag(x, y, false, &SURFACE).unwrap();
+    assert_eq!(
+        term.selection_text().unwrap().as_deref(),
+        Some("world\nsecond")
+    );
+    term.clear_selection();
+    assert!(!term.has_selection());
+}
+
+#[test]
+fn double_click_selects_a_word_and_triple_click_the_line() {
+    let mut term = Terminal::new(SIZE, &Colors::default()).unwrap();
+    term.feed(b"hello world");
+    let (x, y) = at(7, 0);
+    term.select_press(x, y, &SURFACE).unwrap();
+    term.select_release(x, y, &SURFACE).unwrap();
+    term.select_press(x, y, &SURFACE).unwrap();
+    assert_eq!(term.selection_text().unwrap().as_deref(), Some("world"));
+    term.select_release(x, y, &SURFACE).unwrap();
+    term.select_press(x, y, &SURFACE).unwrap();
+    assert_eq!(
+        term.selection_text().unwrap().as_deref(),
+        Some("hello world")
+    );
+}
+
+#[test]
+fn select_all_and_dragging_past_the_edge() {
+    let mut term = Terminal::new(SIZE, &Colors::default()).unwrap();
+    term.feed(b"one\r\ntwo");
+    term.select_all().unwrap();
+    let all = term.selection_text().unwrap().unwrap();
+    assert!(all.contains("one") && all.contains("two"), "{all:?}");
+    // Below the view: asks to scroll down.
+    let (x, _) = at(1, 0);
+    term.select_press(x, at(0, 0).1, &SURFACE).unwrap();
+    let below = SURFACE.height + 30.;
+    assert_eq!(
+        term.select_drag(x, below, false, &SURFACE).unwrap(),
+        Some(sg_terminal::term::SelectScroll::Down)
+    );
+}
+
+#[test]
+fn the_selection_stays_on_its_text_as_output_scrolls() {
+    let mut term = Terminal::new(SIZE, &Colors::default()).unwrap();
+    term.feed(b"keep me\r\n");
+    let (x, y) = at(0, 0);
+    term.select_press(x, y, &SURFACE).unwrap();
+    let (x, y) = past(3, 0);
+    term.select_drag(x, y, false, &SURFACE).unwrap();
+    // Ten more lines push "keep me" into the scrollback.
+    for n in 0..10 {
+        term.feed(format!("line {n}\r\n").as_bytes());
+    }
+    assert_eq!(term.selection_text().unwrap().as_deref(), Some("keep"));
+}

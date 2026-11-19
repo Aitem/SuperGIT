@@ -123,13 +123,19 @@ Design notes: docs/EMBEDDED_TERMINAL.md.
   TUI has drawn and gone quiet.
 - Keys: GPUI runs bindings before key listeners, so the `Terminal` key
   context binds `NoAction` to Tab/Shift-Tab (and on Linux the app's `ctrl-`
-  shortcuts) to release them to the program; `cmd-c`/`cmd-v`
-  (`ctrl-shift-c/v`) are `terminal::Copy`/`Paste`. Keys are encoded by
-  libghostty (Kitty keyboard protocol: Shift+Enter is `ESC[13;2u`).
+  shortcuts) to release them to the program; `cmd-c`/`cmd-v`/`cmd-a`
+  (`ctrl-shift-c/v/a`) are `terminal::Copy`/`Paste`/`SelectAll`. Keys are
+  encoded by libghostty (Kitty keyboard protocol: Shift+Enter is `ESC[13;2u`).
+- Selection: libghostty's gesture state machine (click, double click word,
+  triple click line, Option-drag block, autoscroll past the edges) and its
+  formatter for copying (plain, soft wraps joined, trimmed). Drag and release
+  listen on the whole window (registered in the canvas paint); typing drops
+  the selection.
 - Tests: `cargo test -p sg_terminal` (emulation, keys, a real PTY child).
   UI check: write `{"agent_view":"terminal"}` to
   `$SUPERGIT_STATE_DIR/settings.json`, then `SUPERGIT_DEBUG_CHAT=new` (or
-  `resume`, `prompt:…`) in a screenshot build.
+  `resume`, `prompt:…`) in a screenshot build; `SUPERGIT_DEBUG_TERMINAL=select`
+  also drags a selection over the first rows once the TUI is ready.
 
 ## Native Codex (sg_codex)
 
