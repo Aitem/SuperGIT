@@ -12,10 +12,11 @@ anyhow.workspace = true
 futures.workspace = true
 # Ghostty's VT parser, screen state, scrollback and key/mouse/paste encoders
 # (libghostty-vt 1.0.1, stable C ABI). The Rust bindings come from git: the
-# crates.io release still pins a pre-1.0 Ghostty that needs Zig 0.15. Built
-# from source with Zig 0.17.x: `scripts/fetch-ghostty.sh` puts the sources
-# (the commit these bindings pin) where `.cargo/config.toml` points
-# GHOSTTY_SOURCE_DIR. No Kitty graphics: the panel does not draw images.
+# crates.io release still pins a pre-1.0 Ghostty that needs Zig 0.15. The C
+# library builds with Zig 0.17.x from the release that ghostty/build.zig.zon
+# pins (the one these bindings pin: bump both together); `.cargo/config.toml`
+# points GHOSTTY_SOURCE_DIR at that Zig project. No Kitty graphics: the panel
+# does not draw images.
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", default-features = false }
 # PTY: open, size, controlling terminal (already in the tree via GPUI).
 rustix = { version = "1", features = ["pty", "termios", "process", "fs", "stdio"] }

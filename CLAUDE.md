@@ -94,12 +94,18 @@ Same protocol as the Agent SDKs and the VS Code extension:
 `Settings::agent_view` (`Chat | Terminal` in the panel header and Settings)
 decides whether New / Resume open SuperGIT's chat or the agent's own TUI.
 Design notes: docs/EMBEDDED_TERMINAL.md.
-- Build: libghostty-vt comes from Uzaaft/libghostty-rs at a pinned git rev
-  (crates.io still pins a pre-1.0 Ghostty that needs Zig 0.15). It builds
-  Ghostty with **Zig 0.17.x** from `vendor/ghostty`, which
-  `scripts/fetch-ghostty.sh` downloads (gitignored; the commit must match
-  the bindings' `GHOSTTY_COMMIT`). `.cargo/config.toml` sets
-  `GHOSTTY_SOURCE_DIR` and `LIBGHOSTTY_VT_SYS_OPTIMIZE`.
+- Build: needs **Zig 0.17.x** on PATH, nothing else. libghostty-vt's Rust
+  bindings come from Uzaaft/libghostty-rs at a pinned git rev (crates.io
+  still pins a pre-1.0 Ghostty that needs Zig 0.15). `.cargo/config.toml`
+  points `GHOSTTY_SOURCE_DIR` at `crates/sg_terminal/ghostty`, a tiny Zig
+  project: its `build.zig.zon` pins the signed libghostty-vt release (Zig
+  fetches it once into its global cache, shared by every worktree), and its
+  `build.zig` runs Ghostty's own `zig build -Demit-lib-vt` in the fetched
+  package (only that build merges the SIMD archives into one
+  `libghostty-vt.a`). Bump the release and the bindings' rev together (their
+  build.rs `GHOSTTY_COMMIT` is the `vt-X.Y.Z` tag); new hash: `zig fetch
+  <url>`. Cargo does not watch those files: after editing them, `cargo clean
+  -p libghostty-vt-sys`.
 - libghostty handles are `!Send`: the `Terminal` lives on the main thread,
   the PTY reader thread only moves bytes; one repaint per batch, and the last
   frame stays up while a program holds output (mode 2026, 1 s timeout).
@@ -198,7 +204,6 @@ cargo test --workspace              # unit + integration tests (temp git repos)
 cargo lint && cargo fmt --all        # lint = CI's clippy (.cargo/config.toml)
 cargo run -- --dump $SUPERGIT_TEST_REPO  # data layer as text, no window
 cargo run -- $SUPERGIT_TEST_REPO         # the app
-scripts/fetch-ghostty.sh            # once: Ghostty sources for libghostty-vt (needs Zig 0.17)
 scripts/bundle-macos.sh --install   # SuperGIT.app → /Applications (ad-hoc signed)
 scripts/install-linux.sh            # Linux: ~/.local/bin + .desktop launcher + icon
 scripts/make-icon.sh                # regenerate assets/AppIcon.icns (Swift/AppKit)
@@ -300,7 +305,9 @@ never commit, push or create worktrees there without asking.
 ## Conventions and gotchas
 
 - **Toolchain**: rustup only (`rust-toolchain.toml` pins 1.100). Homebrew Rust
-  was removed because it shadowed rustup.
+  was removed because it shadowed rustup. `mise.toml` pins the same Rust and
+  Zig 0.17.1 (libghostty-vt) for mise users; bump the three places together
+  (`rust-toolchain.toml`, `mise.toml`, CI's setup-zig).
 - **GPUI version**: `gpui-kit 0.9.1` pins `gpui-pre 0.3.12`. Import GPUI through
   `gpui_kit::*` plus `gpui_kit::prelude::*` (for `when`/`when_some`);
   components via `gpui_kit::component::…`. Do not enable `gpui-kit/test-support`
