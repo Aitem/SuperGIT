@@ -149,6 +149,8 @@ pub struct ChatSession {
     open_runs: HashSet<usize>,
     stderr_tail: Vec<String>,
     reader: Option<Task<()>>,
+    /// Reading a Claude transcript for the history.
+    transcript_load: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -177,20 +179,16 @@ impl ChatSession {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut convo = match session.provider {
-            Provider::Claude => sg_claude::from_transcript(&session.transcript).unwrap_or_default(),
-            Provider::Codex => Conversation::new(),
-        };
+        let mut convo = Conversation::new();
         convo.session_id = Some(session.id.clone());
-        if convo.title.is_none() {
-            convo.title = Some(session.title.clone());
-        }
+        convo.title = Some(session.title.clone());
         let cwd = session
             .start_cwd
             .clone()
             .unwrap_or_else(|| worktree.clone());
         let mut chat = Self::build(worktree, cwd, session.provider, convo, window, cx);
         chat.transcript = Some(session.transcript.clone());
+        chat.load_transcript(cx);
         chat.load_history(cx);
         chat
     }
@@ -204,19 +202,13 @@ impl ChatSession {
     ) -> Self {
         let provider = Provider::parse(&saved.provider).unwrap_or_default();
         let transcript_exists = saved.transcript.as_ref().is_some_and(|p| p.is_file());
-        let mut convo = match provider {
-            Provider::Claude => saved
-                .transcript
-                .as_ref()
-                .and_then(|path| sg_claude::from_transcript(path).ok())
-                .unwrap_or_default(),
-            Provider::Codex => Conversation::new(),
-        };
+        let mut convo = Conversation::new();
         // Codex keeps threads it has not written a rollout for yet.
         if transcript_exists || (provider == Provider::Codex && saved.transcript.is_none()) {
             convo.session_id = saved.session_id.clone();
         }
-        if convo.title.is_none() && !saved.title.is_empty() && saved.title != "New conversation" {
+        // The transcript's own title replaces it once read.
+        if !saved.title.is_empty() && saved.title != "New conversation" {
             convo.title = Some(saved.title.clone());
         }
         let cwd = if saved.cwd.is_dir() {
@@ -254,6 +246,7 @@ impl ChatSession {
         chat.input.update(cx, |input, cx| {
             input.set_value(saved.draft.clone(), window, cx)
         });
+        chat.load_transcript(cx);
         chat.load_history(cx);
         chat
     }
@@ -344,6 +337,7 @@ impl ChatSession {
             open_runs: HashSet::new(),
             stderr_tail: Vec::new(),
             reader: None,
+            transcript_load: None,
             _subscriptions: vec![sub],
         }
     }
@@ -550,7 +544,66 @@ impl ChatSession {
     }
 
     fn history_loading(&self) -> bool {
-        matches!(self.backend, Backend::Codex { loading: true, .. })
+        self.transcript_load.is_some()
+            || matches!(self.backend, Backend::Codex { loading: true, .. })
+    }
+
+    /// Read a Claude session's history off the main thread: long sessions
+    /// have transcripts of tens of megabytes.
+    fn load_transcript(&mut self, cx: &mut Context<Self>) {
+        if self.provider() != Provider::Claude {
+            return;
+        }
+        let Some(path) = self.transcript.clone() else {
+            return;
+        };
+        // A thread of its own, as for Codex history: the shared background
+        // pool may be busy with slow Git and GitHub calls.
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(sg_claude::from_transcript(&path));
+        });
+        self.transcript_load = Some(cx.spawn(async move |this, cx| {
+            let result = rx
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the transcript reader stopped")));
+            let _ = this.update(cx, |this, cx| this.on_transcript(result, cx));
+        }));
+    }
+
+    fn on_transcript(&mut self, result: anyhow::Result<Conversation>, cx: &mut Context<Self>) {
+        self.transcript_load = None;
+        match result {
+            Ok(mut loaded) => {
+                // The chat decided which session it continues.
+                loaded.session_id = self.convo.session_id.take();
+                if loaded.title.is_none() {
+                    loaded.title = self.convo.title.take();
+                }
+                // Notices shown meanwhile follow the history.
+                loaded.items.append(&mut self.convo.items);
+                if let Backend::Claude {
+                    process: None,
+                    mode,
+                    ..
+                } = &mut self.backend
+                    && let Some(saved) = loaded
+                        .permission_mode
+                        .as_deref()
+                        .and_then(PermissionMode::from_wire)
+                {
+                    *mode = saved;
+                }
+                self.convo = loaded;
+            }
+            Err(e) => self.convo.push_notice(
+                format!("Couldn't read the conversation history: {e:#}"),
+                true,
+            ),
+        }
+        let count = self.convo.items.len();
+        self.scroller.update(cx, |s, cx| s.reset(count, cx));
+        cx.notify();
     }
 
     // ---- process ---------------------------------------------------------
