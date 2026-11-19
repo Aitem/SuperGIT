@@ -7,7 +7,9 @@ use std::time::SystemTime;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::{Repo, Worktree, WorktreeStatus, git, list_worktrees, remove_worktree, status};
+use crate::{
+    Repo, Worktree, WorktreeStatus, git, git_bytes, list_worktrees, remove_worktree, status,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileIdentity {
@@ -436,12 +438,88 @@ pub fn delete_cleanup_branch(pending: &BranchDeletion, policy: &CleanupPolicy) -
     Ok(())
 }
 
+/// Initialized submodule checkouts under `dir`, nested ones included.
+fn submodule_checkouts(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let listed = git_bytes(dir, ["ls-files", "-z", "--stage"])?;
+    for entry in String::from_utf8_lossy(&listed).split('\0') {
+        // `<mode> <object> <stage>\t<path>`; gitlinks have mode 160000.
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let checkout = dir.join(path);
+        if meta.starts_with("160000 ")
+            && checkout.join(".git").exists()
+            && !found.contains(&checkout)
+        {
+            found.extend(submodule_checkouts(&checkout)?);
+            found.push(checkout);
+        }
+    }
+    Ok(found)
+}
+
+/// What removing these submodule checkouts would lose. A linked worktree's
+/// submodule repositories live in its admin directory
+/// (`.git/worktrees/<name>/modules`) and go with it, so anything only they
+/// hold — uncommitted work, commits no remote has, stashes — would be gone.
+fn submodule_losses(worktree: &Path, checkouts: &[PathBuf]) -> Result<Vec<String>> {
+    let mut losses = Vec::new();
+    for checkout in checkouts {
+        let name = checkout
+            .strip_prefix(worktree)
+            .unwrap_or(checkout)
+            .display()
+            .to_string();
+        let changes = git(checkout, ["status", "--porcelain", "--untracked-files=all"])?;
+        if !changes.trim().is_empty() {
+            losses.push(format!("{name} has uncommitted changes"));
+        }
+        let local = git(
+            checkout,
+            [
+                "rev-list",
+                "--count",
+                "HEAD",
+                "--branches",
+                "--not",
+                "--remotes",
+            ],
+        )?;
+        match local.trim() {
+            "0" => {}
+            "1" => losses.push(format!("{name} has 1 commit that no remote has")),
+            n => losses.push(format!("{name} has {n} commits that no remote has")),
+        }
+        if !git(checkout, ["stash", "list"])?.trim().is_empty() {
+            losses.push(format!("{name} has stashed changes"));
+        }
+    }
+    Ok(losses)
+}
+
 pub fn cleanup_worktree(plan: &CleanupPlan, policy: &CleanupPolicy) -> Result<CleanupOutcome> {
     let pending = validate_plan(plan, policy)?;
     if policy.automatic {
         safe_deletion_base(&pending, policy, Some(&plan.path))?;
     }
-    remove_worktree(&plan.root, &plan.path, false)?;
+    // Git removes a worktree with initialized submodules only with --force,
+    // which also skips its own last check for local changes: do both checks
+    // here, right before removing.
+    let submodules = submodule_checkouts(&plan.path)?;
+    if !submodules.is_empty() {
+        let losses = submodule_losses(&plan.path, &submodules)?;
+        ensure!(
+            losses.is_empty(),
+            "Submodules hold work that would be lost ({}); worktree and branch were preserved",
+            losses.join("; ")
+        );
+        ensure!(
+            status(&plan.path)?.is_clean(),
+            "Local changes were found; worktree and branch were preserved"
+        );
+    }
+    remove_worktree(&plan.root, &plan.path, !submodules.is_empty())?;
     match delete_cleanup_branch(&pending, policy) {
         Ok(()) => Ok(CleanupOutcome::Complete),
         Err(error) => Ok(CleanupOutcome::BranchPreserved {
