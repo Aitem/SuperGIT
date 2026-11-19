@@ -220,3 +220,98 @@ fn ref_transaction_hooks_can_refuse_deletion_without_losing_the_branch() {
     sg_git::delete_cleanup_branch(&pending, &CleanupPolicy::default()).unwrap();
     assert!(!fixture.branch_exists());
 }
+
+/// Like [`Fixture::new`], but `main` records a submodule `vendor/lib`
+/// (cloned from a local repository) and the task worktree has it checked
+/// out — Git then removes the worktree only with `--force`.
+fn with_submodule() -> Fixture {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    let lib = temp.path().join("lib");
+    let this = Fixture {
+        task: temp.path().join("task"),
+        root,
+        _temp: temp,
+    };
+    for dir in [&this.root, &lib] {
+        std::fs::create_dir(dir).unwrap();
+        this.git(dir, &["init", "-q", "-b", "main"]);
+        this.git(dir, &["config", "user.name", "Tester"]);
+        this.git(dir, &["config", "user.email", "test@example.com"]);
+        this.git(dir, &["config", "commit.gpgsign", "false"]);
+        this.git(dir, &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(dir.join("file.txt"), "base\n").unwrap();
+        this.git(dir, &["add", "."]);
+        this.git(dir, &["commit", "-qm", "base"]);
+    }
+    let file = ["-c", "protocol.file.allow=always"];
+    let add = [
+        &file[..],
+        &[
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    ];
+    this.git(&this.root, &add.concat());
+    this.git(&this.root, &["commit", "-qm", "add lib"]);
+    sg_git::add_worktree(&this.root, &this.task, Some("task"), None).unwrap();
+    this.git(
+        &this.task,
+        &[&file[..], &["submodule", "update", "--init", "-q"]].concat(),
+    );
+    for (key, value) in [("user.name", "Tester"), ("user.email", "test@example.com")] {
+        this.git(&this.task.join("vendor/lib"), &["config", key, value]);
+    }
+    this
+}
+
+#[test]
+fn a_clean_worktree_with_submodules_is_removed() {
+    let fixture = with_submodule();
+    assert!(fixture.task.join("vendor/lib/file.txt").exists());
+    // Plain `git worktree remove` refuses it.
+    assert!(sg_git::remove_worktree(&fixture.root, &fixture.task, false).is_err());
+
+    let outcome = sg_git::cleanup_worktree(&fixture.plan(), &CleanupPolicy::default()).unwrap();
+
+    assert!(matches!(outcome, CleanupOutcome::Complete));
+    assert!(!fixture.task.exists());
+    assert!(!fixture.branch_exists());
+}
+
+#[test]
+fn submodule_work_no_remote_has_keeps_the_worktree() {
+    let fixture = with_submodule();
+    let lib = fixture.task.join("vendor/lib");
+    // A commit on a local branch, then back to the recorded commit: the
+    // superproject looks clean, but the commit lives only in this checkout.
+    fixture.git(&lib, &["switch", "-q", "-c", "experiment"]);
+    std::fs::write(lib.join("file.txt"), "experiment\n").unwrap();
+    fixture.git(&lib, &["commit", "-qam", "experiment"]);
+    fixture.git(&lib, &["checkout", "-q", "--detach", "HEAD~1"]);
+    assert!(sg_git::status(&fixture.task).unwrap().is_clean());
+
+    let error = sg_git::cleanup_worktree(&fixture.plan(), &CleanupPolicy::default())
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("vendor/lib has 1 commit that no remote has"),
+        "{error}"
+    );
+    assert!(fixture.task.join("vendor/lib/file.txt").exists());
+    assert!(fixture.branch_exists());
+
+    // A stash is work too.
+    fixture.git(&lib, &["branch", "-q", "-D", "experiment"]);
+    std::fs::write(lib.join("file.txt"), "stashed\n").unwrap();
+    fixture.git(&lib, &["stash", "-q"]);
+    let error = sg_git::cleanup_worktree(&fixture.plan(), &CleanupPolicy::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("vendor/lib has stashed changes"), "{error}");
+    assert!(fixture.task.exists());
+}

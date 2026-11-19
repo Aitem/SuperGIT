@@ -270,4 +270,8 @@ never commit, push or create worktrees there without asking.
   those per list (`Details.submodules`, `commit_submodules`, PR patches) for
   the file-list rows, the cards under submodule headers and difftastic,
   which reads a submodule's files from its checkout. Tests:
-  `cargo test -p sg_git --test submodules`.
+  `cargo test -p sg_git --test submodules`. Cleanup: Git removes a worktree
+  with initialized submodules only with `--force`, which deletes their
+  repositories (`.git/worktrees/<name>/modules`); `cleanup_worktree` forces
+  only after checking every checkout (nested too) has no uncommitted
+  changes, no commits no remote has and no stash.
