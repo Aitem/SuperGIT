@@ -66,7 +66,7 @@ jobs:
           mkdir -p dist
           tar -C target/release -czf "dist/supergit-${PLATFORM}.tar.gz" supergit
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supergit-${{ matrix.platform }}
           path: dist/supergit-*
@@ -81,7 +81,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: supergit-*
           path: dist
