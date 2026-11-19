@@ -2953,10 +2953,8 @@ impl SuperGitApp {
                     .flex_none()
                     .child(
                         Button::new("claude-new")
-                            .label({
-                                let provider = default_provider();
-                                format!("{} New {}", provider.glyph(), provider.label())
-                            })
+                            .icon(crate::icons::agent_icon(default_provider()))
+                            .label(format!("New {}", default_provider().label()))
                             .small()
                             .primary()
                             .tooltip(format!("New conversation in this worktree ({MOD}-n); pick the agent before the first message"))
@@ -4484,8 +4482,14 @@ impl SuperGitApp {
                     .gap_2()
                     .text_xs()
                     .text_color(muted)
-                    .when(commit.by_agent, |el| {
-                        el.child(div().text_color(theme.blue).child("✦ with Claude"))
+                    .when_some(commit.agent, |el, agent| {
+                        let provider = crate::icons::commit_provider(agent);
+                        el.child(
+                            h_flex()
+                                .gap_1()
+                                .child(crate::icons::agent_icon(provider).xsmall())
+                                .child(format!("with {}", provider.label())),
+                        )
                     })
                     .child(
                         div()
@@ -4631,11 +4635,8 @@ impl SuperGitApp {
                         .gap_2()
                         .children(Provider::ALL.into_iter().map(|provider| {
                             Button::new(("agent-new-empty", provider as usize))
-                                .label(format!(
-                                    "{} Start {} here",
-                                    provider.glyph(),
-                                    provider.label()
-                                ))
+                                .icon(crate::icons::agent_icon(provider))
+                                .label(format!("Start {} here", provider.label()))
                                 .when(provider == default_provider(), |b| b.primary())
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.new_chat_with(provider, window, cx)
@@ -4743,7 +4744,7 @@ impl SuperGitApp {
     }
 
     /// The collapsed agent panel: a button to expand it, one glyph per
-    /// conversation of the selected worktree (✦ Claude, ◆ Codex) colored by
+    /// conversation of the selected worktree (the agent's mark) colored by
     /// its state (title in the tooltip; clicking opens it), and a
     /// new-conversation button.
     fn render_chat_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -4755,7 +4756,7 @@ impl SuperGitApp {
         let cells = chats.iter().enumerate().map(|(ix, chat)| {
             let c = chat.read(cx);
             let kind = c.attention().kind;
-            let glyph = c.provider().glyph();
+            let provider = c.provider();
             let tooltip = if kind == Kind::Idle {
                 format!("{} · {}", c.provider().label(), c.title())
             } else {
@@ -4782,11 +4783,11 @@ impl SuperGitApp {
                 .hover(|el| el.bg(theme.list_hover))
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                 .on_click(cx.listener(move |this, _, window, cx| this.open_chat_at(ix, window, cx)))
+                // The agent's mark in its conversation's state color.
                 .child(
-                    div()
-                        .text_sm()
-                        .text_color(attention_color(kind, &theme))
-                        .child(glyph),
+                    crate::icons::agent_mark(provider)
+                        .small()
+                        .text_color(attention_color(kind, &theme)),
                 )
         });
         v_flex()
@@ -4854,11 +4855,8 @@ impl SuperGitApp {
         }
         let tabs = chats.iter().enumerate().map(|(ix, chat)| {
             let c = chat.read(cx);
-            let title = format!(
-                "{} {}",
-                c.provider().glyph(),
-                c.title().chars().take(22).collect::<String>()
-            );
+            let title = c.title().chars().take(22).collect::<String>();
+            let provider = c.provider();
             let dot = match c.status() {
                 sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
                     Some(theme.blue)
@@ -4888,6 +4886,7 @@ impl SuperGitApp {
                 .when_some(dot, |el, color| {
                     el.child(div().size(px(6.)).rounded_full().bg(color))
                 })
+                .child(crate::icons::agent_icon(provider).xsmall())
                 .child(title)
                 .when(c.attention().unread || c.attention().kind.is_live(), |el| {
                     el.child(div().text_xs().child(c.attention().kind.label()))
@@ -4922,22 +4921,19 @@ impl SuperGitApp {
                     .gap_1()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(
-                        div()
+                    .child({
+                        let provider = chats.get(active).map(|chat| chat.read(cx).provider());
+                        h_flex()
                             .flex_none()
+                            .gap_1p5()
                             .px_1()
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
-                            .child(
-                                chats
-                                    .get(active)
-                                    .map(|chat| {
-                                        let provider = chat.read(cx).provider();
-                                        format!("{} {}", provider.glyph(), provider.label())
-                                    })
-                                    .unwrap_or_else(|| "Agents".into()),
-                            ),
-                    )
+                            .when_some(provider, |el, provider| {
+                                el.child(crate::icons::agent_icon(provider).small())
+                            })
+                            .child(provider.map_or("Agents", |provider| provider.label()))
+                    })
                     .child(
                         h_flex()
                             .id("chat-tabs")
@@ -5922,13 +5918,11 @@ fn commit_row(
             el.child(commit_graph(graph, lanes, c.is_merge(), theme))
         })
         .child(author_avatar(ix, c, avatar, theme))
-        .when(c.by_agent, |el| {
+        .when_some(c.agent, |el, agent| {
             el.child(
                 div()
                     .flex_none()
-                    .text_xs()
-                    .text_color(theme.blue)
-                    .child("✦"),
+                    .child(crate::icons::agent_icon(crate::icons::commit_provider(agent)).xsmall()),
             )
         })
         // Badges take up to `badge_room` and clip at the right; the subject
@@ -5979,7 +5973,12 @@ fn session_row(ix: usize, s: &Session, theme: &gpui_kit::component::Theme) -> St
                 .flex_none()
                 .text_xs()
                 .text_color(agent_color(s.state, theme))
-                .child(format!("{} {}", s.provider.glyph(), s.state.label())),
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(crate::icons::agent_icon(s.provider).xsmall())
+                        .child(s.state.label()),
+                ),
         )
         .child(
             v_flex()

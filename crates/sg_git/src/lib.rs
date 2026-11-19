@@ -50,8 +50,8 @@ pub use edit::{
     IndexEdit, IndexHunk, commit, edit_file, edit_hunk, fetch, index_hunks, pull, squash,
 };
 pub use log::{
-    Commit, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch, commit_details,
-    commit_patch, fork, history, history_refs, log,
+    Commit, CommitAgent, CommitDetails, Fork, ForkParent, RefKind, RefLabel, base_branch,
+    commit_details, commit_patch, fork, history, history_refs, log,
 };
 mod publish;
 

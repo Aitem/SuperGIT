@@ -250,7 +250,9 @@ never commit, push or create worktrees there without asking.
   fetch open + recent merged in parallel instead.
 - Never modify the user's `~/.claude` configuration (hooks etc.) without asking.
 - Commits by agents carry a `Co-Authored-By: Claude …` trailer — the History
-  view relies on it for the `✦` marker.
+  view relies on it to mark them (`sg_git::CommitAgent`; a Codex/OpenAI
+  co-author gets OpenAI's mark). Agents are drawn with their official marks
+  everywhere (`icons::agent_icon`, SVGs in `assets/agents`), never glyphs.
 - **Diffs**: gpui-kit's `Diff` with its `syntect` feature (syntax colors;
   `syntax::parse_patch` names languages its detector misses, e.g. Clojure).
   Unified/Split and "show with difftastic" live in `settings.json`

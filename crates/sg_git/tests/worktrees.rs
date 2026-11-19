@@ -114,8 +114,8 @@ fn worktree_lifecycle() {
     let log = sg_git::log(&wt_path, &["HEAD"], 10).unwrap();
     assert_eq!(log.len(), 2);
     assert_eq!(log[0].subject, "work");
-    assert!(log[0].by_agent);
-    assert!(!log[1].by_agent);
+    assert_eq!(log[0].agent, Some(sg_git::CommitAgent::Claude));
+    assert_eq!(log[1].agent, None);
     let commit_patch = sg_git::commit_patch(&wt_path, &log[0].sha).unwrap().text;
     assert!(commit_patch.contains("new.txt"));
 
@@ -503,7 +503,7 @@ fn commit_details_carry_the_full_message() {
     let details = sg_git::commit_details(&t.root(), &head.sha).unwrap();
     assert_eq!(details.commit, head);
     assert_eq!(details.commit.subject, "Add b");
-    assert!(details.commit.by_agent);
+    assert_eq!(details.commit.agent, Some(sg_git::CommitAgent::Claude));
     assert_eq!(
         details.body,
         "Why: the second file.\nSecond line.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"

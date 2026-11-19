@@ -174,7 +174,7 @@ mod tests {
                 name: "Ship/v1".into(),
                 current: false,
             }],
-            by_agent: false,
+            agent: None,
         };
         assert!(matches_commit(
             &commit,
