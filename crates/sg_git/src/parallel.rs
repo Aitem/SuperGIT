@@ -75,6 +75,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -97,20 +98,30 @@ mod tests {
         assert!(map(&[] as &[u8], |_| ()).is_empty());
     }
 
+    /// Mark `mine` started, then wait for `other` to start: true if it did.
+    /// Run one after the other, the first never sees the second (and gives
+    /// up after a while instead of hanging the test).
+    fn meet(mine: &AtomicBool, other: &AtomicBool) -> bool {
+        mine.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !other.load(Ordering::SeqCst) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
     #[test]
     fn join_returns_both_results() {
-        let started = Instant::now();
+        // Side by side: each half waits until the other has started. No
+        // wall-clock bound, so a slow CI runner cannot fail it.
+        let (a_started, b_started) = (AtomicBool::new(false), AtomicBool::new(false));
         let (a, b) = join(
-            || {
-                thread::sleep(Duration::from_millis(100));
-                "a"
-            },
-            || {
-                thread::sleep(Duration::from_millis(100));
-                2
-            },
+            || (meet(&a_started, &b_started), "a"),
+            || (meet(&b_started, &a_started), 2),
         );
-        assert_eq!((a, b), ("a", 2));
-        assert!(started.elapsed() < Duration::from_millis(190));
+        assert_eq!((a, b), ((true, "a"), (true, 2)));
     }
 }
