@@ -16,8 +16,8 @@ use serde_json::Value;
 pub struct ToolResult {
     pub text: String,
     pub is_error: bool,
-    /// The provider's structured result (Claude's `structuredPatch` for
-    /// edits, Codex's completed item, …).
+    /// What the UI reads of the provider's structured result (Claude's
+    /// `structuredPatch` for edits). Kept small: transcripts are long.
     pub meta: Option<Value>,
 }
 

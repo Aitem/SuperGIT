@@ -24,6 +24,13 @@ struct LoadedReview {
 pub(super) struct ReviewProgress {
     loaded: Option<LoadedReview>,
     load: Option<(Target, Task<()>)>,
+    /// Clicks not sent yet, one per path (the last one wins), in click order.
+    /// The loaded review already shows them.
+    queued: Vec<(String, bool)>,
+    /// What GitHub last confirmed for each path changed since: restored when
+    /// an update fails.
+    unconfirmed: HashMap<String, FileViewedState>,
+    /// The update in flight; clicks meanwhile wait in `queued`.
     mutation: Option<Task<()>>,
     mutation_error: Option<(Target, String)>,
     pub(super) hide_viewed: bool,
@@ -37,7 +44,12 @@ impl SuperGitApp {
         base: &str,
         cx: &mut Context<Self>,
     ) {
-        if pr.head_oid.is_empty() || base.is_empty() || self.pulls.file_review.mutation.is_some() {
+        // A refresh must not bring back states GitHub has not confirmed yet.
+        if pr.head_oid.is_empty()
+            || base.is_empty()
+            || self.pulls.file_review.mutation.is_some()
+            || !self.pulls.file_review.queued.is_empty()
+        {
             return;
         }
         let state = &mut self.pulls.file_review;
@@ -141,10 +153,6 @@ impl SuperGitApp {
                 .small()
                 .flex_none()
                 .checked(state == FileViewedState::Viewed)
-                .disabled(
-                    self.pulls.file_review.mutation.is_some()
-                        || self.pulls.file_review.load.is_some(),
-                )
                 .accessibility_label(format!("Viewed {path}"))
                 .tooltip(help)
                 .on_click(cx.listener(move |this, checked: &bool, _, cx| {
@@ -154,6 +162,9 @@ impl SuperGitApp {
         )
     }
 
+    /// Show the click right away and send it in the background: GitHub takes
+    /// two round trips (about a second) to confirm it. Clicks meanwhile are
+    /// queued and sent together once the update in flight is done.
     fn set_pr_file_viewed(
         &mut self,
         target: &Target,
@@ -161,62 +172,113 @@ impl SuperGitApp {
         viewed: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.pulls.file_review.mutation.is_some() || self.pulls.file_review.load.is_some() {
+        if self
+            .visible_review()
+            .is_none_or(|loaded| &loaded.target != target)
+        {
             return;
         }
-        let Some(loaded) = self
-            .visible_review()
-            .filter(|loaded| &loaded.target == target)
-        else {
-            return;
-        };
-        let Some(review) = loaded.result.as_ref().ok().cloned() else {
-            return;
-        };
-        let Some(root) = self.active_root().map(Path::to_path_buf) else {
-            return;
-        };
-        let target = target.clone();
-        let path = path.to_owned();
-        let request = (root.clone(), path.clone());
         let state = &mut self.pulls.file_review;
+        let Some(Ok(review)) = state.loaded.as_mut().map(|loaded| &mut loaded.result) else {
+            return;
+        };
+        let Some(current) = Arc::make_mut(review).files.get_mut(path) else {
+            return;
+        };
+        let wanted = if viewed {
+            FileViewedState::Viewed
+        } else {
+            FileViewedState::Unviewed
+        };
+        state.unconfirmed.entry(path.to_owned()).or_insert(*current);
+        *current = wanted;
+        state.queued.retain(|(queued, _)| queued != path);
+        state.queued.push((path.to_owned(), viewed));
         state.mutation_error = None;
+        // A refresh read before this click would undo it.
+        state.load = None;
+        self.send_viewed(cx);
+        cx.notify();
+    }
+
+    /// Send the queued clicks unless an update is in flight.
+    fn send_viewed(&mut self, cx: &mut Context<Self>) {
+        let root = self.active_root().map(Path::to_path_buf);
+        let state = &mut self.pulls.file_review;
+        if state.mutation.is_some() || state.queued.is_empty() {
+            return;
+        }
+        let review = state
+            .loaded
+            .as_ref()
+            .and_then(|loaded| Some((loaded.target.clone(), loaded.result.clone().ok()?)));
+        let (Some(root), Some((target, review))) = (root, review) else {
+            // The review was dropped ("Refresh viewed state"): nothing to apply to.
+            state.queued.clear();
+            state.unconfirmed.clear();
+            return;
+        };
+        let batch = std::mem::take(&mut state.queued);
         state.mutation = Some(cx.spawn(async move |this, cx| {
+            let request = (root.clone(), batch.clone());
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let (root, path) = request;
-                    sg_github::set_pr_file_viewed(&root, &review, &path, viewed)
+                    let (root, batch) = request;
+                    sg_github::set_pr_files_viewed(&root, &review, &batch)
                         .map_err(model::git_error_message)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                let state = &mut this.pulls.file_review;
-                if this.repo.as_ref().is_none_or(|repo| repo.root != root) {
-                    return;
+                if this.active_root() == Some(root.as_path()) {
+                    this.viewed_sent(target, &batch, result, cx);
                 }
-                state.mutation = None;
-                match result {
-                    Ok(()) => {
-                        if let Some(loaded) = state
-                            .loaded
-                            .as_mut()
-                            .filter(|loaded| loaded.target == target)
-                            && let Ok(review) = &mut loaded.result
-                        {
-                            let viewed_state = if viewed {
-                                FileViewedState::Viewed
-                            } else {
-                                FileViewedState::Unviewed
-                            };
-                            Arc::make_mut(review).files.insert(path, viewed_state);
-                        }
-                    }
-                    Err(error) => state.mutation_error = Some((target, error)),
-                }
-                cx.notify();
             });
         }));
+    }
+
+    fn viewed_sent(
+        &mut self,
+        target: Target,
+        batch: &[(String, bool)],
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let state = &mut self.pulls.file_review;
+        state.mutation = None;
+        match result {
+            Ok(()) => {
+                for (path, viewed) in batch {
+                    if state.queued.iter().any(|(queued, _)| queued == path) {
+                        // Clicked again meanwhile: GitHub now has this batch's state.
+                        let confirmed = if *viewed {
+                            FileViewedState::Viewed
+                        } else {
+                            FileViewedState::Unviewed
+                        };
+                        state.unconfirmed.insert(path.clone(), confirmed);
+                    } else {
+                        state.unconfirmed.remove(path);
+                    }
+                }
+                self.send_viewed(cx);
+            }
+            Err(error) => {
+                // GitHub may have applied part of it: show what it confirmed
+                // last, and offer a refresh with the error.
+                state.queued.clear();
+                let restore = std::mem::take(&mut state.unconfirmed);
+                if let Some(Ok(review)) = state
+                    .loaded
+                    .as_mut()
+                    .filter(|loaded| loaded.target == target)
+                    .map(|loaded| &mut loaded.result)
+                {
+                    Arc::make_mut(review).files.extend(restore);
+                }
+                state.mutation_error = Some((target, error));
+            }
+        }
         cx.notify();
     }
 

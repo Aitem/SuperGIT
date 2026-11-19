@@ -24,9 +24,11 @@ sg_github.workspace = true
 sg_agents.workspace = true
 sg_claude.workspace = true
 sg_codex.workspace = true
-# Syntax colors for the difftastic view; the same versions and features as
-# gpui-kit's `syntect` highlighter, so nothing extra is compiled.
-syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+# Syntax colors for the difftastic view; the same versions as gpui-kit's
+# `syntect` highlighter. `regex-onig` switches both to Oniguruma (syntect
+# prefers it over fancy-regex): fancy-regex builds automata per pattern,
+# ~30 MB for one language's patterns against ~1 MB.
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy", "regex-onig"] }
 two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
 # Only for the `screenshot` feature: turns on GPUI's `render_to_image`.
 gpui_platform_test_support = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"], optional = true }

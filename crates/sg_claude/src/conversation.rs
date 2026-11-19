@@ -202,7 +202,14 @@ fn on_user(c: &mut Conversation, v: &Value, live: bool) {
         }
         return;
     }
-    let meta = v.get("tool_use_result").or_else(|| v.get("toolUseResult"));
+    // The CLI's own result repeats the tool output and whole files (Read's
+    // `file.content`, Edit's `originalFile`); only edits' `structuredPatch`
+    // is shown, so keep just that: long sessions would hold megabytes.
+    let meta = v
+        .get("tool_use_result")
+        .or_else(|| v.get("toolUseResult"))
+        .and_then(|result| result.get("structuredPatch"))
+        .map(|patch| serde_json::json!({ "structuredPatch": patch }));
     for block in content.as_array().into_iter().flatten() {
         match block
             .get("type")
@@ -220,7 +227,7 @@ fn on_user(c: &mut Conversation, v: &Value, live: bool) {
                         .get("is_error")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                    meta: meta.filter(|m| m.is_object()).cloned(),
+                    meta: meta.clone(),
                 };
                 if let Some(t) = c.tool_mut(id) {
                     t.result = Some(result);
@@ -463,12 +470,18 @@ mod tests {
         feed(
             &mut c,
             &[
-                json!({"type":"user","parent_tool_use_id":null,"tool_use_result":{"type":"create"},"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"File created"}]}}),
+                json!({"type":"user","parent_tool_use_id":null,"tool_use_result":{"type":"create","content":"whole file","structuredPatch":[{"oldStart":0,"oldLines":0,"newStart":1,"newLines":1,"lines":["+hi"]}]},"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"File created"}]}}),
             ],
         );
         let t = c.tool("t1").unwrap();
         assert_eq!(t.result.as_ref().unwrap().text, "File created");
-        assert!(t.result.as_ref().unwrap().meta.is_some());
+        // Only the patch survives: the rest repeats files and output.
+        assert_eq!(
+            t.result.as_ref().unwrap().meta,
+            Some(
+                json!({"structuredPatch":[{"oldStart":0,"oldLines":0,"newStart":1,"newLines":1,"lines":["+hi"]}]})
+            )
+        );
     }
 
     #[test]

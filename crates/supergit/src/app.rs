@@ -18,7 +18,7 @@ mod clone_repository;
 use crate::MOD;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable as _, Selectable as _};
@@ -59,6 +59,9 @@ use crate::workspace::{self, RepositoryView, ReviewPosition, WindowRect};
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Network requests run independently so they cannot delay local refreshes.
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Worktrees whose review state (diffs, history) stays loaded besides the
+/// shown one: switching back to them is instant, others reload.
+const CACHED_REVIEWS: usize = 6;
 
 actions!(
     supergit,
@@ -157,7 +160,10 @@ enum ContextScope {
     File,
 }
 
+/// A worktree's review state while another worktree is shown. Each holds
+/// its patches parsed and highlighted, so only the most recent are kept.
 struct ReviewView {
+    cached_at: Instant,
     details: Details,
     history: History,
     selected_commit: Option<String>,
@@ -647,6 +653,7 @@ impl SuperGitApp {
             self.review_views.insert(
                 path.clone(),
                 ReviewView {
+                    cached_at: Instant::now(),
                     details: self.details.clone(),
                     history: self.history.clone(),
                     selected_commit: self.selected_commit.clone(),
@@ -658,6 +665,16 @@ impl SuperGitApp {
                     commit_difft: self.commit_difft.clone(),
                 },
             );
+            while self.review_views.len() > CACHED_REVIEWS {
+                let oldest = self
+                    .review_views
+                    .iter()
+                    .min_by_key(|(_, view)| view.cached_at)
+                    .map(|(path, _)| path.clone());
+                if let Some(oldest) = oldest {
+                    self.review_views.remove(&oldest);
+                }
+            }
         }
     }
 

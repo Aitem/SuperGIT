@@ -41,9 +41,7 @@ impl SuperGitApp {
         if &patch.head != rendered_head || details.base_oid != patch.base_oid {
             return None;
         }
-        let raw = patch.patch.value()?;
         let diff = self.pulls.diff.read(cx);
-        let mut chunks = HashMap::new();
         let threads: Vec<_> = details
             .threads
             .iter()
@@ -56,9 +54,7 @@ impl SuperGitApp {
                 {
                     return None;
                 }
-                let chunk = chunks
-                    .entry(thread.path.as_str())
-                    .or_insert_with(|| agent_context::file_patch(raw, &thread.path));
+                let chunk = patch.file_patch(&thread.path);
                 let note = SharedString::from(format!("inline-pr-thread-{}", thread.id));
                 let annotation = match thread_line(thread) {
                     Some((side, line))

@@ -110,7 +110,7 @@ impl SuperGitApp {
         if sg_git::submodule_of(&patch.submodules, path).is_some_and(|module| module.path != path) {
             return None;
         }
-        let file = agent_context::file_patch(patch.patch.value()?, path)?;
+        let file = patch.file_patch(path)?;
         let hunk =
             agent_context::hunk_patch(file, range.side() == DiffSide::Original, range.start())?;
         let (side, line, content) = github_line(&hunk, range.side(), range.start())?;

@@ -87,7 +87,7 @@ where
 }
 
 pub use details::ReviewSide;
-pub use file_review::{FileReview, FileViewedState, pr_file_review, set_pr_file_viewed};
+pub use file_review::{FileReview, FileViewedState, pr_file_review, set_pr_files_viewed};
 pub use line_comment::{ReviewLine, post_review_line};
 
 pub use details::review_actions::{
