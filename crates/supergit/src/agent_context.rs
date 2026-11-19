@@ -2,6 +2,8 @@
 
 use gpui_kit::component::diff::DiffFile;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 
 pub const MAX_ATTACHMENTS: usize = 5;
@@ -141,6 +143,32 @@ pub fn review_attachment(
 
 /// Match parsed paths rather than splitting a quoted Git filename by spaces.
 pub fn file_patch<'a>(patch: &'a str, path: &str) -> Option<&'a str> {
+    blocks(patch).find_map(|range| {
+        let block = &patch[range];
+        let files = DiffFile::parse(block).ok()?;
+        files
+            .iter()
+            .any(|file| file.path().as_ref() == path)
+            .then_some(block)
+    })
+}
+
+/// Where `file_patch` finds each path, for patches asked about repeatedly:
+/// parsing every block per question is slow on large patches.
+pub fn file_blocks(patch: &str) -> HashMap<String, Range<usize>> {
+    let mut found = HashMap::new();
+    for range in blocks(patch) {
+        for file in DiffFile::parse(&patch[range.clone()]).into_iter().flatten() {
+            found
+                .entry(file.path().to_string())
+                .or_insert_with(|| range.clone());
+        }
+    }
+    found
+}
+
+/// Each `diff --git` block of `patch` (text before the first one included).
+fn blocks(patch: &str) -> impl Iterator<Item = Range<usize>> {
     let mut starts = vec![0];
     starts.extend(
         patch
@@ -148,14 +176,7 @@ pub fn file_patch<'a>(patch: &'a str, path: &str) -> Option<&'a str> {
             .map(|(offset, _)| offset + 1),
     );
     starts.push(patch.len());
-    starts.windows(2).find_map(|range| {
-        let block = &patch[range[0]..range[1]];
-        let files = DiffFile::parse(block).ok()?;
-        files
-            .iter()
-            .any(|file| file.path().as_ref() == path)
-            .then_some(block)
-    })
+    (0..starts.len() - 1).map(move |ix| starts[ix]..starts[ix + 1])
 }
 
 pub use sg_git::hunk_patch;
@@ -177,6 +198,11 @@ mod tests {
         assert!(last.contains("+new"));
         assert!(!last.contains("+after"));
         assert!(file_patch(PATCH, "stale-selection.txt").is_none());
+        let blocks = file_blocks(PATCH);
+        for path in ["deleted.txt", "other.txt"] {
+            assert_eq!(Some(&PATCH[blocks[path].clone()]), file_patch(PATCH, path));
+        }
+        assert_eq!(blocks.len(), 2);
     }
 
     #[test]

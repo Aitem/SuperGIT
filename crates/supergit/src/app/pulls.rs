@@ -28,6 +28,8 @@ const CLOSED_DETAILS_REFRESH: Duration = Duration::from_secs(300);
 const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
 /// A failed diff is retried this often while its tab is open.
 const PATCH_RETRY: Duration = Duration::from_secs(60);
+/// Pull request diffs kept loaded (the shown one included).
+const CACHED_PATCHES: usize = 4;
 const SEARCH_DELAY: Duration = Duration::from_millis(400);
 const BRANCH_LIMIT: usize = 50;
 const SEARCH_LIMIT: usize = 50;
@@ -69,6 +71,21 @@ pub(super) struct Patch {
     patch: LoadState<String>,
     /// The submodules the patch moves, inlined from local checkouts.
     submodules: Vec<sg_git::SubmoduleChange>,
+    /// `agent_context::file_blocks` of `patch`, built on first use: inline
+    /// review threads look their files up on every render.
+    blocks: std::cell::OnceCell<HashMap<String, std::ops::Range<usize>>>,
+}
+
+impl Patch {
+    /// `path`'s part of the patch (`agent_context::file_patch`).
+    pub(super) fn file_patch(&self, path: &str) -> Option<&str> {
+        let patch = self.patch.value()?;
+        let range = self
+            .blocks
+            .get_or_init(|| agent_context::file_blocks(patch))
+            .get(path)?;
+        patch.get(range.clone())
+    }
 }
 
 /// The details column's views, as on GitHub.
@@ -809,8 +826,23 @@ impl SuperGitApp {
                         merge_base,
                         patch,
                         submodules,
+                        blocks: Default::default(),
                     },
                 );
+                // Diffs of PRs looked at earlier reload when opened again.
+                while this.pulls.patches.len() > CACHED_PATCHES {
+                    let oldest = this
+                        .pulls
+                        .patches
+                        .iter()
+                        .filter(|(n, _)| **n != number && Some(**n) != this.pulls.shown)
+                        .min_by_key(|(_, p)| p.at)
+                        .map(|(n, _)| *n);
+                    match oldest {
+                        Some(oldest) => this.pulls.patches.remove(&oldest),
+                        None => break,
+                    };
+                }
                 this.show_pr_diff(number, cx);
                 cx.notify();
             })
@@ -845,6 +877,7 @@ impl SuperGitApp {
                         error: format!("Cannot display the diff: {error}"),
                         previous: None,
                     };
+                    entry.blocks = Default::default();
                     self.pulls
                         .diff
                         .update(cx, |diff, cx| diff.set_files(Vec::new(), cx));

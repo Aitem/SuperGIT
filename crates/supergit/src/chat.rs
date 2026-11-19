@@ -1304,9 +1304,12 @@ impl ChatSession {
         };
         let expanded = self.expanded.contains(&ix);
         // While the edit awaits approval the permission card shows the diff.
-        let diff = self
-            .tool_patch(tool)
-            .and_then(|patch| self.diff_for(&tool.id, &patch, cx));
+        let diff = match self.diffs.get(&tool.id) {
+            Some(diff) => Some(diff.clone()),
+            None => self
+                .tool_patch(tool)
+                .and_then(|patch| self.diff_for(&tool.id, &patch, cx)),
+        };
         let output = tool
             .result
             .as_ref()

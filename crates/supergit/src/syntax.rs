@@ -286,6 +286,38 @@ mod tests {
         assert_eq!(files[1].language().as_ref(), "rust");
     }
 
+    /// syntect compiles patterns on first use and panics when one fails; the
+    /// syntaxes are two-face's fancy-regex set while the engine is Oniguruma
+    /// (it takes precedence, for memory), so every pattern must compile.
+    #[test]
+    fn every_syntax_pattern_compiles_with_the_regex_engine() {
+        use syntect::parsing::Regex;
+        use syntect::parsing::syntax_definition::Pattern;
+        let builder = two_face::syntax::extra_newlines().into_builder();
+        let mut failed = Vec::new();
+        let mut checked = 0;
+        for syntax in builder.syntaxes() {
+            for (name, context) in &syntax.contexts {
+                for pattern in &context.patterns {
+                    // Back-references are filled in from the match that
+                    // opened the context before these compile.
+                    let Pattern::Match(pattern) = pattern else {
+                        continue;
+                    };
+                    if pattern.has_captures {
+                        continue;
+                    }
+                    checked += 1;
+                    if let Some(error) = Regex::try_compile(pattern.regex.regex_str()) {
+                        failed.push(format!("{} / {name}: {error}", syntax.name));
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "only {checked} patterns found");
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
     #[test]
     fn finds_languages_by_name_and_shebang() {
         assert!(!highlight_lines("src/core.clj", &["(defn f [x] (+ x 1))"]).is_empty());

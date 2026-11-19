@@ -141,17 +141,23 @@ fn load_pages(
     Ok(FileReview { revision, files })
 }
 
-/// Change one path on the GitHub revision that supplied the viewed state.
-/// GitHub accepts the path and PR node ID, so check the revision before and
-/// after the mutation; the mutation itself has no revision precondition.
-pub fn set_pr_file_viewed(
+/// Mark (`true`) or unmark paths on the GitHub revision that supplied the
+/// viewed state, in one request: GraphQL runs a document's mutations in
+/// order, so a later change of the same path wins. GitHub accepts the path
+/// and PR node ID, so check the revision before and after the mutation; the
+/// mutation itself has no revision precondition.
+pub fn set_pr_files_viewed(
     repo: &Path,
     review: &FileReview,
-    path: &str,
-    viewed: bool,
+    changes: &[(String, bool)],
 ) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
     ensure!(
-        review.files.contains_key(path),
+        changes
+            .iter()
+            .all(|(path, _)| review.files.contains_key(path)),
         "This path is missing from the pull request"
     );
     let expected = &review.revision;
@@ -160,29 +166,46 @@ pub fn set_pr_file_viewed(
         current == *expected,
         "The pull request revision changed. Refresh the diff first."
     );
-    let name = if viewed {
-        "markFileAsViewed"
-    } else {
-        "unmarkFileAsViewed"
-    };
-    let query = format!(
-        "mutation($id:ID!, $path:String!) {{
-        {name}(input:{{pullRequestId:$id, path:$path}}) {{
-            pullRequest {{ id headRefOid baseRefOid }}
-        }}
-    }}"
-    );
-    let updated: Revision = request(
-        repo,
-        &query,
-        json!({"id":expected.id, "path":path}),
-        &format!("/{name}/pullRequest"),
-    )?;
+    let (query, variables) = viewed_mutation(&expected.id, changes);
+    let updated: HashMap<String, Updated> = request(repo, &query, variables, "")?;
     ensure!(
-        updated == *expected,
+        updated.len() == changes.len()
+            && updated
+                .values()
+                .all(|updated| updated.pull_request == *expected),
         "The pull request changed during the update. Refresh to see the current viewed state."
     );
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Updated {
+    pull_request: Revision,
+}
+
+/// One aliased `markFileAsViewed`/`unmarkFileAsViewed` per change.
+fn viewed_mutation(id: &str, changes: &[(String, bool)]) -> (String, Value) {
+    let mut variables = serde_json::Map::new();
+    variables.insert("id".into(), id.into());
+    let mut params = vec!["$id:ID!".to_string()];
+    let mut fields = String::new();
+    for (ix, (path, viewed)) in changes.iter().enumerate() {
+        let name = if *viewed {
+            "markFileAsViewed"
+        } else {
+            "unmarkFileAsViewed"
+        };
+        params.push(format!("$p{ix}:String!"));
+        variables.insert(format!("p{ix}"), path.as_str().into());
+        fields.push_str(&format!(
+            "  m{ix}: {name}(input:{{pullRequestId:$id, path:$p{ix}}}) {{
+    pullRequest {{ id headRefOid baseRefOid }}
+  }}\n"
+        ));
+    }
+    let query = format!("mutation({}) {{\n{fields}}}", params.join(", "));
+    (query, Value::Object(variables))
 }
 
 fn request<T: DeserializeOwned>(
@@ -236,6 +259,23 @@ mod tests {
         .unwrap();
         assert_eq!(review.files["src/a.rs"], FileViewedState::Viewed);
         assert_eq!(review.files["src/b.rs"], FileViewedState::Dismissed);
+    }
+
+    #[test]
+    fn batches_viewed_changes_as_ordered_aliases() {
+        let changes = [
+            ("a.rs".to_string(), true),
+            ("dir/b c.rs".to_string(), false),
+        ];
+        let (query, variables) = viewed_mutation("PR_1", &changes);
+        assert!(query.starts_with("mutation($id:ID!, $p0:String!, $p1:String!)"));
+        let first = query.find("m0: markFileAsViewed").unwrap();
+        let second = query.find("m1: unmarkFileAsViewed").unwrap();
+        assert!(first < second);
+        assert_eq!(
+            variables,
+            json!({"id":"PR_1", "p0":"a.rs", "p1":"dir/b c.rs"})
+        );
     }
 
     #[test]

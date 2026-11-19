@@ -88,10 +88,11 @@ pub fn result(item: &Value) -> ToolResult {
             .is_some_and(|code| code != 0)
         || item.get("error").is_some_and(|e| !e.is_null())
         || item.get("success").and_then(Value::as_bool) == Some(false);
+    // The item (with its whole output) stays in the call's `input`.
     ToolResult {
         text,
         is_error,
-        meta: Some(item.clone()),
+        meta: None,
     }
 }
 

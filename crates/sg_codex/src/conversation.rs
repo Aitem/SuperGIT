@@ -402,9 +402,14 @@ impl CodexFold {
             }
             _ if tools::is_tool(ty) => {
                 let result = (!started).then(|| tools::result(item));
+                // A command's output is the result's text: keep one copy.
+                let mut input = item.clone();
+                if let Some(fields) = input.as_object_mut() {
+                    fields.remove("aggregatedOutput");
+                }
                 match c.tool_mut(&id) {
                     Some(tool) => {
-                        tool.input = item.clone();
+                        tool.input = input;
                         if result.is_some() {
                             tool.result = result;
                         }
@@ -412,7 +417,7 @@ impl CodexFold {
                     None => c.items.push(Item::Tool(ToolCall {
                         id,
                         name: tools::name(item),
-                        input: item.clone(),
+                        input,
                         result,
                         parent: None,
                         checking: false,
