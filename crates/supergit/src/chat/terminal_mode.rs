@@ -292,10 +292,47 @@ impl ChatSession {
         }
         let queued = std::mem::take(&mut terminal.queued);
         #[cfg(feature = "screenshot")]
-        if std::env::var("SUPERGIT_DEBUG_TERMINAL").as_deref() == Ok("select")
+        if let Ok(debug) = std::env::var("SUPERGIT_DEBUG_TERMINAL")
             && let Some(view) = terminal.view.clone()
         {
+            // `select`: drag a selection; `menu`: and right-click it.
             view.update(cx, |view, cx| view.debug_select(cx));
+            if debug == "menu"
+                && let Some(position) = view.read(cx).debug_menu_position()
+                && let Some(window) = cx.windows().first().copied()
+            {
+                // A real click: press, then release a moment later (the
+                // menu must stay open).
+                cx.spawn(async move |_, cx| {
+                    let event = |down: bool| {
+                        if down {
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Right,
+                                position,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            })
+                        } else {
+                            PlatformInput::MouseUp(MouseUpEvent {
+                                button: MouseButton::Right,
+                                position,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                            })
+                        }
+                    };
+                    for down in [true, false] {
+                        let _ = window.update(cx, |_, window, cx| {
+                            window.dispatch_event(event(down), cx);
+                        });
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(150))
+                            .await;
+                    }
+                })
+                .detach();
+            }
         }
         if let Some(view) = terminal.view.clone() {
             view.update(cx, |view, _| {

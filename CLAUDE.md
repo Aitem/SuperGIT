@@ -130,12 +130,16 @@ Design notes: docs/EMBEDDED_TERMINAL.md.
   triple click line, Option-drag block, autoscroll past the edges) and its
   formatter for copying (plain, soft wraps joined, trimmed). Drag and release
   listen on the whole window (registered in the canvas paint); typing drops
-  the selection.
+  the selection. Right click: Copy / Paste / Select All (the same actions,
+  `action_context` = the terminal). Programs that track the mouse get
+  clicks (right ones too), drags, motion and the wheel instead (libghostty's
+  mouse encoder); Shift still selects.
 - Tests: `cargo test -p sg_terminal` (emulation, keys, a real PTY child).
   UI check: write `{"agent_view":"terminal"}` to
   `$SUPERGIT_STATE_DIR/settings.json`, then `SUPERGIT_DEBUG_CHAT=new` (or
   `resume`, `prompt:…`) in a screenshot build; `SUPERGIT_DEBUG_TERMINAL=select`
-  also drags a selection over the first rows once the TUI is ready.
+  also drags a selection over the first rows once the TUI is ready, `=menu`
+  then right-clicks it (the context menu).
 
 ## Native Codex (sg_codex)
 

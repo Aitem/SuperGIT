@@ -68,7 +68,7 @@ libghostty-vt 1.0 + GPUI (`sg_terminal`, `supergit/src/terminal.rs`), app
 colors for the terminal and a generated Claude theme, exact status from
 Claude's OSC 7501 reports. See docs/EMBEDDED_TERMINAL.md.
 
-Next: IME (dead keys, CJK), mouse reporting, clickable links and paths, switching an idle conversation between chat and terminal, plain
+Next: IME (dead keys, CJK), clickable links and paths, switching an idle conversation between chat and terminal, plain
 shell tabs.
 
 ## 2. Exact agent status + notifications
