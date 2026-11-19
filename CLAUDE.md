@@ -123,6 +123,32 @@ Core crates are UI-agnostic and synchronous; the app runs them on GPUI's
 background executor and applies results on the main thread. Keep it that way:
 no GPUI types in `sg_*` crates.
 
+**Run independent slow work side by side.** Subprocesses (`git` ~5–50 ms,
+`gh` ~0.5–1 s) and file reads that don't need each other's results must not
+run one after another:
+- `sg_git::parallel::join(a, b)` for two calls (it behaves like calling them
+  in sequence, panics included), `sg_git::parallel::map(items, f)` for one
+  call per worktree, submodule, PR or login. `map` runs up to
+  `parallel::workers()` (2–8) threads, never one per item: dozens of
+  worktrees are normal. `sg_github` (no `sg_git` dependency) uses
+  `std::thread::scope`, as in `list_prs`.
+- In the app, start a view's requests together, not one after another's
+  result. For example, a PR's diff, commits and viewed state start with the
+  listed head while its details load, and refetch only what a newer head
+  changed.
+- Prefer one request to several: one GraphQL document with aliased fields,
+  not N `gh` calls.
+- Some work must stay sequential: checks that guard a mutation, commands
+  that write the same repository (`index.lock`, `packed-refs.lock`,
+  `config.lock`) or the same file, and cursor pagination.
+- Never do I/O or parse large data (transcripts, patches, JSON) on the main
+  thread. Use the background executor, or a thread of its own when the
+  shared pool may be busy with slow Git and GitHub calls (as for chat
+  history).
+- Cache what is expensive to recompute and rarely changes, such as avatars
+  and email → account lookups. Bound caches that grow with use: per
+  worktree, per PR, per session.
+
 ## Commands
 
 ```sh
