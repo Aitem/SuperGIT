@@ -36,6 +36,7 @@ use sg_claude::{ClaudeEvents as _, ClaudeProcess, PermissionMode, SpawnOptions};
 use sg_codex::{CodexFold, CodexProcess, CollaborationMode, Policy};
 
 mod questions;
+mod terminal_mode;
 mod timeline;
 
 mod collaboration;
@@ -151,6 +152,8 @@ pub struct ChatSession {
     reader: Option<Task<()>>,
     /// Reading a Claude transcript for the history.
     transcript_load: Option<Task<()>>,
+    /// Shown as the agent's own TUI in the embedded terminal instead.
+    terminal: Option<terminal_mode::TerminalMode>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -162,14 +165,38 @@ impl ChatSession {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(
+        let mut chat = Self::build(
             worktree.clone(),
             worktree,
             provider,
             Conversation::new(),
             window,
             cx,
-        )
+        );
+        if crate::settings::load().agent_view == crate::settings::AgentView::Terminal {
+            chat.terminal = Some(Default::default());
+        }
+        chat
+    }
+
+    /// Continue an existing session as its agent's TUI (not started yet).
+    pub fn resume_terminal(
+        worktree: PathBuf,
+        session: &sg_agents::Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut convo = Conversation::new();
+        convo.session_id = Some(session.id.clone());
+        convo.title = Some(session.title.clone());
+        let cwd = session
+            .start_cwd
+            .clone()
+            .unwrap_or_else(|| worktree.clone());
+        let mut chat = Self::build(worktree, cwd, session.provider, convo, window, cx);
+        chat.transcript = Some(session.transcript.clone());
+        chat.terminal = Some(Default::default());
+        chat
     }
 
     /// Continue an existing session, showing its history.
@@ -203,8 +230,12 @@ impl ChatSession {
         let provider = Provider::parse(&saved.provider).unwrap_or_default();
         let transcript_exists = saved.transcript.as_ref().is_some_and(|p| p.is_file());
         let mut convo = Conversation::new();
-        // Codex keeps threads it has not written a rollout for yet.
-        if transcript_exists || (provider == Provider::Codex && saved.transcript.is_none()) {
+        // Codex keeps threads it has not written a rollout for yet; a new
+        // terminal session keeps the id it was started with.
+        if transcript_exists
+            || (provider == Provider::Codex && saved.transcript.is_none())
+            || saved.terminal
+        {
             convo.session_id = saved.session_id.clone();
         }
         // The transcript's own title replaces it once read.
@@ -221,6 +252,9 @@ impl ChatSession {
             chat.local_id = saved.local_id.clone();
         }
         chat.transcript = saved.transcript.clone().filter(|p| p.is_file());
+        if saved.terminal {
+            chat.terminal = Some(Default::default());
+        }
         if let (Backend::Codex { policy, .. }, Some(saved_policy)) =
             (&mut chat.backend, Policy::parse(&saved.policy))
         {
@@ -246,8 +280,11 @@ impl ChatSession {
         chat.input.update(cx, |input, cx| {
             input.set_value(saved.draft.clone(), window, cx)
         });
-        chat.load_transcript(cx);
-        chat.load_history(cx);
+        // A terminal conversation shows its history in the TUI.
+        if !chat.is_terminal() {
+            chat.load_transcript(cx);
+            chat.load_history(cx);
+        }
         chat
     }
 
@@ -283,6 +320,7 @@ impl ChatSession {
                 }
                 Backend::Claude { .. } => None,
             },
+            terminal: self.is_terminal(),
         }
     }
 
@@ -338,6 +376,7 @@ impl ChatSession {
             stderr_tail: Vec::new(),
             reader: None,
             transcript_load: None,
+            terminal: None,
             _subscriptions: vec![sub],
         }
     }
@@ -372,10 +411,11 @@ impl ChatSession {
         self.convo.items.is_empty()
             && self.convo.session_id.is_none()
             && self.backend.agent().is_none()
+            && self.terminal.as_ref().is_none_or(|t| t.view.is_none())
     }
 
     pub fn status(&self) -> Status {
-        self.convo.status
+        self.terminal_status().unwrap_or(self.convo.status)
     }
 
     pub fn set_git_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
@@ -390,6 +430,10 @@ impl ChatSession {
         &mut self,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Option<Arc<dyn AgentProcess>>> {
+        if self.is_terminal() {
+            self.release_terminal(cx)?;
+            return Ok(None);
+        }
         anyhow::ensure!(
             !self.convo.status.is_busy(),
             "An agent is still running or waiting for approval"
@@ -428,6 +472,9 @@ impl ChatSession {
             matches!(item, Item::UserInput(request) if request.resolution == InputResolution::Pending)
         })
         };
+        if self.focus_terminal(window, cx) {
+            return;
+        }
         if let Some(ix) = approval.or_else(question) {
             self.scroller.update(cx, |scroller, cx| {
                 scroller.scroll_to_item(ix, cx);
@@ -448,19 +495,36 @@ impl ChatSession {
         self.convo
             .title
             .clone()
+            .or_else(|| self.terminal_title().map(str::to_string))
             .unwrap_or_else(|| "New conversation".into())
     }
 
-    pub fn input(&self) -> Entity<TextareaState> {
-        self.input.clone()
+    /// Put the keyboard focus where the user types: the composer, or the
+    /// terminal.
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        if !self.focus_terminal(window, cx) {
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    /// Text for the user to edit and send: in the composer, or typed into
+    /// the agent's prompt in a terminal.
+    pub fn set_draft(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_terminal() {
+            self.type_into_terminal(text, false, cx);
+        } else {
+            self.input
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+        }
     }
 
     pub fn follows_tail(&self, cx: &App) -> bool {
-        self.scroller.read(cx).is_following_tail()
+        self.is_terminal() || self.scroller.read(cx).is_following_tail()
     }
 
     pub fn has_draft(&self, cx: &App) -> bool {
-        !self.input.read(cx).value().is_empty() || !self.attachments.is_empty()
+        !self.is_terminal()
+            && (!self.input.read(cx).value().is_empty() || !self.attachments.is_empty())
     }
 
     pub fn attach(
@@ -470,6 +534,11 @@ impl ChatSession {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         attachment.validate_destination(&self.worktree, &self.cwd)?;
+        if self.is_terminal() {
+            self.type_into_terminal(attachment.bounded().prompt(), false, cx);
+            self.focus(window, cx);
+            return Ok(());
+        }
         anyhow::ensure!(
             self.attachments.len() < MAX_ATTACHMENTS,
             "Remove an attachment before adding more (maximum {MAX_ATTACHMENTS})"
@@ -829,6 +898,10 @@ impl ChatSession {
     pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if self.git_busy || self.history_loading() {
             return false;
+        }
+        if self.is_terminal() {
+            self.type_into_terminal(text.to_string(), true, cx);
+            return true;
         }
         self.attention.set(Kind::Running, None);
         let text = text.to_string();
@@ -1717,6 +1790,9 @@ impl ChatSession {
 
 impl Render for ChatSession {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.is_terminal() {
+            return self.render_terminal(cx);
+        }
         self.load_models(cx);
         let theme = cx.theme().clone();
         let status = match self.convo.status {
@@ -1823,6 +1899,7 @@ impl Render for ChatSession {
                     .into_any_element()
             })
             .child(self.render_composer(cx))
+            .into_any_element()
     }
 }
 

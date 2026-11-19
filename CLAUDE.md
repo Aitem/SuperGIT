@@ -34,6 +34,9 @@ crates/
   sg_claude/   native Claude chat: `claude` stream-json process + protocol
                (process.rs), event → chat items fold (conversation.rs),
                tool summaries/diffs (tools.rs)
+  sg_terminal/ embedded terminal core: PTY (rustix) + Ghostty's emulation
+               (libghostty-vt) reduced to plain `Screen` runs; key/paste
+               encoding, program status (OSC 7501), render holds (2026)
   sg_codex/    native Codex chat: CLI discovery + version check (install.rs),
                `codex app-server` driver (process.rs), fold (conversation.rs),
                item summaries/diffs (tools.rs), rollout discovery (sessions.rs)
@@ -41,7 +44,9 @@ crates/
                loading), launch.rs (terminals/editor/browser), dump.rs,
                screenshot.rs (feature `screenshot`), difft_view.rs (the
                difftastic diff view), syntax.rs (syntect highlight names),
-               submodules.rs (submodule rows and diff cards)
+               submodules.rs (submodule rows and diff cards), terminal.rs
+               (GPUI terminal view; terminal/theme.rs: app colors for it and
+               for Claude), chat/terminal_mode.rs (a conversation as a TUI)
 docs/ROADMAP.md
 ```
 
@@ -83,6 +88,42 @@ Same protocol as the Agent SDKs and the VS Code extension:
 - Live test against the real CLI (costs cents): `cargo test -p sg_claude -- --ignored`.
 - UI checks: `SUPERGIT_DEBUG_CHAT=resume` or `SUPERGIT_DEBUG_CHAT='prompt:…'`
   (screenshot builds only) opens/sends on startup, then screenshot it.
+
+## Embedded terminal (sg_terminal + supergit/src/terminal.rs)
+
+`Settings::agent_view` (`Chat | Terminal` in the panel header and Settings)
+decides whether New / Resume open SuperGIT's chat or the agent's own TUI.
+Design notes: docs/EMBEDDED_TERMINAL.md.
+- Build: libghostty-vt comes from Uzaaft/libghostty-rs at a pinned git rev
+  (crates.io still pins a pre-1.0 Ghostty that needs Zig 0.15). It builds
+  Ghostty with **Zig 0.17.x** from `vendor/ghostty`, which
+  `scripts/fetch-ghostty.sh` downloads (gitignored; the commit must match
+  the bindings' `GHOSTTY_COMMIT`). `.cargo/config.toml` sets
+  `GHOSTTY_SOURCE_DIR` and `LIBGHOSTTY_VT_SYS_OPTIMIZE`.
+- libghostty handles are `!Send`: the `Terminal` lives on the main thread,
+  the PTY reader thread only moves bytes; one repaint per batch, and the last
+  frame stays up while a program holds output (mode 2026, 1 s timeout).
+- Launch: `claude --session-id <new uuid>` / `--resume <id>` in the
+  session's cwd, plus `--plugin-dir <support>/claude-terminal/plugin
+  --settings <support>/claude-terminal/settings.json`: a generated plugin
+  with themes `supergit:light|dark` built from the GPUI theme, picked per
+  appearance (`custom:supergit:dark`). Nothing in `~/.claude` changes.
+  Session/terminal variables of the parent (`CLAUDECODE`, `TMUX`, …) are
+  removed; `TERM=xterm-256color`, `TERM_PROGRAM=SuperGIT`.
+- Status: Claude Code asks `OSC 7501 ; ?` and then reports working /
+  blocked (permission, question) / done; that maps onto `Attention`. Without
+  reports (Codex) status comes from output activity. Typed-in text (issue
+  drafts, attached context, `SUPERGIT_DEBUG_CHAT=prompt:`) waits until the
+  TUI has drawn and gone quiet.
+- Keys: GPUI runs bindings before key listeners, so the `Terminal` key
+  context binds `NoAction` to Tab/Shift-Tab (and on Linux the app's `ctrl-`
+  shortcuts) to release them to the program; `cmd-c`/`cmd-v`
+  (`ctrl-shift-c/v`) are `terminal::Copy`/`Paste`. Keys are encoded by
+  libghostty (Kitty keyboard protocol: Shift+Enter is `ESC[13;2u`).
+- Tests: `cargo test -p sg_terminal` (emulation, keys, a real PTY child).
+  UI check: write `{"agent_view":"terminal"}` to
+  `$SUPERGIT_STATE_DIR/settings.json`, then `SUPERGIT_DEBUG_CHAT=new` (or
+  `resume`, `prompt:…`) in a screenshot build.
 
 ## Native Codex (sg_codex)
 
@@ -157,6 +198,7 @@ cargo test --workspace              # unit + integration tests (temp git repos)
 cargo lint && cargo fmt --all        # lint = CI's clippy (.cargo/config.toml)
 cargo run -- --dump $SUPERGIT_TEST_REPO  # data layer as text, no window
 cargo run -- $SUPERGIT_TEST_REPO         # the app
+scripts/fetch-ghostty.sh            # once: Ghostty sources for libghostty-vt (needs Zig 0.17)
 scripts/bundle-macos.sh --install   # SuperGIT.app → /Applications (ad-hoc signed)
 scripts/install-linux.sh            # Linux: ~/.local/bin + .desktop launcher + icon
 scripts/make-icon.sh                # regenerate assets/AppIcon.icns (Swift/AppKit)

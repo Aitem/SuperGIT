@@ -74,6 +74,9 @@ pub struct SavedConversation {
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_collaboration_mode: Option<String>,
+    /// Shown as the agent's TUI in the embedded terminal, not as a chat.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

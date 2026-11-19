@@ -16,6 +16,7 @@ sg_github = { path = "crates/sg_github" }
 sg_agents = { path = "crates/sg_agents" }
 sg_claude = { path = "crates/sg_claude" }
 sg_codex = { path = "crates/sg_codex" }
+sg_terminal = { path = "crates/sg_terminal" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

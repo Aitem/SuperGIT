@@ -282,8 +282,8 @@ impl SuperGitApp {
                             {
                                 this.new_chat(window, cx);
                                 if let Some(chat) = this.active_chat_entity() {
-                                    chat.read(cx).input().update(cx, |state, cx| {
-                                        state.set_value(issue_draft(issue), window, cx);
+                                    chat.update(cx, |chat, cx| {
+                                        chat.set_draft(issue_draft(issue), window, cx);
                                     });
                                 }
                             }

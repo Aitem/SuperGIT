@@ -24,6 +24,9 @@ sg_github.workspace = true
 sg_agents.workspace = true
 sg_claude.workspace = true
 sg_codex.workspace = true
+sg_terminal.workspace = true
+# Session ids for new terminal conversations (`claude --session-id`).
+uuid = { version = "1", features = ["v4"] }
 # Syntax colors for the difftastic view; the same versions as gpui-kit's
 # `syntect` highlighter. `regex-onig` switches both to Oniguruma (syntect
 # prefers it over fancy-regex): fancy-regex builds automata per pattern,

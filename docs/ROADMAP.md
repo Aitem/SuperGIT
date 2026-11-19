@@ -62,9 +62,15 @@ worktree. Keep existing Claude conversations working throughout the change.
 
 ## 1b. Embedded terminal
 
-For people who prefer the TUI and for plain shells: terminal tabs per
-worktree (`alacritty_terminal` + GPUI). Lower priority now that Claude is
-native.
+Done (first cut): `Chat | Terminal` in the agent panel opens conversations
+as the agent's own TUI (`claude`, `codex`) in an embedded terminal:
+libghostty-vt 1.0 + GPUI (`sg_terminal`, `supergit/src/terminal.rs`), app
+colors for the terminal and a generated Claude theme, exact status from
+Claude's OSC 7501 reports. See docs/EMBEDDED_TERMINAL.md.
+
+Next: mouse selection + copy, IME (dead keys, CJK), clickable links and
+paths, switching an idle conversation between chat and terminal, plain
+shell tabs.
 
 ## 2. Exact agent status + notifications
 

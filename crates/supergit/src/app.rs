@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable as _, Selectable as _};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffMode,
     DiffSide, DiffState,
@@ -258,6 +258,8 @@ pub struct SuperGitApp {
     commit_difft: Entity<DifftView>,
     /// Unified or Split, for every diff (Settings).
     diff_layout: DiffLayout,
+    /// What New / Resume open: SuperGIT's chat or the agent's TUI.
+    agent_view: crate::settings::AgentView,
     /// Show diffs through difftastic (Settings); needs `difft` on PATH.
     difftastic: bool,
     /// `None` until looked up; then the installed version, if any.
@@ -373,6 +375,7 @@ impl SuperGitApp {
         });
         let settings = crate::settings::load();
         let diff_layout = settings.diff_layout;
+        let agent_view = settings.agent_view;
         let changes_diff = new_diff_state(diff_layout, cx);
         let commit_diff = new_diff_state(diff_layout, cx);
         let changes_difft = cx.new(|_| DifftView::new(diff_mode(diff_layout)));
@@ -466,6 +469,7 @@ impl SuperGitApp {
             changes_difft,
             commit_difft,
             diff_layout,
+            agent_view,
             difftastic: settings.difftastic,
             difft_version: None,
             commit_patch: LoadState::Loading,
@@ -1325,6 +1329,12 @@ impl SuperGitApp {
                     } else {
                         "Only exact events from native conversations are notified. The visible conversation stays quiet. Alerts go to your desktop's notification server; Do Not Disturb hides them."
                     }))
+                .child(v_flex().gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Agents"))
+                    .child(h_flex().justify_between().child("Open conversations as")
+                        .child(self.render_agent_view_toggle("settings-agent-view", cx).small()))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(
+                        "Terminal runs the agent's own TUI (claude, codex) in the panel, in SuperGIT's colors. Chat is SuperGIT's native view.")))
                 .child(self.render_diff_settings(cx))
                 .child(self.render_cleanup_settings(cx)))
             .into_any_element()
@@ -1548,7 +1558,9 @@ impl SuperGitApp {
                     let agent = std::env::var("SUPERGIT_DEBUG_AGENT")
                         .ok()
                         .and_then(|a| Provider::parse(&a));
-                    if spec == "resume" {
+                    if spec == "new" {
+                        app.new_chat_with(agent.unwrap_or_else(default_provider), window, cx);
+                    } else if spec == "resume" {
                         if let Some(s) = app.selected_info().and_then(|i| {
                             i.sessions
                                 .iter()
@@ -2279,8 +2291,7 @@ impl SuperGitApp {
         self.active_chat.insert(path, list.len() - 1);
         self.chat_open = true;
         self.queue_persist(cx);
-        let input = chat.read(cx).input();
-        input.update(cx, |state, cx| state.focus(window, cx));
+        chat.update(cx, |chat, cx| chat.focus(window, cx));
         cx.notify();
     }
 
@@ -2312,14 +2323,27 @@ impl SuperGitApp {
             self.active_chat.insert(path.clone(), ix);
             self.chat_open = true;
             let chat = self.chats[&path][ix].clone();
-            chat.update(cx, |chat, cx| chat.set_provider(provider, window, cx));
-            let input = chat.read(cx).input();
-            input.update(cx, |state, cx| state.focus(window, cx));
+            let view = self.agent_view;
+            chat.update(cx, |chat, cx| {
+                chat.set_provider(provider, window, cx);
+                chat.set_view(view, cx);
+                if chat.is_terminal() {
+                    chat.start_terminal(window, cx);
+                } else {
+                    chat.focus(window, cx);
+                }
+            });
             cx.notify();
             return;
         }
         let chat = cx.new(|cx| ChatSession::new(path.clone(), provider, window, cx));
-        self.add_chat(path, chat, window, cx);
+        self.add_chat(path, chat.clone(), window, cx);
+        // A terminal conversation asked for with New starts right away.
+        chat.update(cx, |chat, cx| {
+            if chat.is_terminal() {
+                chat.start_terminal(window, cx);
+            }
+        });
     }
 
     pub fn new_chat_action(
@@ -2345,6 +2369,13 @@ impl SuperGitApp {
             self.active_chat.insert(path, ix);
             self.chat_open = true;
             cx.notify();
+            return;
+        }
+        if self.agent_view == crate::settings::AgentView::Terminal {
+            let chat =
+                cx.new(|cx| ChatSession::resume_terminal(path.clone(), &session, window, cx));
+            self.add_chat(path, chat.clone(), window, cx);
+            chat.update(cx, |chat, cx| chat.start_terminal(window, cx));
             return;
         }
         let chat = cx.new(|cx| ChatSession::resume(path.clone(), &session, window, cx));
@@ -2375,8 +2406,7 @@ impl SuperGitApp {
         if self.chat_open
             && let Some(chat) = self.active_chat_entity()
         {
-            let input = chat.read(cx).input();
-            input.update(cx, |state, cx| state.focus(window, cx));
+            chat.update(cx, |chat, cx| chat.focus(window, cx));
         }
         cx.notify();
     }
@@ -3007,9 +3037,10 @@ impl SuperGitApp {
                     })
                     .child(
                         Button::new("terminal")
-                            .label("Terminal")
+                            .label(terminal.name())
                             .small()
                             .ghost()
+                            .tooltip(format!("Open a shell here in {}", terminal.name()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let r = launch::open_terminal(terminal, &p3, None);
                                 this.report(r, "Terminal opened", cx);
@@ -3565,6 +3596,49 @@ impl SuperGitApp {
             FileList::Commit => &self.commit_submodules,
             FileList::Pull => self.pr_submodules(),
         }
+    }
+
+    /// Chat or terminal for new conversations. An untouched conversation on
+    /// screen switches too, so the choice shows at once.
+    fn set_agent_view(&mut self, view: crate::settings::AgentView, cx: &mut Context<Self>) {
+        if self.agent_view == view {
+            return;
+        }
+        self.agent_view = view;
+        let mut settings = crate::settings::load();
+        settings.agent_view = view;
+        crate::settings::save(&settings);
+        if let Some(chat) = self.active_chat_entity() {
+            chat.update(cx, |chat, cx| chat.set_view(view, cx));
+        }
+        cx.notify();
+    }
+
+    /// `Chat | Terminal`: how New and Resume open conversations.
+    fn render_agent_view_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> ButtonGroup {
+        use crate::settings::AgentView;
+        ButtonGroup::new(id)
+            .outline()
+            .flex_none()
+            .children([AgentView::Chat, AgentView::Terminal].map(|view| {
+                Button::new(SharedString::from(format!("{id}-{}", view.label())))
+                    .label(view.label())
+                    .selected(self.agent_view == view)
+                    .tooltip(match view {
+                        AgentView::Chat => "Open conversations in SuperGIT's chat",
+                        AgentView::Terminal => {
+                            "Open conversations as the agent's own terminal UI (claude, codex)"
+                        }
+                    })
+            }))
+            .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
+                let view = if clicked.contains(&1) {
+                    AgentView::Terminal
+                } else {
+                    AgentView::Chat
+                };
+                this.set_agent_view(view, cx);
+            }))
     }
 
     fn set_diff_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
@@ -4767,8 +4841,7 @@ impl SuperGitApp {
         self.active_chat.insert(path, ix);
         self.chat_open = true;
         if let Some(chat) = self.active_chat_entity() {
-            let input = chat.read(cx).input();
-            input.update(cx, |state, cx| state.focus(window, cx));
+            chat.update(cx, |chat, cx| chat.focus(window, cx));
         }
         self.queue_persist(cx);
         cx.notify();
@@ -4974,6 +5047,7 @@ impl SuperGitApp {
                             .overflow_x_scroll()
                             .children(tabs),
                     )
+                    .child(self.render_agent_view_toggle("agent-view", cx).xsmall())
                     .child(
                         Button::new("chat-new")
                             .label("+")
