@@ -19,5 +19,8 @@ CLAUDE.local.md
 # Ad-hoc screenshots from `--features screenshot` runs
 /screenshots/
 
-# Ghostty sources for libghostty-vt (scripts/fetch-ghostty.sh)
-/vendor/
+# Zig's caches and unpacked packages for crates/sg_terminal/ghostty
+.zig-cache/
+.zig-pkg/
+zig-pkg/
+zig-out/

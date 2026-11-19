@@ -51,12 +51,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup toolchain install && rustc --version
-      # libghostty-vt (crates/sg_terminal) builds from Ghostty's sources with Zig.
+      # libghostty-vt (crates/sg_terminal) builds with Zig; the release it
+      # builds from is a Zig package (crates/sg_terminal/ghostty/build.zig.zon).
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - name: Fetch Ghostty sources
-        run: scripts/fetch-ghostty.sh
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -71,12 +70,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup toolchain install && rustc --version
-      # libghostty-vt (crates/sg_terminal) builds from Ghostty's sources with Zig.
+      # libghostty-vt (crates/sg_terminal) builds with Zig; the release it
+      # builds from is a Zig package (crates/sg_terminal/ghostty/build.zig.zon).
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - name: Fetch Ghostty sources
-        run: scripts/fetch-ghostty.sh
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -94,12 +92,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup toolchain install && rustc --version
-      # libghostty-vt (crates/sg_terminal) builds from Ghostty's sources with Zig.
+      # libghostty-vt (crates/sg_terminal) builds with Zig; the release it
+      # builds from is a Zig package (crates/sg_terminal/ghostty/build.zig.zon).
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - name: Fetch Ghostty sources
-        run: scripts/fetch-ghostty.sh
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true

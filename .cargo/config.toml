@@ -3,9 +3,10 @@
 lint = "clippy --workspace --all-targets --all-features --locked -- -D warnings"
 
 [env]
-# libghostty-vt (crates/sg_terminal) builds from these Ghostty sources with
-# Zig 0.17.x; `scripts/fetch-ghostty.sh` downloads them. A GHOSTTY_SOURCE_DIR
-# in the environment wins.
-GHOSTTY_SOURCE_DIR = { value = "vendor/ghostty", relative = true }
+# libghostty-vt (crates/sg_terminal) builds with Zig 0.17.x through the small
+# Zig project in crates/sg_terminal/ghostty, whose build.zig.zon pins the
+# libghostty-vt release (fetched once into Zig's global cache). A
+# GHOSTTY_SOURCE_DIR in the environment wins.
+GHOSTTY_SOURCE_DIR = { value = "crates/sg_terminal/ghostty", relative = true }
 # Like the other dependencies in dev builds: fast (Zig would build Debug).
 LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"

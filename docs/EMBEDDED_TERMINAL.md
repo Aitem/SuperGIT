@@ -45,12 +45,23 @@ crates/supergit/src/
 - **Bindings.** `libghostty-vt` comes from git (Uzaaft/libghostty-rs at a
   pinned rev that targets vt 1.0.1). The crates.io release (0.2.2) still pins
   a pre-1.0 Ghostty that only builds with Zig 0.15.
-- **Build.** Zig 0.17.x on `PATH`, and `scripts/fetch-ghostty.sh` downloads
-  the matching Ghostty sources into `vendor/ghostty` (a 37 MB tarball,
-  gitignored). `.cargo/config.toml` points the build at that folder, so
-  `cargo build` needs no network and no per-target-dir `git clone`. CI
-  installs Zig with `mlugg/setup-zig` and runs the script. libghostty links
-  statically, so nothing extra goes into the `.app`.
+- **Build.** Zig 0.17.x on `PATH`, nothing else. The bindings' build script
+  runs `zig build` in `GHOSTTY_SOURCE_DIR`, and `.cargo/config.toml` points
+  that at `crates/sg_terminal/ghostty`, a small Zig project:
+  - its `build.zig.zon` pins the signed libghostty-vt source release
+    (`release.files.ghostty.org/libghostty-vt/1.0.1/libghostty-vt-1.0.1.tar.gz`,
+    4.5 MB) by content hash, so Zig's package manager downloads it once
+    into its global cache, shared by every worktree and target dir;
+  - its `build.zig` runs Ghostty's own `zig build -Demit-lib-vt` inside the
+    fetched package. As a Zig dependency Ghostty only hands out the bare
+    archive and leaves its SIMD libraries to Zig's `linkLibrary`. Only the
+    top-level build merges them into one self-contained `libghostty-vt.a`,
+    which is what Cargo links.
+
+  This replaced an earlier `scripts/fetch-ghostty.sh` that vendored a
+  37 MB repo snapshot into each checkout. CI installs Zig with
+  `mlugg/setup-zig`. libghostty links statically, so nothing extra goes
+  into the `.app`.
 - **Threading.** libghostty handles are `!Send`, so the terminal lives on
   the main thread and the PTY reader only moves bytes. Each batch of output
   gets one repaint. While a program holds a synchronized frame, the last
@@ -165,7 +176,9 @@ TUI in the terminal.
 - Codex: new sessions get no id until its rollout exists, so a restored
   Codex terminal tab starts a fresh session.
 - When `libghostty-vt` reaches crates.io with 1.0 support, move off the git
-  dependency (bump the rev and `fetch-ghostty.sh`'s commit together).
+  dependency (bump the crate and `ghostty/build.zig.zon` together). An
+  upstream change letting the sys crate fetch through Zig instead of
+  `git clone` would make our Zig wrapper unnecessary.
 
 ## Sources
 
