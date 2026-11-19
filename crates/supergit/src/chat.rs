@@ -1707,17 +1707,21 @@ impl Render for ChatSession {
                     .gap_2()
                     .px_6()
                     .text_color(theme.muted_foreground)
-                    .child(div().text_lg().child(format!(
-                        "{} {}",
-                        provider.glyph(),
-                        provider.label()
-                    )))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_lg()
+                            .child(crate::icons::agent_icon(provider).size_5())
+                            .child(provider.label()),
+                    )
                     .when(fresh, |el| {
                         el.child(h_flex().gap_1().children(Provider::ALL.into_iter().map(
                             |choice| {
                                 let active = choice == provider;
                                 Button::new(("agent-choice", choice as usize))
-                                    .label(format!("{} {}", choice.glyph(), choice.label()))
+                                    .icon(crate::icons::agent_icon(choice))
+                                    .label(choice.label())
                                     .small()
                                     .when(active, |b| b.secondary())
                                     .when(!active, |b| b.ghost())

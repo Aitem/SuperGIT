@@ -17,8 +17,30 @@ pub struct Commit {
     pub subject: String,
     /// Branches, remote branches and tags pointing at this commit.
     pub refs: Vec<RefLabel>,
-    /// `Co-Authored-By: Claude …` trailer present — written with an agent.
-    pub by_agent: bool,
+    /// The coding agent its `Co-authored-by` trailer names, if any.
+    pub agent: Option<CommitAgent>,
+}
+
+/// A coding agent credited as co-author of a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitAgent {
+    Claude,
+    Codex,
+}
+
+impl CommitAgent {
+    /// From the `Co-authored-by` trailer values: `Claude Opus …`, or Codex
+    /// by name or by OpenAI.
+    fn from_trailers(trailers: &str) -> Option<Self> {
+        let trailers = trailers.to_ascii_lowercase();
+        if trailers.contains("claude") {
+            Some(Self::Claude)
+        } else if trailers.contains("codex") || trailers.contains("openai") {
+            Some(Self::Codex)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -179,7 +201,7 @@ fn parse_log(out: &str) -> Vec<Commit> {
                 time: f[4].trim().parse().unwrap_or(0),
                 refs: parse_refs(f[5]),
                 subject: f[6].into(),
-                by_agent: f[7].to_ascii_lowercase().contains("claude"),
+                agent: CommitAgent::from_trailers(f[7]),
             })
         })
         .collect()
@@ -437,7 +459,12 @@ mod tests {
         let commits = parse_log(&out);
         assert_eq!(commits.len(), 2);
         assert!(commits[0].is_merge());
-        assert!(commits[0].by_agent);
+        assert_eq!(commits[0].agent, Some(CommitAgent::Claude));
+        assert_eq!(commits[1].agent, None);
+        assert_eq!(
+            CommitAgent::from_trailers("Codex <noreply@openai.com>"),
+            Some(CommitAgent::Codex)
+        );
         let label = |kind, name: &str, current| RefLabel {
             kind,
             name: name.into(),
@@ -455,6 +482,5 @@ mod tests {
         assert_eq!(commits[0].refs[2].branch_name(), "main");
         assert_eq!(parse_refs("HEAD"), vec![label(RefKind::Head, "HEAD", true)]);
         assert!(commits[1].parents.is_empty());
-        assert!(!commits[1].by_agent);
     }
 }
