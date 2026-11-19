@@ -36,6 +36,7 @@ use sg_claude::{ClaudeEvents as _, ClaudeProcess, PermissionMode, SpawnOptions};
 use sg_codex::{CodexFold, CodexProcess, CollaborationMode, Policy};
 
 mod questions;
+mod timeline;
 
 mod collaboration;
 mod turn_plan;
@@ -144,6 +145,8 @@ pub struct ChatSession {
     diffs: HashMap<String, (Entity<DiffState>, usize)>,
     question_forms: HashMap<String, Vec<questions::AnswerDraft>>,
     expanded: HashSet<usize>,
+    /// Runs of tool calls the user unfolded, by their first item.
+    open_runs: HashSet<usize>,
     stderr_tail: Vec<String>,
     reader: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -338,6 +341,7 @@ impl ChatSession {
             diffs: HashMap::new(),
             question_forms: HashMap::new(),
             expanded: HashSet::new(),
+            open_runs: HashSet::new(),
             stderr_tail: Vec::new(),
             reader: None,
             _subscriptions: vec![sub],
@@ -1022,98 +1026,62 @@ impl ChatSession {
             return div().into_any_element();
         };
         let theme = cx.theme().clone();
-        // Tool calls run together; messages and cards get some air, a new
-        // user turn the most. (The scroller's own row gap is turned off.)
-        let (top, bottom) = match &item {
-            Item::Tool(_) | Item::Thinking { .. } => (px(2.), px(2.)),
-            Item::User { .. } => (px(10.), px(4.)),
-            Item::Text { .. } => (px(6.), px(6.)),
-            Item::Notice { .. } | Item::TurnEnd { .. } => (px(4.), px(4.)),
-            Item::Permission(_) | Item::UserInput(_) | Item::Plan(_) => (px(6.), px(6.)),
+        let row = timeline::row(
+            &self.convo.items,
+            ix,
+            &|item| self.groupable(item),
+            &self.open_runs,
+        );
+        let (shape, first, last) = match row {
+            timeline::Row::Hidden => return div().into_any_element(),
+            timeline::Row::User => return self.render_user_message(ix, item, &theme, cx),
+            timeline::Row::Step { shape, first, last } => (shape, first, last),
         };
-        let body = match item {
-            Item::User { text, at } => {
-                let attached = text.split_once(crate::agent_context::CONTEXT_MARKER);
-                let expanded = self.expanded.contains(&ix);
-                let display = if expanded {
-                    text.clone()
-                } else {
-                    attached
-                        .map(|(question, _)| question.to_string())
-                        .unwrap_or_else(|| text.clone())
-                };
-                h_flex()
-                    .justify_end()
-                    .child(
-                        div()
-                            .max_w(relative(0.88))
-                            .px_3()
-                            .py_2()
-                            .rounded_lg()
-                            .bg(theme.secondary)
-                            .text_color(theme.secondary_foreground)
-                            .child(message_label(
-                                "You",
-                                ("user", ix),
-                                display.clone(),
-                                at,
-                                &theme,
-                            ))
-                            .child(
-                                TextView::html(("user-message", ix), plain_message_html(&display))
-                                    .selectable(true),
-                            )
-                            .when(attached.is_some(), |bubble| {
-                                bubble.child(
-                                    Button::new(("message-context", ix))
-                                        .label(if expanded {
-                                            "Hide diff context"
-                                        } else {
-                                            "Show diff context"
-                                        })
-                                        .xsmall()
-                                        .ghost()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.toggle_expanded(ix, cx)
-                                        })),
-                                )
-                            }),
-                    )
-                    .into_any_element()
-            }
-            Item::Text {
-                text,
-                streaming,
-                at,
-            } => v_flex()
+        // Tool calls run together; messages and cards get some air.
+        let (top, bottom) = match (&shape, &item) {
+            (timeline::Shape::Run(_), _) => (px(3.), px(3.)),
+            (_, Item::Tool(_) | Item::Thinking { .. }) => (px(2.), px(2.)),
+            (_, Item::Text { .. }) => (px(8.), px(8.)),
+            (_, Item::Notice { .. } | Item::TurnEnd { .. }) => (px(4.), px(4.)),
+            _ => (px(6.), px(6.)),
+        };
+        let dot = match &shape {
+            timeline::Shape::Run(run) => Some((self.run_color(run.clone(), &theme), 8.)),
+            timeline::Shape::InRun => Some((step_color(&item, &theme), 5.)),
+            timeline::Shape::Single => Some((step_color(&item, &theme), 8.)),
+        };
+        let body = match (shape, item) {
+            (timeline::Shape::Run(run), _) => self.render_run(ix, run, &theme, cx),
+            (
+                _,
+                Item::Text {
+                    text,
+                    streaming,
+                    at,
+                },
+            ) => v_flex()
                 .min_w_0()
                 .gap_1()
                 .text_sm()
-                .child(message_label(
-                    self.provider().label(),
-                    ("response", ix),
-                    text.clone(),
-                    at,
-                    &theme,
-                ))
-                .child(TextView::markdown(("md", ix), text).selectable(true))
+                .child(TextView::markdown(("md", ix), text.clone()).selectable(true))
                 .when(streaming, |el| {
                     el.child(div().text_color(theme.muted_foreground).child("▍"))
                 })
+                .when(!streaming, |el| {
+                    el.child(message_footer(("response", ix), at, Some(text), &theme))
+                })
                 .into_any_element(),
-            // Finished thinking is noise in the transcript; show it only live.
-            Item::Thinking { streaming: false } => return div().into_any_element(),
-            Item::Thinking { streaming: true } => div()
+            (_, Item::Thinking { .. }) => div()
                 .text_xs()
                 .italic()
                 .text_color(theme.muted_foreground)
                 .child("Thinking…")
                 .into_any_element(),
-            Item::Tool(tool) => self.render_tool(ix, &tool, &theme, cx).into_any_element(),
-            Item::Permission(p) => self.render_permission(&p, &theme, cx).into_any_element(),
-            Item::UserInput(request) => self.render_user_input(&request, window, cx),
-            Item::Plan(plan) => turn_plan::render(&plan, &theme),
-            Item::Notice { text, is_error } => div()
+            (_, Item::Tool(tool)) => self.render_tool(ix, &tool, &theme, cx).into_any_element(),
+            (_, Item::Permission(p)) => self.render_permission(&p, &theme, cx).into_any_element(),
+            (_, Item::UserInput(request)) => self.render_user_input(&request, window, cx),
+            (_, Item::Plan(plan)) => turn_plan::render(&plan, &theme),
+            (_, Item::Notice { text, is_error }) => div()
                 .text_xs()
                 .text_color(if is_error {
                     theme.danger
@@ -1122,11 +1090,14 @@ impl ChatSession {
                 })
                 .child(text)
                 .into_any_element(),
-            Item::TurnEnd {
-                duration_ms,
-                is_error,
-                message,
-            } => {
+            (
+                _,
+                Item::TurnEnd {
+                    duration_ms,
+                    is_error,
+                    message,
+                },
+            ) => {
                 let secs = duration_ms.map(|ms| format!("{:.1}s", ms as f64 / 1000.0));
                 let text = match (is_error, message) {
                     (true, Some(m)) => format!("✗ {m}"),
@@ -1146,13 +1117,175 @@ impl ChatSession {
                     .child(text)
                     .into_any_element()
             }
+            // `timeline::row` makes user turns `Row::User`.
+            (_, Item::User { .. }) => div().into_any_element(),
         };
         div()
             .px_4()
-            .pt(top)
-            .pb(bottom)
-            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(timeline_gutter(first, last, top, dot, &theme))
+                    .child(div().flex_1().min_w_0().pt(top).pb(bottom).child(body)),
+            )
             .into_any_element()
+    }
+
+    /// A user turn: a bubble on the right, its time under it.
+    fn render_user_message(
+        &mut self,
+        ix: usize,
+        item: Item,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Item::User { text, at } = item else {
+            return div().into_any_element();
+        };
+        let attached = text.split_once(crate::agent_context::CONTEXT_MARKER);
+        let expanded = self.expanded.contains(&ix);
+        let display = if expanded {
+            text.clone()
+        } else {
+            attached
+                .map(|(question, _)| question.to_string())
+                .unwrap_or_else(|| text.clone())
+        };
+        v_flex()
+            .px_4()
+            .pt(px(12.))
+            .pb(px(6.))
+            .items_end()
+            .gap_1()
+            .child(
+                div()
+                    .max_w(relative(0.88))
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(theme.secondary)
+                    .text_color(theme.secondary_foreground)
+                    .child(
+                        TextView::html(("user-message", ix), plain_message_html(&display))
+                            .selectable(true),
+                    )
+                    .when(attached.is_some(), |bubble| {
+                        bubble.child(
+                            Button::new(("message-context", ix))
+                                .label(if expanded {
+                                    "Hide diff context"
+                                } else {
+                                    "Show diff context"
+                                })
+                                .xsmall()
+                                .ghost()
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.toggle_expanded(ix, cx)),
+                                ),
+                        )
+                    }),
+            )
+            .child(message_footer(("user", ix), at, None, theme))
+            .into_any_element()
+    }
+
+    /// Tool calls that may fold into a run: not edits, which show a diff.
+    fn groupable(&self, item: &Item) -> bool {
+        let Item::Tool(tool) = item else {
+            return false;
+        };
+        match self.provider() {
+            Provider::Claude => !sg_claude::tools::is_edit(&tool.name),
+            Provider::Codex => !sg_codex::tools::is_edit(tool),
+        }
+    }
+
+    fn run_calls(&self, run: std::ops::Range<usize>) -> Vec<ToolCall> {
+        self.convo.items[run.start..run.end.min(self.convo.items.len())]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Tool(tool) => Some(tool.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The run's dot: running while any call runs, red after a failed one.
+    fn run_color(&self, run: std::ops::Range<usize>, theme: &Theme) -> Hsla {
+        let calls = self.run_calls(run);
+        if calls.iter().any(|call| call.result.is_none()) {
+            theme.blue
+        } else if calls
+            .iter()
+            .any(|call| call.result.as_ref().is_some_and(|r| r.is_error))
+        {
+            theme.danger
+        } else {
+            theme.success
+        }
+    }
+
+    /// A folded run of tool calls ("▸ Bash ×3, Read · the latest call");
+    /// unfolded, the first call follows and the rest are their own rows.
+    fn render_run(
+        &mut self,
+        ix: usize,
+        run: std::ops::Range<usize>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let calls = self.run_calls(run);
+        let open = self.open_runs.contains(&ix);
+        let latest = calls
+            .last()
+            .filter(|_| !open)
+            .map(|call| self.tool_summary(call));
+        let checking = calls.iter().any(|call| call.checking);
+        let header = h_flex()
+            .id(("run", ix))
+            .gap_2()
+            .min_w_0()
+            .cursor_pointer()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_run(ix, cx)))
+            .child(div().flex_none().child(if open { "▾" } else { "▸" }))
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(timeline::run_label(&calls)),
+            )
+            .when_some(latest, |el, summary| {
+                el.child(div().min_w_0().truncate().opacity(0.75).child(summary))
+            })
+            .when(checking, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child("safety check…"),
+                )
+            });
+        let first = calls.into_iter().next().filter(|_| open);
+        v_flex()
+            .gap_1()
+            .min_w_0()
+            .child(header)
+            .when_some(first, |el, tool| {
+                el.child(self.render_tool(ix, &tool, theme, cx))
+            })
+            .into_any_element()
+    }
+
+    fn toggle_run(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if !self.open_runs.remove(&ix) {
+            self.open_runs.insert(ix);
+        }
+        let len = self.convo.items.len();
+        self.items_changed(len, cx);
     }
 
     fn render_tool(
@@ -1163,11 +1296,11 @@ impl ChatSession {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let summary = self.tool_summary(tool);
-        let (dot, label_color) = match &tool.result {
-            None if tool.checking => (theme.warning, theme.foreground),
-            None => (theme.blue, theme.foreground),
-            Some(r) if r.is_error => (theme.danger, theme.danger),
-            Some(_) => (theme.success, theme.foreground),
+        // Calls are background: muted, red only when one failed (its state
+        // is the timeline dot).
+        let label_color = match &tool.result {
+            Some(r) if r.is_error => theme.danger,
+            _ => theme.muted_foreground,
         };
         let expanded = self.expanded.contains(&ix);
         // While the edit awaits approval the permission card shows the diff.
@@ -1193,14 +1326,14 @@ impl ChatSession {
                 h_flex()
                     .id(("tool", ix))
                     .gap_2()
+                    .min_w_0()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_expanded(ix, cx)))
-                    .child(div().size(px(7.)).flex_none().rounded_full().bg(dot))
                     .child(
                         div()
                             .flex_none()
                             .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(label_color)
                             .child(tool.name.clone()),
                     )
@@ -1209,6 +1342,7 @@ impl ChatSession {
                             .min_w_0()
                             .text_sm()
                             .text_color(theme.muted_foreground)
+                            .opacity(0.75)
                             .truncate()
                             .child(summary),
                     )
@@ -1228,7 +1362,6 @@ impl ChatSession {
             .when_some(output, |el, text| {
                 el.child(
                     div()
-                        .ml_4()
                         .p_2()
                         .rounded_md()
                         .bg(theme.muted)
@@ -1633,49 +1766,99 @@ impl Render for ChatSession {
     }
 }
 
-/// Who wrote a message, when (the full date on hover) and a copy button.
-fn message_label(
-    label: &str,
+/// Under a message: when it was sent (the full date on hover) and, for an
+/// agent's message, a copy button.
+fn message_footer(
     (kind, ix): (&'static str, usize),
-    text: String,
     at: Option<SystemTime>,
+    copy: Option<String>,
     theme: &Theme,
 ) -> impl IntoElement {
     let time = at.map(message_time);
     h_flex()
-        .justify_between()
         .gap_2()
-        .child(
-            h_flex()
-                .gap_1p5()
-                .min_w_0()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(label.to_string()),
-                )
-                .when_some(time, |row, (short, full)| {
-                    row.child(
-                        div()
-                            .id(SharedString::from(format!("time-{kind}-{ix}")))
-                            .opacity(0.8)
-                            .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
-                            .child(short),
-                    )
-                }),
-        )
-        .child(
-            Button::new(SharedString::from(format!("copy-{kind}-{ix}")))
-                .label("Copy")
-                .xsmall()
-                .ghost()
-                .tooltip("Copy message")
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
-                }),
-        )
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .when_some(time, |row, (short, full)| {
+            row.child(
+                div()
+                    .id(SharedString::from(format!("time-{kind}-{ix}")))
+                    .opacity(0.8)
+                    .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                    .child(short),
+            )
+        })
+        .when_some(copy, |row, text| {
+            row.child(
+                Button::new(SharedString::from(format!("copy-{kind}-{ix}")))
+                    .label("Copy")
+                    .xsmall()
+                    .ghost()
+                    .tooltip("Copy message")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                    }),
+            )
+        })
+}
+
+/// Width of the timeline column left of the agent's steps.
+const GUTTER: f32 = 18.;
+
+/// The timeline beside one step: the line through it (starting or ending at
+/// its dot at a turn's edges) and the dot, level with the step's first line.
+fn timeline_gutter(
+    first: bool,
+    last: bool,
+    top: Pixels,
+    dot: Option<(Hsla, f32)>,
+    theme: &Theme,
+) -> Div {
+    let center = top + px(10.);
+    let line = div()
+        .absolute()
+        .left(px(GUTTER / 2. - 0.5))
+        .w(px(1.))
+        .bg(theme.border);
+    let line = match (first, last) {
+        (true, true) => None,
+        (true, false) => Some(line.top(center).bottom_0()),
+        (false, true) => Some(line.top_0().h(center)),
+        (false, false) => Some(line.top_0().bottom_0()),
+    };
+    div()
+        .relative()
+        .flex_none()
+        .w(px(GUTTER))
+        .children(line)
+        .when_some(dot, |el, (color, size)| {
+            el.child(
+                div()
+                    .absolute()
+                    .left(px(GUTTER / 2. - size / 2.))
+                    .top(center - px(size / 2.))
+                    .size(px(size))
+                    .rounded_full()
+                    .bg(color),
+            )
+        })
+}
+
+/// A step's dot: tool calls by state, prompts while waiting, messages grey.
+fn step_color(item: &Item, theme: &Theme) -> Hsla {
+    match item {
+        Item::Tool(tool) => match &tool.result {
+            None if tool.checking => theme.warning,
+            None => theme.blue,
+            Some(r) if r.is_error => theme.danger,
+            Some(_) => theme.success,
+        },
+        Item::Permission(p) if p.decision.is_none() => theme.warning,
+        Item::UserInput(request) if request.resolution == InputResolution::Pending => theme.warning,
+        Item::Plan(_) => theme.blue,
+        Item::Notice { is_error: true, .. } | Item::TurnEnd { is_error: true, .. } => theme.danger,
+        _ => theme.muted_foreground,
+    }
 }
 
 /// A message's time: short in the chat ("14:05" today, "18 Nov 14:05" this
