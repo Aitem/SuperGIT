@@ -1063,12 +1063,12 @@ impl ChatSession {
                 .min_w_0()
                 .gap_1()
                 .text_sm()
-                .child(TextView::markdown(("md", ix), text.clone()).selectable(true))
+                .child(TextView::markdown(("md", ix), text).selectable(true))
                 .when(streaming, |el| {
                     el.child(div().text_color(theme.muted_foreground).child("▍"))
                 })
                 .when(!streaming, |el| {
-                    el.child(message_footer(("response", ix), at, Some(text), &theme))
+                    el.child(message_footer(("response", ix), at, &theme))
                 })
                 .into_any_element(),
             (_, Item::Thinking { .. }) => div()
@@ -1186,7 +1186,7 @@ impl ChatSession {
                         )
                     }),
             )
-            .child(message_footer(("user", ix), at, None, theme))
+            .child(message_footer(("user", ix), at, theme))
             .into_any_element()
     }
 
@@ -1766,12 +1766,11 @@ impl Render for ChatSession {
     }
 }
 
-/// Under a message: when it was sent (the full date on hover) and, for an
-/// agent's message, a copy button.
+/// Under a message: when it was sent (the full date on hover). The text
+/// itself is selectable for copying.
 fn message_footer(
     (kind, ix): (&'static str, usize),
     at: Option<SystemTime>,
-    copy: Option<String>,
     theme: &Theme,
 ) -> impl IntoElement {
     let time = at.map(message_time);
@@ -1786,18 +1785,6 @@ fn message_footer(
                     .opacity(0.8)
                     .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
                     .child(short),
-            )
-        })
-        .when_some(copy, |row, text| {
-            row.child(
-                Button::new(SharedString::from(format!("copy-{kind}-{ix}")))
-                    .label("Copy")
-                    .xsmall()
-                    .ghost()
-                    .tooltip("Copy message")
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
-                    }),
             )
         })
 }
