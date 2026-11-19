@@ -36,6 +36,13 @@ pub fn build(b: *std.Build) void {
     run.setCwd(ghostty.path(""));
     // A new release in build.zig.zon must rebuild (the cwd is no input).
     run.addFileInput(b.path("build.zig.zon"));
+    // The fetched package sits inside SuperGIT's checkout (zig-pkg/), and
+    // Ghostty's build asks git in its build root for its version: git finds
+    // SuperGIT's repository, and on a tagged commit (v0.3.0) Ghostty panics
+    // ("tagged releases must be in vX.Y.Z format matching build.zig") since
+    // the tag is not its own. Point git at no repository: Ghostty then takes
+    // its "git not available" path and builds as its own dev version.
+    run.setEnvironmentVariable("GIT_DIR", "/nonexistent/supergit-not-a-ghostty-repo");
 
     b.installDirectory(.{
         .source_dir = prefix.path(b, "lib"),
