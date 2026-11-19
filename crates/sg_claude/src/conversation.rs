@@ -4,6 +4,8 @@
 //! `~/.claude/projects/…/<session>.jsonl` (used to show history on resume):
 //! both carry Anthropic-style `message` objects.
 
+use std::fs::File;
+use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -321,13 +323,21 @@ fn on_result(c: &mut Conversation, v: &Value) {
 }
 
 /// Rebuild a conversation from a session transcript (for resume).
+///
+/// Reads line by line: transcripts reach tens of megabytes, and reading one
+/// whole leaves that much dirty memory with the allocator after it is freed.
 pub fn from_transcript(path: &Path) -> Result<Conversation> {
-    let text = std::fs::read_to_string(path)?;
+    let mut reader = BufReader::new(File::open(path)?);
     let mut convo = Conversation::new();
     convo.session_id = path.file_stem().map(|s| s.to_string_lossy().into_owned());
     let mut ai_title = None;
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
