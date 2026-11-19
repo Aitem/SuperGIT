@@ -35,6 +35,11 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         run: rustup toolchain install && rustc --version
+      # libghostty-vt (crates/sg_terminal) builds with Zig; keep the version
+      # in step with ci.yml, mise.toml and rust-toolchain.toml.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.platform }}

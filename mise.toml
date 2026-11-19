@@ -1,5 +1,5 @@
 # Toolchains for mise users; keep in step with rust-toolchain.toml (Rust)
-# and CI's setup-zig (Zig, for libghostty-vt in crates/sg_terminal).
+# and setup-zig in ci.yml + release.yml (Zig, for libghostty-vt in crates/sg_terminal).
 [tools]
 rust = "1.100"
 zig = "0.17.1"

@@ -316,8 +316,8 @@ never commit, push or create worktrees there without asking.
 
 - **Toolchain**: rustup only (`rust-toolchain.toml` pins 1.100). Homebrew Rust
   was removed because it shadowed rustup. `mise.toml` pins the same Rust and
-  Zig 0.17.1 (libghostty-vt) for mise users; bump the three places together
-  (`rust-toolchain.toml`, `mise.toml`, CI's setup-zig).
+  Zig 0.17.1 (libghostty-vt) for mise users; bump every pin together
+  (`rust-toolchain.toml`, `mise.toml`, setup-zig in `ci.yml` and `release.yml`).
 - **GPUI version**: `gpui-kit 0.9.1` pins `gpui-pre 0.3.12`. Import GPUI through
   `gpui_kit::*` plus `gpui_kit::prelude::*` (for `when`/`when_some`);
   components via `gpui_kit::component::…`. Do not enable `gpui-kit/test-support`
