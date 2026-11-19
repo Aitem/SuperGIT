@@ -20,6 +20,7 @@ use libghostty_vt::effect::{
 use libghostty_vt::fmt::{Format, Formatter};
 use libghostty_vt::key::{self, Action, Mods};
 use libghostty_vt::mode::Mode;
+use libghostty_vt::mouse;
 use libghostty_vt::point::{Coordinate, Point};
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
 use libghostty_vt::report::{ColorScheme, SizeReportSize};
@@ -263,6 +264,8 @@ pub struct Terminal {
     lines: Vec<Vec<Run>>,
     colors: Colors,
     selecting: Selecting,
+    mouse: mouse::Encoder<'static>,
+    mouse_event: mouse::Event<'static>,
 }
 
 /// Mouse selection: Ghostty's gesture state machine (click counts, word and
@@ -301,8 +304,42 @@ pub struct Surface {
     pub padding: f32,
     pub cell_width: f32,
     pub cell_height: f32,
+    pub width: f32,
     /// The whole view's height (dragging past it scrolls).
     pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    /// The wheel, as programs see it (buttons 4 and 5).
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    /// Movement, with the button held (`None`: no button).
+    Motion,
+}
+
+/// A mouse event for a program that tracks the mouse, at a position in the
+/// view's pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MouseInput {
+    pub action: MouseAction,
+    pub button: Option<MouseButton>,
+    pub x: f32,
+    pub y: f32,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    /// Some button is held (motion while dragging).
+    pub any_pressed: bool,
 }
 
 /// Which way a selection drag past the edge wants the view to scroll.
@@ -422,6 +459,8 @@ impl Terminal {
             lines: Vec::new(),
             colors: colors.clone(),
             selecting: Selecting::new()?,
+            mouse: mouse::Encoder::new()?,
+            mouse_event: mouse::Event::new()?,
         };
         terminal.apply_colors()?;
         terminal.resize(size)?;
@@ -721,6 +760,60 @@ impl Terminal {
     /// The program tracks the mouse itself (mouse reporting modes).
     pub fn tracks_mouse(&self) -> bool {
         self.vt.is_mouse_tracking().unwrap_or(false)
+    }
+
+    /// Bytes reporting a mouse event to a program that tracks the mouse, in
+    /// the protocol it asked for (X10, SGR, …). Empty when the program does
+    /// not want this event (e.g. motion without a button in button mode, or
+    /// motion within the same cell).
+    pub fn encode_mouse(&mut self, input: &MouseInput, surface: &Surface) -> Result<Vec<u8>> {
+        // libghostty measures in whole-pixel cells: positions on our
+        // fractional grid, mapped onto that one.
+        let cell_w = surface.cell_width.round().max(1.);
+        let cell_h = surface.cell_height.round().max(1.);
+        let scale_x = cell_w / surface.cell_width;
+        let scale_y = cell_h / surface.cell_height;
+        let pad = surface.padding;
+        let x = pad + (input.x - pad) * scale_x;
+        let y = pad + (input.y - pad) * scale_y;
+        let mut mods = Mods::empty();
+        mods.set(Mods::SHIFT, input.shift);
+        mods.set(Mods::CTRL, input.ctrl);
+        mods.set(Mods::ALT, input.alt);
+        let button = input.button.map(|button| match button {
+            MouseButton::Left => mouse::Button::Left,
+            MouseButton::Middle => mouse::Button::Middle,
+            MouseButton::Right => mouse::Button::Right,
+            MouseButton::WheelUp => mouse::Button::Four,
+            MouseButton::WheelDown => mouse::Button::Five,
+        });
+        self.mouse_event
+            .set_action(match input.action {
+                MouseAction::Press => mouse::Action::Press,
+                MouseAction::Release => mouse::Action::Release,
+                MouseAction::Motion => mouse::Action::Motion,
+            })
+            .set_button(button)
+            .set_mods(mods)
+            .set_position(mouse::Position { x, y });
+        let padding = pad.round() as u32;
+        self.mouse
+            .set_options_from_terminal(&self.vt)
+            .set_size(mouse::EncoderSize {
+                screen_width: (pad + (surface.width - pad) * scale_x).round().max(1.) as u32,
+                screen_height: (pad + (surface.height - pad) * scale_y).round().max(1.) as u32,
+                cell_width: cell_w as u32,
+                cell_height: cell_h as u32,
+                padding_top: padding,
+                padding_bottom: padding,
+                padding_left: padding,
+                padding_right: padding,
+            })?
+            .set_any_button_pressed(input.any_pressed)
+            .set_track_last_cell(true);
+        let mut out = Vec::new();
+        self.mouse.encode_to_vec(&self.mouse_event, &mut out)?;
+        Ok(out)
     }
 
     /// The cell under a view position, clamped to the grid so drags past

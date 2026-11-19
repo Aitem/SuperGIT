@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_terminal::{
@@ -82,6 +83,9 @@ pub struct TerminalView {
     /// The last drag position in view pixels (autoscroll extends to it).
     drag_at: (f32, f32),
     autoscroll: Option<(sg_terminal::term::SelectScroll, Task<()>)>,
+    /// A button pressed while the program tracks the mouse: its motion and
+    /// release go to the program too.
+    reporting: Option<sg_terminal::MouseButton>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -138,6 +142,7 @@ impl TerminalView {
             selecting: false,
             drag_at: (0., 0.),
             autoscroll: None,
+            reporting: None,
             _subscriptions: subscriptions,
         }
     }
@@ -381,8 +386,56 @@ impl TerminalView {
         Some((f32::from(local.x), f32::from(local.y), surface))
     }
 
+    /// The program gets mouse events while it tracks the mouse; Shift
+    /// selects text anyway (as in other terminals).
+    fn reports_mouse(&self, modifiers: Modifiers) -> bool {
+        self.pty.is_some() && self.terminal.tracks_mouse() && !modifiers.shift
+    }
+
+    fn report_mouse(
+        &mut self,
+        action: sg_terminal::MouseAction,
+        button: Option<sg_terminal::MouseButton>,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+    ) {
+        let Some((x, y, surface)) = self.local(position) else {
+            return;
+        };
+        let input = sg_terminal::MouseInput {
+            action,
+            button,
+            x,
+            y,
+            shift: modifiers.shift,
+            ctrl: modifiers.control,
+            alt: modifiers.alt,
+            any_pressed: self.reporting.is_some(),
+        };
+        if let Ok(bytes) = self.terminal.encode_mouse(&input, &surface) {
+            self.write(bytes);
+        }
+    }
+
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
+        if self.reports_mouse(event.modifiers) {
+            let Some(button) = term_button(event.button) else {
+                return;
+            };
+            self.reporting = Some(button);
+            self.report_mouse(
+                sg_terminal::MouseAction::Press,
+                Some(button),
+                event.position,
+                event.modifiers,
+            );
+            cx.stop_propagation();
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
         let Some((x, y, surface)) = self.local(event.position) else {
             return;
         };
@@ -395,6 +448,22 @@ impl TerminalView {
 
     fn mouse_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if !self.selecting {
+            // Programs that track the mouse: drags with a held button
+            // anywhere, plain movement only over the terminal (the encoder
+            // drops what the program's mode does not ask for).
+            if self.pty.is_some() && self.terminal.tracks_mouse() {
+                let over = self.local(event.position).is_some_and(|(x, y, surface)| {
+                    x >= 0. && y >= 0. && x < surface.width && y < surface.height
+                });
+                if self.reporting.is_some() || over {
+                    self.report_mouse(
+                        sg_terminal::MouseAction::Motion,
+                        self.reporting,
+                        event.position,
+                        event.modifiers,
+                    );
+                }
+            }
             return;
         }
         if event.pressed_button != Some(MouseButton::Left) {
@@ -424,6 +493,17 @@ impl TerminalView {
     fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         if self.selecting && event.button == MouseButton::Left {
             self.end_selection(event.position, cx);
+        }
+        if let Some(button) = self.reporting
+            && term_button(event.button) == Some(button)
+        {
+            self.reporting = None;
+            self.report_mouse(
+                sg_terminal::MouseAction::Release,
+                Some(button),
+                event.position,
+                event.modifiers,
+            );
         }
     }
 
@@ -481,6 +561,24 @@ impl TerminalView {
             return;
         }
         self.scroll_remainder -= line_height * lines;
+        if self.reports_mouse(event.modifiers) {
+            // One wheel "click" per line, up or down.
+            let button = if lines > 0. {
+                sg_terminal::MouseButton::WheelUp
+            } else {
+                sg_terminal::MouseButton::WheelDown
+            };
+            for _ in 0..(lines.abs() as usize) {
+                self.report_mouse(
+                    sg_terminal::MouseAction::Press,
+                    Some(button),
+                    event.position,
+                    event.modifiers,
+                );
+            }
+            cx.stop_propagation();
+            return;
+        }
         // Content moving down (positive delta) shows earlier lines.
         let bytes = self.terminal.scroll(-(lines as isize));
         self.write(bytes);
@@ -509,6 +607,20 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Screenshot builds: `SUPERGIT_DEBUG_TERMINAL=menu` right-clicks the
+    /// selection; this is where, in window coordinates.
+    #[cfg(feature = "screenshot")]
+    pub fn debug_menu_position(&self) -> Option<Point<Pixels>> {
+        let (origin, surface) = self.layout?;
+        Some(
+            origin
+                + point(
+                    px(surface.padding + 10. * surface.cell_width),
+                    px(surface.padding + 1.5 * surface.cell_height),
+                ),
+        )
+    }
+
     /// Run a program again in this terminal (after the last one exited).
     pub fn restart(&mut self, spawn: Spawn, cx: &mut Context<Self>) {
         self.exited = None;
@@ -516,6 +628,16 @@ impl TerminalView {
         self.pty = None;
         self.reader = None;
         self.start(spawn, cx);
+    }
+}
+
+/// GPUI's mouse button as the terminal reports it (back/forward: none).
+fn term_button(button: MouseButton) -> Option<sg_terminal::MouseButton> {
+    match button {
+        MouseButton::Left => Some(sg_terminal::MouseButton::Left),
+        MouseButton::Right => Some(sg_terminal::MouseButton::Right),
+        MouseButton::Middle => Some(sg_terminal::MouseButton::Middle),
+        _ => None,
     }
 }
 
@@ -532,6 +654,9 @@ impl Render for TerminalView {
         let background = hsla(self.screen.background);
         let selection = theme.selection;
         let focused = self.focus.is_focused(window);
+        // Clicks go to a program that tracks the mouse: the arrow, not the
+        // text cursor.
+        let tracking = self.pty.is_some() && self.terminal.tracks_mouse();
         let view = cx.entity();
         let grid = canvas(
             {
@@ -564,6 +689,7 @@ impl Render for TerminalView {
                         padding: PADDING,
                         cell_width: f32::from(cell_width),
                         cell_height: f32::from(line_height),
+                        width: f32::from(bounds.size.width),
                         height: f32::from(bounds.size.height),
                     };
                     let screen = view.update(cx, |view, cx| {
@@ -596,22 +722,46 @@ impl Render for TerminalView {
         )
         .size_full();
 
-        div()
+        let terminal = div()
             .id("terminal")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .size_full()
             .relative()
             .bg(background)
-            .cursor_text()
+            .when(tracking, |el| el.cursor_default())
+            .when(!tracking, |el| el.cursor_text())
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::select_all))
             .on_scroll(cx.listener(Self::scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .child(grid)
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
+            .child(grid);
+        // While a program tracks the mouse, right clicks are its own.
+        if tracking {
+            return terminal.into_any_element();
+        }
+        let focus = self.focus.clone();
+        let this = cx.entity();
+        terminal
+            .context_menu(move |menu, _, cx| {
+                let selected = this.read(cx).terminal.has_selection();
+                context_menu(menu, &focus, selected)
+            })
+            .into_any_element()
     }
+}
+
+/// Right click: what the terminal's own shortcuts do.
+fn context_menu(menu: PopupMenu, focus: &FocusHandle, selected: bool) -> PopupMenu {
+    menu.action_context(focus.clone())
+        .menu_with_disabled("Copy", Box::new(Copy), !selected)
+        .menu("Paste", Box::new(Paste))
+        .separator()
+        .menu("Select All", Box::new(SelectAll))
 }
 
 #[expect(clippy::too_many_arguments, reason = "one paint pass over the grid")]

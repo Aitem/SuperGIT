@@ -10,6 +10,6 @@ pub mod term;
 pub use keys::KeyInput;
 pub use pty::{Pty, PtyEvent, Size, Spawn};
 pub use term::{
-    BlockedOn, Colors, Cursor, CursorShape, Effects, Notification, ProgramState, Rgb, Run, Screen,
-    Scroll, Terminal, UnderlineStyle,
+    BlockedOn, Colors, Cursor, CursorShape, Effects, MouseAction, MouseButton, MouseInput,
+    Notification, ProgramState, Rgb, Run, Screen, Scroll, Terminal, UnderlineStyle,
 };

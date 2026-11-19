@@ -80,9 +80,13 @@ crates/supergit/src/
   word, triple click for a line, Option-drag for a block, autoscroll when
   dragging past the top or bottom. The selection follows the content as
   output arrives, typing drops it, and copy uses libghostty's formatter
-  (plain text, soft-wrapped lines joined, trailing blanks trimmed). Mouse
-  reporting to programs that track the mouse is not implemented; Claude Code
-  doesn't ask for it.
+  (plain text, soft-wrapped lines joined, trailing blanks trimmed). Right
+  click opens Copy, Paste and Select All, with their shortcuts.
+- **Mouse reporting.** Programs that turn on mouse tracking (1000/1002/1003,
+  in X10, SGR, urxvt or SGR-pixel coordinates) get clicks, drags, motion
+  and the wheel, encoded by libghostty; right clicks go to the program
+  then, not to the menu. Shift selects text anyway. Claude
+  Code's inline UI doesn't track the mouse, so selection works without it.
 
 ## Launching the agent
 
@@ -171,7 +175,6 @@ TUI in the terminal.
 
 ## Next
 
-- Mouse reporting for TUIs that track the mouse (Codex may).
 - IME and dead keys (a GPUI `InputHandler`). Plain layouts, Cyrillic
   included, already work through `key_char`.
 - Clickable OSC 8 links and file paths that open in the diff view.

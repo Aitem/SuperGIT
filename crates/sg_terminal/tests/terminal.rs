@@ -196,6 +196,7 @@ const SURFACE: sg_terminal::term::Surface = sg_terminal::term::Surface {
     padding: 6.,
     cell_width: 10.,
     cell_height: 20.,
+    width: 6. + 10. * 40.,
     height: 6. + 20. * 6.,
 };
 
@@ -296,4 +297,66 @@ fn the_selection_stays_on_its_text_as_output_scrolls() {
         term.feed(format!("line {n}\r\n").as_bytes());
     }
     assert_eq!(term.selection_text().unwrap().as_deref(), Some("keep"));
+}
+
+#[test]
+fn mouse_events_reach_programs_that_track_the_mouse() {
+    use sg_terminal::{MouseAction, MouseButton, MouseInput};
+    let mut term = Terminal::new(SIZE, &Colors::default()).unwrap();
+    let (x, y) = at(4, 2);
+    let click = MouseInput {
+        action: MouseAction::Press,
+        button: Some(MouseButton::Left),
+        x,
+        y,
+        shift: false,
+        ctrl: false,
+        alt: false,
+        any_pressed: true,
+    };
+    // Not tracking: nothing to send.
+    assert!(!term.tracks_mouse());
+    assert!(term.encode_mouse(&click, &SURFACE).unwrap().is_empty());
+    // Button tracking with SGR coordinates (1-based column;row).
+    term.feed(b"\x1b[?1002h\x1b[?1006h");
+    assert!(term.tracks_mouse());
+    assert_eq!(
+        term.encode_mouse(&click, &SURFACE).unwrap(),
+        b"\x1b[<0;5;3M"
+    );
+    let release = MouseInput {
+        action: MouseAction::Release,
+        any_pressed: false,
+        ..click
+    };
+    assert_eq!(
+        term.encode_mouse(&release, &SURFACE).unwrap(),
+        b"\x1b[<0;5;3m"
+    );
+    // The wheel is buttons 4 and 5.
+    let wheel = MouseInput {
+        button: Some(MouseButton::WheelUp),
+        any_pressed: false,
+        ..click
+    };
+    assert_eq!(
+        term.encode_mouse(&wheel, &SURFACE).unwrap(),
+        b"\x1b[<64;5;3M"
+    );
+    // Motion without a button is only for any-event tracking (1003).
+    let (x, y) = at(9, 2);
+    let hover = MouseInput {
+        action: MouseAction::Motion,
+        button: None,
+        x,
+        y,
+        any_pressed: false,
+        ..click
+    };
+    assert!(term.encode_mouse(&hover, &SURFACE).unwrap().is_empty());
+    term.feed(b"\x1b[?1003h");
+    assert_eq!(
+        term.encode_mouse(&hover, &SURFACE).unwrap(),
+        b"\x1b[<35;10;3M"
+    );
 }
