@@ -291,6 +291,12 @@ impl ChatSession {
             }
         }
         let queued = std::mem::take(&mut terminal.queued);
+        #[cfg(feature = "screenshot")]
+        if std::env::var("SUPERGIT_DEBUG_TERMINAL").as_deref() == Ok("select")
+            && let Some(view) = terminal.view.clone()
+        {
+            view.update(cx, |view, cx| view.debug_select(cx));
+        }
         if let Some(view) = terminal.view.clone() {
             view.update(cx, |view, _| {
                 for (text, submit) in queued {

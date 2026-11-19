@@ -74,8 +74,15 @@ crates/supergit/src/
 - **Keys.** GPUI dispatches bindings before key listeners, so the
   `Terminal` key context binds `NoAction` to Tab and Shift+Tab (and on Linux
   the app's `ctrl-` shortcuts and `ctrl-c`), handing them to the program.
-  `cmd-c`/`cmd-v` (`ctrl-shift-c/v` on Linux) are copy and paste. Paste is
-  bracketed and sanitized by libghostty.
+  `cmd-c`/`cmd-v`/`cmd-a` (`ctrl-shift-c/v/a` on Linux) copy, paste and
+  select all. Paste is bracketed and sanitized by libghostty.
+- **Selection.** libghostty's selection gestures: drag, double click for a
+  word, triple click for a line, Option-drag for a block, autoscroll when
+  dragging past the top or bottom. The selection follows the content as
+  output arrives, typing drops it, and copy uses libghostty's formatter
+  (plain text, soft-wrapped lines joined, trailing blanks trimmed). Mouse
+  reporting to programs that track the mouse is not implemented; Claude Code
+  doesn't ask for it.
 
 ## Launching the agent
 
@@ -164,9 +171,7 @@ TUI in the terminal.
 
 ## Next
 
-- Mouse selection and copy (libghostty has selection and gesture helpers;
-  `cmd-c` is wired but has no selection yet), and mouse reporting for TUIs
-  that ask for it.
+- Mouse reporting for TUIs that track the mouse (Codex may).
 - IME and dead keys (a GPUI `InputHandler`). Plain layouts, Cyrillic
   included, already work through `key_char`.
 - Clickable OSC 8 links and file paths that open in the diff view.

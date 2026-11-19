@@ -20,7 +20,7 @@ use sg_terminal::{
     UnderlineStyle as TermUnderline,
 };
 
-actions!(terminal, [Copy, Paste]);
+actions!(terminal, [Copy, Paste, SelectAll]);
 
 /// The key context terminal views set: `main.rs` binds `Copy`/`Paste` in
 /// it, and gives it the keys other bindings would take (Tab, and Linux's
@@ -29,6 +29,8 @@ pub const KEY_CONTEXT: &str = "Terminal";
 
 /// Space around the grid.
 const PADDING: f32 = 6.;
+/// How often a selection drag past an edge scrolls by a line.
+const AUTOSCROLL_EVERY: Duration = Duration::from_millis(60);
 /// The longest a program may hold a synchronized frame back.
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -72,6 +74,14 @@ pub struct TerminalView {
     last_output: Option<Instant>,
     last_input: Option<Instant>,
     dark: bool,
+    /// Where the grid was last laid out: the view's origin in the window and
+    /// its cell geometry, for turning mouse positions into cells.
+    layout: Option<(Point<Pixels>, sg_terminal::term::Surface)>,
+    /// A selection drag is in progress (left button held since a press here).
+    selecting: bool,
+    /// The last drag position in view pixels (autoscroll extends to it).
+    drag_at: (f32, f32),
+    autoscroll: Option<(sg_terminal::term::SelectScroll, Task<()>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -124,6 +134,10 @@ impl TerminalView {
             last_output: None,
             last_input: None,
             dark: colors.dark,
+            layout: None,
+            selecting: false,
+            drag_at: (0., 0.),
+            autoscroll: None,
             _subscriptions: subscriptions,
         }
     }
@@ -327,6 +341,8 @@ impl TerminalView {
         };
         match self.terminal.encode_key(&input) {
             Ok(bytes) if !bytes.is_empty() => {
+                // As in Ghostty: typing drops the selection.
+                self.terminal.clear_selection();
                 self.terminal.scroll_to_bottom();
                 self.last_input = Some(Instant::now());
                 self.write(bytes);
@@ -339,6 +355,7 @@ impl TerminalView {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.terminal.clear_selection();
             self.terminal.scroll_to_bottom();
             self.last_input = Some(Instant::now());
             self.paste_text(&text);
@@ -346,9 +363,114 @@ impl TerminalView {
         }
     }
 
-    fn copy(&mut self, _: &Copy, _: &mut Window, _: &mut Context<Self>) {
-        // Selection is not drawn yet; Claude Code copies with its own `/copy`
-        // (OSC 52), which lands on the clipboard.
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(Some(text)) = self.terminal.selection_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.terminal.select_all();
+        cx.notify();
+    }
+
+    /// A window position in the view's pixels, with the grid's geometry.
+    fn local(&self, position: Point<Pixels>) -> Option<(f32, f32, sg_terminal::term::Surface)> {
+        let (origin, surface) = self.layout?;
+        let local = position - origin;
+        Some((f32::from(local.x), f32::from(local.y), surface))
+    }
+
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        let Some((x, y, surface)) = self.local(event.position) else {
+            return;
+        };
+        if self.terminal.select_press(x, y, &surface).is_ok() {
+            self.selecting = true;
+            self.drag_at = (x, y);
+        }
+        cx.notify();
+    }
+
+    fn mouse_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            // The button came up outside the window.
+            self.end_selection(event.position, cx);
+            return;
+        }
+        let Some((x, y, surface)) = self.local(event.position) else {
+            return;
+        };
+        self.drag_at = (x, y);
+        let m = event.modifiers;
+        // Block selection: Option on macOS, Ctrl/Super+Alt elsewhere (as in
+        // Ghostty).
+        let rectangle = if cfg!(target_os = "macos") {
+            m.alt
+        } else {
+            m.alt && (m.control || m.platform)
+        };
+        match self.terminal.select_drag(x, y, rectangle, &surface) {
+            Ok(Some(direction)) => self.start_autoscroll(direction, cx),
+            _ => self.autoscroll = None,
+        }
+        cx.notify();
+    }
+
+    fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.selecting && event.button == MouseButton::Left {
+            self.end_selection(event.position, cx);
+        }
+    }
+
+    fn end_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selecting = false;
+        self.autoscroll = None;
+        if let Some((x, y, surface)) = self.local(position) {
+            let _ = self.terminal.select_release(x, y, &surface);
+        }
+        cx.notify();
+    }
+
+    /// Dragging past the top or bottom scrolls a line at a time, extending
+    /// the selection, until the pointer comes back or the button is up.
+    fn start_autoscroll(
+        &mut self,
+        direction: sg_terminal::term::SelectScroll,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .autoscroll
+            .as_ref()
+            .is_some_and(|(running, _)| *running == direction)
+        {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_EVERY).await;
+                let going = this.update(cx, |this, cx| {
+                    let Some((_, surface)) = this.layout else {
+                        return false;
+                    };
+                    if !this.selecting {
+                        return false;
+                    }
+                    let (x, y) = this.drag_at;
+                    let _ = this.terminal.select_autoscroll(direction, x, y, &surface);
+                    cx.notify();
+                    true
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        });
+        self.autoscroll = Some((direction, task));
     }
 
     fn scroll_wheel(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -363,6 +485,27 @@ impl TerminalView {
         let bytes = self.terminal.scroll(-(lines as isize));
         self.write(bytes);
         cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Screenshot builds: `SUPERGIT_DEBUG_TERMINAL=select` drags a selection
+    /// over the first rows, as the mouse would (press, drag, release).
+    #[cfg(feature = "screenshot")]
+    pub fn debug_select(&mut self, cx: &mut Context<Self>) {
+        let Some((_, surface)) = self.layout else {
+            return;
+        };
+        let at = |col: f32, row: f32| {
+            (
+                surface.padding + col * surface.cell_width,
+                surface.padding + (row + 0.5) * surface.cell_height,
+            )
+        };
+        let (x, y) = at(0.2, 0.);
+        let (to_x, to_y) = at(24.8, 2.);
+        let _ = self.terminal.select_press(x, y, &surface);
+        let _ = self.terminal.select_drag(to_x, to_y, false, &surface);
+        let _ = self.terminal.select_release(to_x, to_y, &surface);
         cx.notify();
     }
 
@@ -417,7 +560,14 @@ impl Render for TerminalView {
                         cell_width: f32::from(cell_width).round() as u16,
                         cell_height: f32::from(line_height).round() as u16,
                     };
+                    let surface = sg_terminal::term::Surface {
+                        padding: PADDING,
+                        cell_width: f32::from(cell_width),
+                        cell_height: f32::from(line_height),
+                        height: f32::from(bounds.size.height),
+                    };
                     let screen = view.update(cx, |view, cx| {
+                        view.layout = Some((bounds.origin, surface));
                         view.set_size(size, cx);
                         view.frame()
                     });
@@ -428,6 +578,20 @@ impl Render for TerminalView {
                 paint_screen(
                     bounds, &metrics, &screen, &family, focused, selection, window, cx,
                 );
+                // Drags keep extending the selection outside the view (and
+                // the window), so these listen to the whole window.
+                let drag = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        drag.update(cx, |view, cx| view.mouse_drag(event, cx));
+                    }
+                });
+                let up = view.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        up.update(cx, |view, cx| view.mouse_up(event, cx));
+                    }
+                });
             },
         )
         .size_full();
@@ -443,11 +607,9 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::select_all))
             .on_scroll(cx.listener(Self::scroll_wheel))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.focus.focus(window, cx)),
-            )
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .child(grid)
     }
 }

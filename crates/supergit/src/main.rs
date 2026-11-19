@@ -87,12 +87,14 @@ fn bind_terminal_keys(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("cmd-c", terminal::Copy, context),
             KeyBinding::new("cmd-v", terminal::Paste, context),
+            KeyBinding::new("cmd-a", terminal::SelectAll, context),
         ]);
     } else {
         // Ctrl+Shift+C/V copy and paste; plain Ctrl+letters reach the TUI.
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-c", terminal::Copy, context),
             KeyBinding::new("ctrl-shift-v", terminal::Paste, context),
+            KeyBinding::new("ctrl-shift-a", terminal::SelectAll, context),
         ]);
         cx.bind_keys(
             [

@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use libghostty_vt::RenderState;
@@ -16,11 +17,16 @@ use libghostty_vt::effect::{
     PrimaryDeviceAttributes, ProgramStatusKind, ProgramStatusState, SecondaryDeviceAttributes,
     TertiaryDeviceAttributes,
 };
+use libghostty_vt::fmt::{Format, Formatter};
 use libghostty_vt::key::{self, Action, Mods};
 use libghostty_vt::mode::Mode;
+use libghostty_vt::point::{Coordinate, Point};
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
 use libghostty_vt::report::{ColorScheme, SizeReportSize};
 use libghostty_vt::screen::CellWide;
+use libghostty_vt::selection::gesture::{
+    Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
+};
 use libghostty_vt::style::Underline;
 use libghostty_vt::terminal::ScrollViewport;
 
@@ -256,6 +262,54 @@ pub struct Terminal {
     /// Lines drawn last time; only dirty rows are rebuilt.
     lines: Vec<Vec<Run>>,
     colors: Colors,
+    selecting: Selecting,
+}
+
+/// Mouse selection: Ghostty's gesture state machine (click counts, word and
+/// line selection, drags, autoscroll) and its reusable events.
+struct Selecting {
+    gesture: Gesture<'static>,
+    press: PressEvent<'static>,
+    drag: DragEvent<'static>,
+    release: ReleaseEvent<'static>,
+    tick: AutoscrollTickEvent<'static>,
+    /// Gesture times are relative to this.
+    epoch: Instant,
+}
+
+impl Selecting {
+    fn new() -> Result<Self> {
+        let mut press = PressEvent::new()?;
+        // Double and triple clicks: the usual desktop interval.
+        press.set_repeat_interval(Duration::from_millis(500))?;
+        Ok(Self {
+            gesture: Gesture::new()?,
+            press,
+            drag: DragEvent::new()?,
+            release: ReleaseEvent::new()?,
+            tick: AutoscrollTickEvent::new()?,
+            epoch: Instant::now(),
+        })
+    }
+}
+
+/// Where the grid is on the view, in the view's pixels: what mouse
+/// positions are measured against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Surface {
+    /// Space left and above the grid.
+    pub padding: f32,
+    pub cell_width: f32,
+    pub cell_height: f32,
+    /// The whole view's height (dragging past it scrolls).
+    pub height: f32,
+}
+
+/// Which way a selection drag past the edge wants the view to scroll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectScroll {
+    Up,
+    Down,
 }
 
 /// Untrusted text from the program, for showing outside the terminal: no
@@ -367,6 +421,7 @@ impl Terminal {
             shared,
             lines: Vec::new(),
             colors: colors.clone(),
+            selecting: Selecting::new()?,
         };
         terminal.apply_colors()?;
         terminal.resize(size)?;
@@ -663,6 +718,161 @@ impl Terminal {
     }
 
     /// Back to the live screen (typing does this).
+    /// The program tracks the mouse itself (mouse reporting modes).
+    pub fn tracks_mouse(&self) -> bool {
+        self.vt.is_mouse_tracking().unwrap_or(false)
+    }
+
+    /// The cell under a view position, clamped to the grid so drags past
+    /// the edges keep extending to the nearest cell.
+    fn cell_at(&self, x: f32, y: f32, surface: &Surface) -> Coordinate {
+        let cols = self.vt.cols().unwrap_or(1).max(1);
+        let rows = self.vt.rows().unwrap_or(1).max(1);
+        let col = ((x - surface.padding) / surface.cell_width).floor();
+        let row = ((y - surface.padding) / surface.cell_height).floor();
+        Coordinate {
+            x: col.clamp(0., f32::from(cols - 1)) as u16,
+            y: row.clamp(0., f32::from(rows - 1)) as u32,
+        }
+    }
+
+    /// libghostty measures in whole-pixel cells: a position on our
+    /// fractional grid, mapped onto that one.
+    fn gesture_position(x: f32, y: f32, surface: &Surface) -> (f64, f64) {
+        let cell = surface.cell_width.round().max(1.);
+        let x = surface.padding + (x - surface.padding) / surface.cell_width * cell;
+        (f64::from(x), f64::from(y))
+    }
+
+    fn geometry(&self, surface: &Surface) -> Geometry {
+        Geometry {
+            columns: u32::from(self.vt.cols().unwrap_or(1).max(1)),
+            cell_width: surface.cell_width.round().max(1.) as u32,
+            padding_left: surface.padding.round() as u32,
+            screen_height: surface.height.round().max(1.) as u32,
+        }
+    }
+
+    /// Mouse button down: starts a selection (a click clears one; a double
+    /// click selects a word, a triple click the line).
+    pub fn select_press(&mut self, x: f32, y: f32, surface: &Surface) -> Result<()> {
+        let at = self.cell_at(x, y, surface);
+        let (px, py) = Self::gesture_position(x, y, surface);
+        let selecting = &mut self.selecting;
+        let grid_ref = self.vt.grid_ref(Point::Viewport(at))?;
+        let selection = selecting
+            .press
+            .set_repeat_distance(f64::from(surface.cell_width))?
+            .set_time(selecting.epoch.elapsed())?
+            .set_position(px, py)?
+            .apply(&mut selecting.gesture, &self.vt, grid_ref)?;
+        self.vt.set_selection(selection.as_ref())?;
+        self.lines.clear();
+        Ok(())
+    }
+
+    /// Mouse moved with the button down. `rectangle`: a block selection
+    /// (Option on macOS). Returns where to autoscroll, if past an edge.
+    pub fn select_drag(
+        &mut self,
+        x: f32,
+        y: f32,
+        rectangle: bool,
+        surface: &Surface,
+    ) -> Result<Option<SelectScroll>> {
+        let at = self.cell_at(x, y, surface);
+        let (px, py) = Self::gesture_position(x, y, surface);
+        let geometry = self.geometry(surface);
+        let selecting = &mut self.selecting;
+        let grid_ref = self.vt.grid_ref(Point::Viewport(at))?;
+        let selection = selecting
+            .drag
+            .set_rectangle(rectangle)?
+            .set_position(px, py)?
+            .apply(&mut selecting.gesture, &self.vt, grid_ref, geometry)?;
+        self.vt.set_selection(selection.as_ref())?;
+        self.lines.clear();
+        Ok(match selecting.gesture.autoscroll(&self.vt)? {
+            Autoscroll::Up => Some(SelectScroll::Up),
+            Autoscroll::Down => Some(SelectScroll::Down),
+            _ => None,
+        })
+    }
+
+    /// While a drag is past an edge: scroll one line and extend the
+    /// selection to the pointer's cell.
+    pub fn select_autoscroll(
+        &mut self,
+        direction: SelectScroll,
+        x: f32,
+        y: f32,
+        surface: &Surface,
+    ) -> Result<()> {
+        self.vt
+            .scroll_viewport(ScrollViewport::Delta(match direction {
+                SelectScroll::Up => -1,
+                SelectScroll::Down => 1,
+            }));
+        let at = self.cell_at(x, y, surface);
+        let geometry = self.geometry(surface);
+        let (px, py) = Self::gesture_position(x, y, surface);
+        let selecting = &mut self.selecting;
+        let selection = selecting.tick.set_position(px, py)?.apply(
+            &mut selecting.gesture,
+            &self.vt,
+            at,
+            geometry,
+        )?;
+        self.vt.set_selection(selection.as_ref())?;
+        self.lines.clear();
+        Ok(())
+    }
+
+    /// Mouse button up: the gesture ends; the selection stays.
+    pub fn select_release(&mut self, x: f32, y: f32, surface: &Surface) -> Result<()> {
+        let at = self.cell_at(x, y, surface);
+        let selecting = &mut self.selecting;
+        let grid_ref = self.vt.grid_ref(Point::Viewport(at)).ok();
+        selecting
+            .release
+            .apply(&mut selecting.gesture, &self.vt, grid_ref)?;
+        Ok(())
+    }
+
+    pub fn select_all(&mut self) -> Result<()> {
+        let all = self.vt.select_all()?;
+        self.vt.set_selection(all.as_ref())?;
+        self.lines.clear();
+        Ok(())
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.vt
+            .selection()
+            .is_ok_and(|selection| selection.is_some())
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.has_selection() {
+            let _ = self.vt.set_selection(None);
+            self.lines.clear();
+        }
+    }
+
+    /// The selected text as plain text for the clipboard: soft-wrapped lines
+    /// joined, trailing blanks trimmed.
+    pub fn selection_text(&self) -> Result<Option<String>> {
+        let Some(mut formatter) = Formatter::new_selection(&self.vt)? else {
+            return Ok(None);
+        };
+        formatter
+            .set_format(Format::Plain)?
+            .set_unwrap(true)?
+            .set_trim(true)?;
+        let bytes = formatter.format_alloc(None)?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
     pub fn scroll_to_bottom(&mut self) {
         self.vt.scroll_viewport(ScrollViewport::Bottom);
     }
