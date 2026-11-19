@@ -10,6 +10,7 @@ mod options;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::agent_context::{Attachment, MAX_ATTACHMENTS};
 use crate::attention::{Attention, Kind};
@@ -20,6 +21,7 @@ use gpui_kit::component::diff::{Diff, DiffState};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -963,7 +965,7 @@ impl ChatSession {
             .enumerate()
             .rev()
             .find_map(|(ix, item)| {
-                if let Item::User { text } = item {
+                if let Item::User { text, .. } = item {
                     Some((ix, text))
                 } else {
                     None
@@ -1020,8 +1022,17 @@ impl ChatSession {
             return div().into_any_element();
         };
         let theme = cx.theme().clone();
+        // Tool calls run together; messages and cards get some air, a new
+        // user turn the most. (The scroller's own row gap is turned off.)
+        let (top, bottom) = match &item {
+            Item::Tool(_) | Item::Thinking { .. } => (px(2.), px(2.)),
+            Item::User { .. } => (px(10.), px(4.)),
+            Item::Text { .. } => (px(6.), px(6.)),
+            Item::Notice { .. } | Item::TurnEnd { .. } => (px(4.), px(4.)),
+            Item::Permission(_) | Item::UserInput(_) | Item::Plan(_) => (px(6.), px(6.)),
+        };
         let body = match item {
-            Item::User { text } => {
+            Item::User { text, at } => {
                 let attached = text.split_once(crate::agent_context::CONTEXT_MARKER);
                 let expanded = self.expanded.contains(&ix);
                 let display = if expanded {
@@ -1043,8 +1054,9 @@ impl ChatSession {
                             .text_color(theme.secondary_foreground)
                             .child(message_label(
                                 "You",
-                                ("copy-user", ix),
+                                ("user", ix),
                                 display.clone(),
+                                at,
                                 &theme,
                             ))
                             .child(
@@ -1069,14 +1081,19 @@ impl ChatSession {
                     )
                     .into_any_element()
             }
-            Item::Text { text, streaming } => v_flex()
+            Item::Text {
+                text,
+                streaming,
+                at,
+            } => v_flex()
                 .min_w_0()
                 .gap_1()
                 .text_sm()
                 .child(message_label(
                     self.provider().label(),
-                    ("copy-response", ix),
+                    ("response", ix),
                     text.clone(),
+                    at,
                     &theme,
                 ))
                 .child(TextView::markdown(("md", ix), text).selectable(true))
@@ -1130,7 +1147,12 @@ impl ChatSession {
                     .into_any_element()
             }
         };
-        div().px_4().py_1p5().child(body).into_any_element()
+        div()
+            .px_4()
+            .pt(top)
+            .pb(bottom)
+            .child(body)
+            .into_any_element()
     }
 
     fn render_tool(
@@ -1593,37 +1615,59 @@ impl Render for ChatSession {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .child(MessageScroller::new(
-                        "chat-messages",
-                        self.scroller.clone(),
-                        cx.processor(|this, ix: usize, window, cx| {
-                            this.render_item(ix, window, cx)
-                        }),
-                    ))
+                    .child(
+                        MessageScroller::new(
+                            "chat-messages",
+                            self.scroller.clone(),
+                            cx.processor(|this, ix: usize, window, cx| {
+                                this.render_item(ix, window, cx)
+                            }),
+                        )
+                        // Its 32px between rows made runs of tool calls sparse;
+                        // `render_item` spaces rows by kind instead.
+                        .with_row_style(StyleRefinement::default().pb(px(0.))),
+                    )
                     .into_any_element()
             })
             .child(self.render_composer(cx))
     }
 }
 
+/// Who wrote a message, when (the full date on hover) and a copy button.
 fn message_label(
     label: &str,
-    id: (&'static str, usize),
+    (kind, ix): (&'static str, usize),
     text: String,
+    at: Option<SystemTime>,
     theme: &Theme,
 ) -> impl IntoElement {
+    let time = at.map(message_time);
     h_flex()
         .justify_between()
         .gap_2()
         .child(
-            div()
+            h_flex()
+                .gap_1p5()
+                .min_w_0()
                 .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.muted_foreground)
-                .child(label.to_string()),
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(label.to_string()),
+                )
+                .when_some(time, |row, (short, full)| {
+                    row.child(
+                        div()
+                            .id(SharedString::from(format!("time-{kind}-{ix}")))
+                            .opacity(0.8)
+                            .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                            .child(short),
+                    )
+                }),
         )
         .child(
-            Button::new(id)
+            Button::new(SharedString::from(format!("copy-{kind}-{ix}")))
                 .label("Copy")
                 .xsmall()
                 .ghost()
@@ -1632,6 +1676,24 @@ fn message_label(
                     cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
                 }),
         )
+}
+
+/// A message's time: short in the chat ("14:05" today, "18 Nov 14:05" this
+/// year, "2025-11-18 14:05" before), and in full for the tooltip.
+fn message_time(at: SystemTime) -> (String, String) {
+    let at = chrono::DateTime::<chrono::Local>::from(at);
+    let now = chrono::Local::now();
+    let short = if at.date_naive() == now.date_naive() {
+        at.format("%H:%M")
+    } else if at.format("%Y").to_string() == now.format("%Y").to_string() {
+        at.format("%-d %b %H:%M")
+    } else {
+        at.format("%Y-%m-%d %H:%M")
+    };
+    (
+        short.to_string(),
+        at.format("%A, %-d %B %Y, %H:%M:%S").to_string(),
+    )
 }
 
 fn plain_message_html(text: &str) -> String {

@@ -6205,6 +6205,7 @@ name = "sg_claude"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "serde_json",
  "sg_agents",
@@ -6532,6 +6533,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
+ "chrono",
  "futures",
  "gpui-kit",
  "gpui-pre-platform",

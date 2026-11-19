@@ -110,13 +110,10 @@ fn streams_a_turn_with_approvals_and_tools() {
         ],
     );
     assert!(replies.is_empty());
-    assert_eq!(
-        c.items[1],
-        Item::Text {
-            text: "I’ll create".into(),
-            streaming: true
-        }
-    );
+    assert!(matches!(
+        &c.items[1],
+        Item::Text { text, streaming: true, at: Some(_) } if text == "I’ll create"
+    ));
 
     feed(
         &mut fold,
@@ -134,13 +131,10 @@ fn streams_a_turn_with_approvals_and_tools() {
             json!({"method": "item/fileChange/requestApproval", "id": 0, "params": {"threadId": THREAD, "turnId": TURN, "itemId": "exec-a6", "startedAtMs": 1, "reason": null, "grantRoot": null}}),
         ],
     );
-    assert_eq!(
-        c.items[1],
-        Item::Text {
-            text: "I’ll create a.txt and read it back.\n".into(),
-            streaming: false
-        }
-    );
+    assert!(matches!(
+        &c.items[1],
+        Item::Text { text, streaming: false, .. } if text == "I’ll create a.txt and read it back.\n"
+    ));
     assert_eq!(c.status, Status::NeedsPermission);
     let p = c.pending_permission().unwrap().clone();
     assert_eq!(p.request_id, "0");
@@ -234,11 +228,10 @@ fn streams_a_turn_with_approvals_and_tools() {
             ..
         })
     ));
-    assert!(c.items.iter().any(|i| *i
-        == Item::Text {
-            text: "done".into(),
-            streaming: false
-        }));
+    assert!(c.items.iter().any(|i| matches!(
+        i,
+        Item::Text { text, streaming: false, .. } if text == "done"
+    )));
     assert!(
         !c.items
             .iter()
@@ -403,7 +396,7 @@ fn rebuilds_history_from_turns() {
                 {"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": "Review it"}]},
                 {"type": "agentMessage", "id": "m1", "text": "Reading the skill first.", "phase": "commentary"},
             ]}),
-            json!({"id": "t2", "status": "completed", "items": [
+            json!({"id": "t2", "status": "completed", "startedAt": 1_795_076_496_u64, "completedAt": 1_795_076_520_u64, "items": [
                 {"type": "userMessage", "id": "u2", "content": [{"type": "text", "text": "Continue"}]},
                 {"type": "reasoning", "id": "r1", "summary": [], "content": []},
                 {"type": "commandExecution", "id": "c1", "command": "/bin/zsh -lc 'ls'", "cwd": "/w/repo", "status": "completed", "aggregatedOutput": "a\n", "exitCode": 0},
@@ -424,7 +417,7 @@ fn rebuilds_history_from_turns() {
         .items
         .iter()
         .map(|i| match i {
-            Item::User { text } => format!("user:{text}"),
+            Item::User { text, .. } => format!("user:{text}"),
             Item::Text { text, .. } => format!("text:{text}"),
             Item::Thinking { .. } => "thinking".into(),
             Item::Tool(t) => format!("tool:{}", t.name),
@@ -446,6 +439,19 @@ fn rebuilds_history_from_turns() {
             "notice:boom",
         ]
     );
+    let at = |text: &str| {
+        c.items.iter().find_map(|i| match i {
+            Item::User { text: t, at } | Item::Text { text: t, at, .. } if t == text => {
+                Some(at.map(|at| at.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))
+            }
+            _ => None,
+        })
+    };
+    // A user turn at the turn's start, the answer at its end; turns without
+    // times stay undated rather than "now".
+    assert_eq!(at("Continue"), Some(Some(1_795_076_496)));
+    assert_eq!(at("Done."), Some(Some(1_795_076_520)));
+    assert_eq!(at("Review it"), Some(None));
     let edit = c.tool("f1").unwrap();
     assert!(
         tools::edit_patch(edit, c.cwd.as_deref())

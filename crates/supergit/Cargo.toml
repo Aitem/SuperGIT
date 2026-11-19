@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# Local times of chat messages.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

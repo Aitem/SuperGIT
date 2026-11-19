@@ -343,14 +343,24 @@ pub fn from_transcript(path: &Path) -> Result<Conversation> {
                 .and_then(Value::as_str)
                 .map(String::from);
         }
+        convo.replay_at(line_time(&v));
         apply_inner(&mut convo, &v, false);
     }
+    convo.go_live();
     if ai_title.is_some() {
         convo.title = ai_title;
     }
     convo.finish_streaming();
     convo.status = Status::Idle;
     Ok(convo)
+}
+
+/// A transcript line's `timestamp` (RFC 3339, UTC).
+fn line_time(v: &Value) -> Option<std::time::SystemTime> {
+    let text = v.get("timestamp")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(Into::into)
 }
 
 fn control_response(v: &Value) -> Option<Reply> {
@@ -391,13 +401,10 @@ mod tests {
                 json!({"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}}),
             ],
         );
-        assert_eq!(
-            c.items[1],
-            Item::Text {
-                text: "Hello".into(),
-                streaming: true
-            }
-        );
+        assert!(matches!(
+            &c.items[1],
+            Item::Text { text, streaming: true, .. } if text == "Hello"
+        ));
         assert_eq!(c.status, Status::Working);
         feed(
             &mut c,
@@ -407,13 +414,10 @@ mod tests {
             ],
         );
         assert_eq!(c.items.len(), 3);
-        assert_eq!(
-            c.items[1],
-            Item::Text {
-                text: "Hello!".into(),
-                streaming: false
-            }
-        );
+        assert!(matches!(
+            &c.items[1],
+            Item::Text { text, streaming: false, .. } if text == "Hello!"
+        ));
         assert!(matches!(
             c.items[2],
             Item::TurnEnd {
@@ -496,13 +500,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sess-1.jsonl");
         let lines = [
-            json!({"type":"user","cwd":"/r","message":{"role":"user","content":"Fix the bug"}}),
+            json!({"type":"user","cwd":"/r","timestamp":"2026-11-19T08:21:36.123Z","message":{"role":"user","content":"Fix the bug"}}),
             json!({"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>x</system-reminder>"}}),
             json!({"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"thinking","thinking":""}]}}),
             json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}),
             json!({"type":"user","toolUseResult":{"stdout":"ok"},"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}]}}),
             json!({"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent noise"}]}}),
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Fixed."}]}}),
+            json!({"type":"assistant","timestamp":"2026-11-19T08:22:00Z","message":{"content":[{"type":"text","text":"Fixed."}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Undated."}]}}),
             json!({"type":"ai-title","aiTitle":"Bug fix"}),
         ];
         let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
@@ -526,8 +531,20 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, ["user", "thinking", "tool", "text"]);
+        assert_eq!(kinds, ["user", "thinking", "tool", "text", "text"]);
         assert_eq!(c.tool("t1").unwrap().result.as_ref().unwrap().text, "ok");
+        let unix = |item: &Item| match item {
+            Item::User { at, .. } | Item::Text { at, .. } => at.map(|at| {
+                at.duration_since(std::time::UNIX_EPOCH)
+                    .expect("after 1970")
+                    .as_millis()
+            }),
+            _ => None,
+        };
+        assert_eq!(unix(&c.items[0]), Some(1_795_076_496_123));
+        assert_eq!(unix(&c.items[3]), Some(1_795_076_520_000));
+        // History without a timestamp is undated, not "now".
+        assert_eq!(unix(&c.items[4]), None);
     }
 
     #[test]
