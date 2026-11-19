@@ -87,15 +87,19 @@ impl History {
         {
             return self.clone();
         }
+        // The commit walk and the fork point read different refs: both at once.
+        let (commits, fork) = sg_git::parallel::join(
+            || sg_git::history(path, limit.saturating_add(1)),
+            || sg_git::fork(path),
+        );
         let mut has_more = false;
-        let commits = sg_git::history(path, limit.saturating_add(1))
+        let commits = commits
             .map(|mut commits| {
                 has_more = commits.len() > limit;
                 commits.truncate(limit);
                 Arc::new(commits)
             })
             .map_err(git_error_message);
-        let fork = sg_git::fork(path);
         // Read the refs on both sides of a miss. If a fetch changes the graph
         // during the walk, refresh it again next time instead of caching it.
         let cached = if commits.is_ok() && fork.is_ok() {

@@ -681,20 +681,23 @@ impl SuperGitApp {
             let open = listed.is_some_and(PullRequest::is_open);
             self.ensure_pr_details(root.clone(), number, open, cx);
             // The details carry the freshest head (a push changes the diff)
-            // and the base commit the diff starts from: wait for them,
-            // unless they failed.
+            // and the base commit the diff starts from. Until they arrive,
+            // the listed head starts the tab's own requests alongside them:
+            // GitHub's diff, commits and viewed state need nothing else, and
+            // whatever a newer head changes is fetched again.
             let loaded = self.pulls.details.get(&number);
+            let failed = loaded.is_some_and(|l| l.details.error().is_some());
             let target = match loaded.and_then(|l| l.details.value()) {
                 Some(details) => Some((details.pr.clone(), details.base_oid.clone())),
-                None if loaded.is_some_and(|l| l.details.error().is_some()) => {
-                    listed.map(|pr| (pr.clone(), String::new()))
-                }
-                None => None,
+                None => listed.map(|pr| (pr.clone(), String::new())),
             };
             if let Some((pr, base_oid)) = target {
                 match self.pulls.tab {
                     DetailsTab::Files => {
-                        self.ensure_pr_file_review(root.clone(), &pr, &base_oid, cx);
+                        // Without details the viewed state cannot be shown.
+                        if !failed || !base_oid.is_empty() {
+                            self.ensure_pr_file_review(root.clone(), &pr, &base_oid, cx);
+                        }
                         self.ensure_pr_patch(root, &pr, base_oid, cx);
                     }
                     DetailsTab::Commits => self.ensure_pr_commits(root, &pr, cx),
@@ -745,19 +748,33 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) {
         let number = pr.number;
-        let due = match self.pulls.patches.get(&number) {
-            None => true,
-            Some(p) => {
-                p.head != pr.head_oid
-                    || p.base_oid != base_oid
-                    || (p.patch.error().is_some() && p.at.elapsed() > PATCH_RETRY)
-            }
-        };
         let running = self
             .pulls
             .patch_task
             .as_ref()
             .is_some_and(|(n, _)| *n == number);
+        let due = match self.pulls.patches.get_mut(&number) {
+            None => true,
+            // Loaded before the details named the base: GitHub's diff does
+            // not depend on it, only the merge base difftastic reads from.
+            Some(p)
+                if !running
+                    && p.head == pr.head_oid
+                    && p.base_oid.is_empty()
+                    && !base_oid.is_empty()
+                    && !p.local
+                    && p.patch.value().is_some() =>
+            {
+                p.base_oid = base_oid.clone();
+                self.adopt_pr_base(root.clone(), pr, base_oid.clone(), cx);
+                false
+            }
+            Some(p) => {
+                p.head != pr.head_oid
+                    || (p.base_oid != base_oid && !base_oid.is_empty())
+                    || (p.patch.error().is_some() && p.at.elapsed() > PATCH_RETRY)
+            }
+        };
         if !due || running {
             return;
         }
@@ -770,9 +787,13 @@ impl SuperGitApp {
                 .spawn(async move {
                     let (root, head, base_oid) = request;
                     // The PR's diff is its head against this merge base:
-                    // the local repository often has both commits.
-                    let merge_base = sg_git::pr_merge_base(&root, &base_oid, &base, &head);
-                    let result = match sg_github::pr_diff(&root, number) {
+                    // the local repository often has both commits. Found
+                    // while GitHub sends the diff.
+                    let (merge_base, diff) = sg_git::parallel::join(
+                        || sg_git::pr_merge_base(&root, &base_oid, &base, &head),
+                        || sg_github::pr_diff(&root, number),
+                    );
+                    let result = match diff {
                         Ok(patch) => Ok((sg_git::inline_submodules(&root, &patch, None), false)),
                         Err(remote) => match &merge_base {
                             Ok(from) => sg_git::range_patch(&root, from, &head)
@@ -849,6 +870,45 @@ impl SuperGitApp {
             .ok();
         });
         self.pulls.patch_task = Some((number, task));
+    }
+
+    /// The merge base of a diff loaded before its base commit was known,
+    /// now that it is.
+    fn adopt_pr_base(
+        &mut self,
+        root: PathBuf,
+        pr: &PullRequest,
+        base_oid: String,
+        cx: &mut Context<Self>,
+    ) {
+        let number = pr.number;
+        let head = pr.head_oid.clone();
+        let request = (root, base_oid.clone(), pr.base_branch.clone(), head.clone());
+        cx.spawn(async move |this, cx| {
+            let merge_base = cx
+                .background_executor()
+                .spawn(async move {
+                    let (root, base_oid, base, head) = request;
+                    sg_git::pr_merge_base(&root, &base_oid, &base, &head).ok()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(patch) = this
+                    .pulls
+                    .patches
+                    .get_mut(&number)
+                    .filter(|p| p.head == head && p.base_oid == base_oid)
+                else {
+                    return;
+                };
+                if patch.merge_base != merge_base {
+                    patch.merge_base = merge_base;
+                    this.refresh_difft(FileList::Pull, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Put PR `number`'s patch into the diff view (once per head), then
@@ -986,21 +1046,43 @@ impl SuperGitApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // Every branch and linked PR at once: one `gh` call each.
+                    // A linked PR a branch also lists is fetched twice.
+                    let linked: Vec<u64> = request
+                        .linked
+                        .iter()
+                        .copied()
+                        .filter(|number| !known.contains(number))
+                        .collect();
+                    let (branches, linked) = sg_git::parallel::join(
+                        || {
+                            sg_git::parallel::map(&request.heads, |head| {
+                                sg_github::list_branch_prs(&request_root, head, BRANCH_LIMIT)
+                            })
+                        },
+                        || {
+                            sg_git::parallel::map(&linked, |&number| {
+                                sg_github::view_pr(&request_root, number)
+                            })
+                        },
+                    );
                     let mut prs: Vec<PullRequest> = Vec::new();
                     let mut error = None;
-                    for head in &request.heads {
-                        match sg_github::list_branch_prs(&request_root, head, BRANCH_LIMIT) {
-                            Ok(found) => merge_prs(&mut prs, found),
-                            Err(e) => error = Some(format!("{e:#}")),
+                    for found in branches {
+                        match found {
+                            Ok(Ok(found)) => merge_prs(&mut prs, found),
+                            Ok(Err(e)) => error = Some(format!("{e:#}")),
+                            Err(_) => error = Some("gh pr list panicked".into()),
                         }
                     }
-                    for &number in &request.linked {
-                        if known.contains(&number) || prs.iter().any(|p| p.number == number) {
-                            continue;
-                        }
-                        match sg_github::view_pr(&request_root, number) {
-                            Ok(pr) => prs.push(pr),
-                            Err(e) => error = Some(format!("{e:#}")),
+                    for pr in linked {
+                        match pr {
+                            Ok(Ok(pr)) if !prs.iter().any(|p| p.number == pr.number) => {
+                                prs.push(pr)
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => error = Some(format!("{e:#}")),
+                            Err(_) => error = Some("gh pr view panicked".into()),
                         }
                     }
                     match error {

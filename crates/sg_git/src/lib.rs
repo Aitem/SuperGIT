@@ -21,6 +21,7 @@ mod log;
 mod native_refs;
 #[cfg(feature = "git2-probe")]
 mod native_status;
+pub mod parallel;
 #[cfg(feature = "git2-probe")]
 pub use native_status::read_fixture as probe_native_status;
 mod rebase;

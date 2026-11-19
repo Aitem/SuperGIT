@@ -190,6 +190,24 @@ pub fn inline_submodules(worktree: &Path, patch: &str, status: Option<&WorktreeS
             chunks.insert(at, chunk);
         }
     }
+    // Each submodule is a repository of its own, read a few at a time
+    // (several Git calls each); the patch keeps their order.
+    let links: Vec<(Gitlink, SubmoduleFlags)> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.gitlink.clone())
+        .map(|gitlink| {
+            let flags = status
+                .and_then(|status| status.files.iter().find(|f| f.path == gitlink.path))
+                .and_then(|file| file.submodule)
+                .unwrap_or_default();
+            (gitlink, flags)
+        })
+        .collect();
+    let mut inspected = crate::parallel::map(&links, |(gitlink, flags)| {
+        inspect(worktree, gitlink.clone(), status.is_some(), *flags)
+    })
+    .into_iter()
+    .map(|result| result.unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
     let mut text = String::with_capacity(patch.len());
     let mut submodules = Vec::new();
     for chunk in chunks {
@@ -197,14 +215,12 @@ pub fn inline_submodules(worktree: &Path, patch: &str, status: Option<&WorktreeS
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        let Some(gitlink) = chunk.gitlink else {
+        if chunk.gitlink.is_none() {
+            continue;
+        }
+        let Some((change, inner)) = inspected.next() else {
             continue;
         };
-        let flags = status
-            .and_then(|status| status.files.iter().find(|f| f.path == gitlink.path))
-            .and_then(|file| file.submodule)
-            .unwrap_or_default();
-        let (change, inner) = inspect(worktree, gitlink, status.is_some(), flags);
         text.push_str(&inner);
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');

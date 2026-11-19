@@ -132,24 +132,36 @@ pub fn branch_changes(
             git_bytes_in_index(worktree, args, Some(index))?;
         }
     }
-    let mut args = vec!["diff"];
-    args.extend(PATCH_OPTIONS);
-    args.extend(["--no-textconv", &merge_base, "--"]);
-    let patch = git_bytes_in_index(worktree, args, index.as_deref())?;
-    let patch = inline_submodules(worktree, &String::from_utf8_lossy(&patch), Some(status));
-    let raw = git_bytes_in_index(
-        worktree,
-        [
-            "diff",
-            "--name-status",
-            "-z",
-            "-M",
-            "--submodule=short",
-            &merge_base,
-            "--",
-        ],
-        index.as_deref(),
-    )?;
+    // The patch and the file list read the same (private) index: both at once.
+    let (patch, raw) = crate::parallel::join(
+        || -> Result<Patch> {
+            let mut args = vec!["diff"];
+            args.extend(PATCH_OPTIONS);
+            args.extend(["--no-textconv", &merge_base, "--"]);
+            let patch = git_bytes_in_index(worktree, args, index.as_deref())?;
+            Ok(inline_submodules(
+                worktree,
+                &String::from_utf8_lossy(&patch),
+                Some(status),
+            ))
+        },
+        || {
+            git_bytes_in_index(
+                worktree,
+                [
+                    "diff",
+                    "--name-status",
+                    "-z",
+                    "-M",
+                    "--submodule=short",
+                    &merge_base,
+                    "--",
+                ],
+                index.as_deref(),
+            )
+        },
+    );
+    let (patch, raw) = (patch?, raw?);
     let mut files = parse_name_status(&String::from_utf8_lossy(&raw));
     // A conflicted index may emit multiple records for a path.
     files.sort_by(|a, b| a.path.cmp(&b.path));

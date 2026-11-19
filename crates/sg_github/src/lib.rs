@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
@@ -299,14 +300,22 @@ pub fn noreply_avatar(email: &str) -> Option<(String, String)> {
     }
 }
 
-/// Whether `gh` is installed and on PATH.
+/// Whether `gh` is installed and on PATH. Asked before every PR poll:
+/// once found it is remembered; while missing it is looked for again, so
+/// installing it needs no restart.
 pub fn gh_available() -> bool {
-    Command::new("gh")
+    static FOUND: AtomicBool = AtomicBool::new(false);
+    if FOUND.load(Ordering::Relaxed) {
+        return true;
+    }
+    let found = Command::new("gh")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|s| s.success());
+    FOUND.store(found, Ordering::Relaxed);
+    found
 }
 
 /// Open pull requests plus the most recently merged ones. Two narrow queries

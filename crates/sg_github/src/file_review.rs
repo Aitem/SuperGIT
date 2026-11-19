@@ -22,6 +22,13 @@ pub struct FileReview {
     pub files: HashMap<String, FileViewedState>,
 }
 
+impl FileReview {
+    /// The base commit the viewed state belongs to.
+    pub fn base(&self) -> &str {
+        &self.revision.base_ref_oid
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Revision {
@@ -74,6 +81,8 @@ const REVISION: &str = "query($id:ID!) {
   node(id:$id) { ... on PullRequest { id headRefOid baseRefOid } }
 }";
 
+/// The viewer's viewed state of every file at `head` against `base`; an
+/// empty `base` (not known yet) takes GitHub's, see [`FileReview::base`].
 pub fn pr_file_review(repo: &Path, number: u64, head: &str, base: &str) -> Result<FileReview> {
     load_pages(head, base, |cursor| {
         let mut args = vec![
@@ -103,7 +112,7 @@ fn load_pages(
     let first = page(None)?;
     let revision = first.revision;
     ensure!(
-        revision.head_ref_oid == head && revision.base_ref_oid == base,
+        revision.head_ref_oid == head && (base.is_empty() || revision.base_ref_oid == base),
         "The pull request revision changed. Refresh the diff before reviewing files."
     );
     let mut files = HashMap::new();
@@ -291,5 +300,15 @@ mod tests {
         let repeated =
             load_pages("head", "base", |_| Ok(page("head", "a", "VIEWED", true))).unwrap_err();
         assert!(repeated.to_string().contains("repeated a file cursor"));
+        // Without a known base, GitHub's is taken; the head is still checked.
+        let early = load_pages("head", "", |cursor| {
+            Ok(match cursor {
+                None => page("head", "a", "VIEWED", true),
+                Some(_) => page("head", "b", "UNVIEWED", false),
+            })
+        })
+        .unwrap();
+        assert_eq!(early.base(), "base");
+        assert!(load_pages("moved", "", |_| Ok(page("head", "a", "VIEWED", false))).is_err());
     }
 }
