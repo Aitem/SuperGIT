@@ -82,12 +82,20 @@ impl CodexFold {
         c.cwd = s("cwd").map(PathBuf::from).or(c.cwd.take());
         c.model = s("model").or(c.model.take());
         for turn in &history.turns {
+            let at = |key: &str| {
+                turn.get(key)
+                    .and_then(Value::as_u64)
+                    .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            };
+            let (started, completed) = (at("startedAt"), at("completedAt"));
             for item in turn
                 .get("items")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
             {
+                let user = item.get("type").and_then(Value::as_str) == Some("userMessage");
+                c.replay_at(if user { started } else { completed.or(started) });
                 self.on_item(c, item, false, false);
             }
             match turn.get("status").and_then(Value::as_str) {
@@ -99,6 +107,7 @@ impl CodexFold {
         if let Some(name) = s("name") {
             c.title = Some(short_title(&name));
         }
+        c.go_live();
         c.finish_streaming();
         self.texts.clear();
         self.thinking.clear();
@@ -342,11 +351,15 @@ impl CodexFold {
                     c.items.push(Item::Text {
                         text: text("text").to_string(),
                         streaming: true,
+                        at: c.stamp(),
                     });
                     self.texts.insert(id, c.items.len() - 1);
                 }
                 (false, Some(ix)) => {
-                    if let Some(Item::Text { text: t, streaming }) = c.items.get_mut(ix) {
+                    if let Some(Item::Text {
+                        text: t, streaming, ..
+                    }) = c.items.get_mut(ix)
+                    {
                         *t = text("text").to_string();
                         *streaming = false;
                     }
@@ -354,6 +367,7 @@ impl CodexFold {
                 (false, None) if !text("text").trim().is_empty() => c.items.push(Item::Text {
                     text: text("text").to_string(),
                     streaming: false,
+                    at: c.stamp(),
                 }),
                 _ => {}
             },
@@ -372,6 +386,7 @@ impl CodexFold {
             "plan" if !started && !text("text").trim().is_empty() => c.items.push(Item::Text {
                 text: format!("**Plan**\n\n{}", text("text")),
                 streaming: false,
+                at: c.stamp(),
             }),
             "contextCompaction" if !started => c.push_notice("Conversation compacted", false),
             "enteredReviewMode" if !started => c.push_notice(
@@ -382,6 +397,7 @@ impl CodexFold {
                 c.items.push(Item::Text {
                     text: text("review").to_string(),
                     streaming: false,
+                    at: c.stamp(),
                 })
             }
             _ if tools::is_tool(ty) => {

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -131,10 +132,14 @@ pub struct TurnPlan {
 pub enum Item {
     User {
         text: String,
+        /// When it was sent; `None` in history without timestamps.
+        at: Option<SystemTime>,
     },
     Text {
         text: String,
         streaming: bool,
+        /// When the agent wrote it; `None` in history without timestamps.
+        at: Option<SystemTime>,
     },
     Thinking {
         streaming: bool,
@@ -192,11 +197,30 @@ pub struct Conversation {
     pub total_cost_usd: Option<f64>,
     streaming_text: Option<usize>,
     streaming_thinking: Option<usize>,
+    /// While history is replayed: when its current event happened (`None`
+    /// when unknown). Live events happen now.
+    replay_time: Option<Option<SystemTime>>,
 }
 
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// History is being replayed: stamp what follows with `at` (`None`
+    /// when the history does not say), not with the time it is read.
+    pub fn replay_at(&mut self, at: Option<SystemTime>) {
+        self.replay_time = Some(at);
+    }
+
+    /// Back to live events, stamped as they arrive.
+    pub fn go_live(&mut self) {
+        self.replay_time = None;
+    }
+
+    /// When the event being folded happened.
+    pub fn stamp(&self) -> Option<SystemTime> {
+        self.replay_time.unwrap_or_else(|| Some(SystemTime::now()))
     }
 
     /// Local echo of a turn the user just sent.
@@ -206,6 +230,7 @@ impl Conversation {
         }
         self.items.push(Item::User {
             text: text.to_string(),
+            at: Some(SystemTime::now()),
         });
         if !self.status.is_busy() {
             self.status = Status::Starting;
@@ -219,6 +244,7 @@ impl Conversation {
         }
         self.items.push(Item::User {
             text: text.to_string(),
+            at: self.stamp(),
         });
     }
 
@@ -352,6 +378,7 @@ impl Conversation {
         self.items.push(Item::Text {
             text: String::new(),
             streaming: true,
+            at: self.stamp(),
         });
         self.streaming_text = Some(self.items.len() - 1);
     }
@@ -370,7 +397,10 @@ impl Conversation {
     pub fn complete_text(&mut self, full: &str) {
         match self.streaming_text.take() {
             Some(ix) => {
-                if let Some(Item::Text { text, streaming }) = self.items.get_mut(ix) {
+                if let Some(Item::Text {
+                    text, streaming, ..
+                }) = self.items.get_mut(ix)
+                {
                     *text = full.to_string();
                     *streaming = false;
                 }
@@ -378,6 +408,7 @@ impl Conversation {
             None if !full.trim().is_empty() => self.items.push(Item::Text {
                 text: full.to_string(),
                 streaming: false,
+                at: self.stamp(),
             }),
             None => {}
         }
@@ -513,23 +544,40 @@ mod tests {
         c.start_text();
         c.append_text("Hel");
         c.append_text("lo");
-        assert_eq!(
-            c.items[1],
-            Item::Text {
-                text: "Hello".into(),
-                streaming: true
-            }
-        );
+        assert!(matches!(
+            &c.items[1],
+            Item::Text { text, streaming: true, at: Some(_) } if text == "Hello"
+        ));
         c.complete_text("Hello!");
         c.complete_text("  ");
         assert_eq!(c.items.len(), 2);
-        assert_eq!(
-            c.items[1],
-            Item::Text {
-                text: "Hello!".into(),
-                streaming: false
-            }
-        );
+        assert!(matches!(
+            &c.items[1],
+            Item::Text { text, streaming: false, .. } if text == "Hello!"
+        ));
+    }
+
+    #[test]
+    fn history_keeps_its_own_times() {
+        let then = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut c = Conversation::new();
+        c.replay_at(Some(then));
+        c.push_history_user("old question");
+        c.complete_text("old answer");
+        c.replay_at(None);
+        c.complete_text("undated answer");
+        c.go_live();
+        c.push_user("new question");
+        let times: Vec<_> = c
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::User { at, .. } | Item::Text { at, .. } => *at,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(times[..3], [Some(then), Some(then), None]);
+        assert!(times[3].is_some_and(|at| at > then));
     }
 
     #[test]
