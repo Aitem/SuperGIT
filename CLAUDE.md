@@ -149,7 +149,9 @@ aggregates the rest — the one check to require for merges.
   seconds: core crates don't build GPUI. Check the app crate (`-p supergit`)
   only when you touched it.
 - **Hooks** (`.claude/settings.json`, scripts in `.claude/hooks/`): every
-  edited `.rs` file is rustfmt-ed; while Rust files differ from HEAD, finishing
+  edited `.rs` file is rustfmt-ed — after Edit/Write the file written, after
+  any Bash command (scripts, `sed`) every `.rs` file that differs from HEAD
+  or is new; while Rust files differ from HEAD, finishing
   a turn or running `git commit` first needs `cargo clippy --workspace
   --all-targets -- -D warnings` to pass (exit 2 returns the errors to you).
   `SUPERGIT_NO_RUST_GATE=1` turns the gate off. CI additionally checks
