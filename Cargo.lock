@@ -6254,7 +6254,7 @@ dependencies = [
 
 [[package]]
 name = "sg_agents"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -6262,7 +6262,7 @@ dependencies = [
 
 [[package]]
 name = "sg_claude"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6273,7 +6273,7 @@ dependencies = [
 
 [[package]]
 name = "sg_codex"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -6284,7 +6284,7 @@ dependencies = [
 
 [[package]]
 name = "sg_git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "git2",
@@ -6297,7 +6297,7 @@ dependencies = [
 
 [[package]]
 name = "sg_github"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6307,7 +6307,7 @@ dependencies = [
 
 [[package]]
 name = "sg_terminal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -6599,7 +6599,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supergit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
