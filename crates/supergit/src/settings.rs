@@ -47,14 +47,6 @@ impl Appearance {
         }
     }
 
-    pub fn next(self) -> Self {
-        match self {
-            Self::System => Self::Light,
-            Self::Light => Self::Dark,
-            Self::Dark => Self::System,
-        }
-    }
-
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "system" | "auto" => Some(Self::System),
@@ -188,7 +180,6 @@ mod tests {
         assert_eq!(s.agent_view, AgentView::Chat);
         let s: Settings = serde_json::from_str(r#"{"agent_view":"terminal"}"#).unwrap();
         assert_eq!(s.agent_view, AgentView::Terminal);
-        assert_eq!(Appearance::System.next().next().next(), Appearance::System);
     }
 
     #[test]

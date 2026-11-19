@@ -45,14 +45,14 @@ use sg_github::{PrState, PullRequest};
 use crate::agent_context::{self, Attachment};
 use crate::attention::Kind;
 use crate::avatars;
-use crate::chat::ChatSession;
+use crate::chat::{ChatEvent, ChatSession};
 use crate::difft_view::{self, DifftView};
 use crate::file_tree::{self, TreeRow};
 use crate::graph;
 use crate::launch::{self, TerminalApp};
 use crate::model::{self, Details, History, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::notifications;
-use crate::settings::{Appearance, DiffLayout};
+use crate::settings::DiffLayout;
 use crate::switcher::{self, Destination, Entry};
 use crate::workspace::{self, RepositoryView, ReviewPosition, WindowRect};
 
@@ -527,9 +527,15 @@ impl SuperGitApp {
     }
 
     /// The agent panel's widest size and the main area's width, beside the
-    /// sidebar.
+    /// sidebar and the agent rail.
     fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32) {
-        let total = window.viewport_size().width.as_f32() - self.sidebar_width(cx);
+        // A worktree's agent rail stays at the right edge, panel open or not.
+        let rail = if self.selected.is_some() {
+            RAIL_WIDTH
+        } else {
+            0.
+        };
+        let total = window.viewport_size().width.as_f32() - self.sidebar_width(cx) - rail;
         let show_chat = self.chat_open && self.selected.is_some();
         let saved = self.repository_view();
         let chat_max = (total - 360.).clamp(320., 960.);
@@ -541,8 +547,6 @@ impl SuperGitApp {
                 .map(|v| v.as_f32())
                 .unwrap_or(saved.chat_width)
                 .clamp(320., chat_max)
-        } else if self.selected.is_some() {
-            RAIL_WIDTH
         } else {
             0.
         };
@@ -1417,6 +1421,12 @@ impl SuperGitApp {
                 return;
             }
         }
+        // Terminal conversations learn their titles from their sessions.
+        for info in &self.worktrees {
+            for chat in self.chats.get(info.path()).into_iter().flatten() {
+                chat.update(cx, |chat, cx| chat.adopt_session_title(&info.sessions, cx));
+            }
+        }
         let previous = self.selected.clone();
         let valid = self
             .selected
@@ -2161,6 +2171,10 @@ impl SuperGitApp {
             cx.notify();
         })
         .detach();
+        cx.subscribe(chat, |this, _, event: &ChatEvent, cx| match event {
+            ChatEvent::PickedView(view) => this.remember_agent_view(*view, cx),
+        })
+        .detach();
     }
 
     fn attention_entries(&self, kind: Kind, cx: &App) -> Vec<Entry> {
@@ -2295,15 +2309,28 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// A new conversation for the selected worktree, with the agent picked
-    /// last (switchable until the first message).
+    /// New (`+`, MOD-n): a new conversation for the selected worktree, with
+    /// the agent and the view picked last, both switchable on its screen
+    /// until the first message (a terminal one waits for Start).
     pub fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_chat_with(default_provider(), window, cx);
+        self.open_new_chat(default_provider(), false, window, cx);
     }
 
+    /// A new conversation with this agent that starts at once: its TUI in
+    /// the terminal view (Start {agent} here, context or a draft to type in).
     pub fn new_chat_with(
         &mut self,
         provider: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_new_chat(provider, true, window, cx);
+    }
+
+    fn open_new_chat(
+        &mut self,
+        provider: Provider,
+        start: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2327,7 +2354,7 @@ impl SuperGitApp {
             chat.update(cx, |chat, cx| {
                 chat.set_provider(provider, window, cx);
                 chat.set_view(view, cx);
-                if chat.is_terminal() {
+                if start && chat.is_terminal() {
                     chat.start_terminal(window, cx);
                 } else {
                     chat.focus(window, cx);
@@ -2338,9 +2365,8 @@ impl SuperGitApp {
         }
         let chat = cx.new(|cx| ChatSession::new(path.clone(), provider, window, cx));
         self.add_chat(path, chat.clone(), window, cx);
-        // A terminal conversation asked for with New starts right away.
         chat.update(cx, |chat, cx| {
-            if chat.is_terminal() {
+            if start && chat.is_terminal() {
                 chat.start_terminal(window, cx);
             }
         });
@@ -2670,36 +2696,17 @@ impl SuperGitApp {
 
     // ---- rendering -------------------------------------------------------
 
-    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A title bar across the window: outside macOS (menus, window buttons),
+    /// and on macOS only while there is no sidebar to hold the window
+    /// buttons. `title`: show the app's name (the sidebar shows it
+    /// otherwise). Its actions live in the sidebar's "⋯" menu.
+    fn render_title_bar(
+        &self,
+        title: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let menu_bar = crate::menu_bar(cx);
-        let indicators = projects::ATTENTION_ORDER.into_iter().filter_map(|kind| {
-            let count = self.attention_count(kind, cx);
-            (count > 0).then(|| {
-                Button::new(match kind {
-                    Kind::Approval => "attention-approval",
-                    Kind::Question => "attention-question",
-                    Kind::Failed => "attention-failed",
-                    Kind::Completed => "attention-completed",
-                    _ => "attention-running",
-                })
-                .label(format!("{count} {}", kind.label()))
-                .text_color(attention_color(kind, cx.theme()))
-                .xsmall()
-                .ghost()
-                .tooltip(format!(
-                    "{} · Open the exact conversation; repeat to cycle",
-                    if kind == Kind::Completed {
-                        "Completed and unread"
-                    } else {
-                        kind.label()
-                    }
-                ))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.open_attention(kind, window, cx)),
-                )
-            })
-        });
-        let theme = cx.theme();
         TitleBar::new()
             // The bar keeps 80px on the left for the window buttons, which a
             // full-screen window does not show: start at the edge there (the
@@ -2708,106 +2715,11 @@ impl SuperGitApp {
             .child(
                 h_flex()
                     .w_full()
-                    .pr_2()
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .when_some(menu_bar, |el, bar| el.child(div().h_full().child(bar)))
-                            .child(div().font_weight(FontWeight::BOLD).child("SuperGIT"))
-                            .when_some(self.repo.as_ref().map(Repo::name), |el, name| {
-                                el.child(
-                                    div()
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("· {name}")),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .text_xs()
-                            .child(
-                                Button::new("open-switcher")
-                                    .label("Switch…")
-                                    .small()
-                                    .ghost()
-                                    .tooltip(format!(
-                                        "Switch worktree, conversation or project ({MOD}-p)"
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_switcher(&OpenSwitcher, window, cx)
-                                    })),
-                            )
-                            .children(indicators)
-                            .child(
-                                Button::new("open-repo")
-                                    .label("Open…")
-                                    .ghost()
-                                    .small()
-                                    .tooltip(format!("Open a repository as a project ({MOD}-o)"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_repository(&OpenRepository, window, cx)
-                                    })),
-                            )
-                            .when(self.repo.is_some(), |el| {
-                                el.child(
-                                    Button::new("clone-repo")
-                                        .label("Clone…")
-                                        .ghost()
-                                        .small()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_clone_form(window, cx)
-                                        })),
-                                )
-                            })
-                            .when(self.repo.is_some(), |el| {
-                                el.child(
-                                    Button::new("close-repo")
-                                        .label("Recent")
-                                        .ghost()
-                                        .small()
-                                        .tooltip(format!(
-                                            "Switch to a recent repository ({MOD}-shift-o)"
-                                        ))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.close_repository(&CloseRepository, window, cx)
-                                        })),
-                                )
-                            })
-                            .child({
-                                let current = crate::appearance::current(cx);
-                                Button::new("appearance")
-                                .label(format!(
-                                    "{} {}",
-                                    match current {
-                                        Appearance::System => "◐",
-                                        Appearance::Light => "☀",
-                                        Appearance::Dark => "☾",
-                                    },
-                                    current.label()
-                                ))
-                                .ghost()
-                                .small()
-                                .tooltip(
-                                    "Appearance: System → Light → Dark (also View ▸ Appearance)",
-                                )
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    crate::appearance::set(current.next(), cx);
-                                    cx.notify();
-                                }))
-                            })
-                            .child(
-                                Button::new("refresh")
-                                    .label("Refresh")
-                                    .ghost()
-                                    .small()
-                                    .tooltip(format!("Refresh now ({MOD}-r)"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.refresh(&Refresh, window, cx)
-                                    })),
-                            ),
-                    ),
+                    .gap_2()
+                    .when_some(menu_bar, |el, bar| el.child(div().h_full().child(bar)))
+                    .when(title, |el| {
+                        el.child(div().font_weight(FontWeight::BOLD).child("SuperGIT"))
+                    }),
             )
     }
 
@@ -3295,7 +3207,8 @@ impl SuperGitApp {
         }
         self.ensure_chats(&item.worktree, window, cx);
         if new {
-            self.new_chat(window, cx);
+            // The context is typed in at once: no screen to pick on first.
+            self.new_chat_with(default_provider(), window, cx);
         }
         if let Some(chat) = self.active_chat_entity() {
             match chat.update(cx, |chat, cx| chat.attach(item, window, cx)) {
@@ -3604,13 +3517,21 @@ impl SuperGitApp {
         if self.agent_view == view {
             return;
         }
+        self.remember_agent_view(view, cx);
+        if let Some(chat) = self.active_chat_entity() {
+            chat.update(cx, |chat, cx| chat.set_view(view, cx));
+        }
+    }
+
+    /// The view New and Resume open from now on (`settings.json`).
+    fn remember_agent_view(&mut self, view: crate::settings::AgentView, cx: &mut Context<Self>) {
+        if self.agent_view == view {
+            return;
+        }
         self.agent_view = view;
         let mut settings = crate::settings::load();
         settings.agent_view = view;
         crate::settings::save(&settings);
-        if let Some(chat) = self.active_chat_entity() {
-            chat.update(cx, |chat, cx| chat.set_view(view, cx));
-        }
         cx.notify();
     }
 
@@ -4847,94 +4768,144 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// The collapsed agent panel: a button to expand it, one glyph per
-    /// conversation of the selected worktree (the agent's mark) colored by
-    /// its state (title in the tooltip; clicking opens it), and a
-    /// new-conversation button.
+    /// The agent rail at the window's right edge, beside the agent panel or
+    /// in its place: the button that collapses or expands the panel, New,
+    /// and one mark per conversation of the selected worktree (the agent's
+    /// mark, in its own colors while the agent works, gray otherwise; the
+    /// selected one on a background). Hovered, an item shows its label at
+    /// once to its left. Clicking a mark opens its conversation; its context
+    /// menu closes it. Every item is a square as wide as the rail, easy to
+    /// hit, with a line under it.
     fn render_chat_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::Size;
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
         let theme = cx.theme().clone();
+        let open = self.chat_open;
         let chats = self.chats.get(&path).cloned().unwrap_or_default();
         let active = self.active_chat.get(&path).copied().unwrap_or(0);
+        let closable = chats.len() > 1;
+        let owner = cx.entity().downgrade();
+        // The first square is as tall as the panel's header: their lines
+        // meet.
+        let item = |id: ElementId| {
+            div()
+                .id(id)
+                .w_full()
+                .h(px(RAIL_WIDTH))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_b_1()
+                .border_color(theme.border)
+                .cursor_pointer()
+        };
+        // Busy in any process, this window's or another (Claude Code's
+        // registry, read with the sessions).
+        let busy: Vec<(Provider, String)> = self
+            .worktrees
+            .iter()
+            .filter(|info| info.path() == path)
+            .flat_map(|info| &info.sessions)
+            .filter(|session| session.busy)
+            .map(|session| (session.provider, session.id.clone()))
+            .collect();
         let cells = chats.iter().enumerate().map(|(ix, chat)| {
             let c = chat.read(cx);
-            let kind = c.attention().kind;
-            let provider = c.provider();
-            let tooltip = if kind == Kind::Idle {
-                format!("{} · {}", c.provider().label(), c.title())
+            let owner = owner.clone();
+            // The agent's mark: in its own colors while the agent works,
+            // gray otherwise.
+            let working = c.is_working()
+                || c.session_id().is_some_and(|id| {
+                    busy.iter()
+                        .any(|(provider, busy)| *provider == c.provider() && busy == id)
+                });
+            let mark = if working {
+                crate::icons::agent_icon(c.provider())
             } else {
-                format!(
-                    "{} · {} · {}",
-                    c.provider().label(),
-                    c.title(),
-                    kind.label()
-                )
+                crate::icons::agent_mark(c.provider()).text_color(theme.muted_foreground)
             };
-            div()
-                .id(("rail-chat", ix))
-                .w_full()
-                .py_1p5()
-                .flex()
-                .justify_center()
-                .cursor_pointer()
-                .border_r_2()
-                .border_color(if ix == active {
-                    theme.primary
-                } else {
-                    transparent_black()
+            let square = item(("rail-chat", ix).into())
+                // The selected conversation (on screen, or the one the panel
+                // reopens on).
+                .when(ix == active, |el| el.bg(theme.sidebar_accent))
+                .hover(|el| {
+                    el.bg(if ix == active {
+                        theme.sidebar_accent
+                    } else {
+                        theme.list_hover
+                    })
                 })
-                .hover(|el| el.bg(theme.list_hover))
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                 .on_click(cx.listener(move |this, _, window, cx| this.open_chat_at(ix, window, cx)))
-                // The agent's mark in its conversation's state color.
-                .child(
-                    crate::icons::agent_mark(provider)
-                        .small()
-                        .text_color(attention_color(kind, &theme)),
-                )
+                .child(mark.with_size(Size::Medium))
+                .context_menu(move |menu, _, _| {
+                    let owner = owner.clone();
+                    // Closing stops the conversation's agent; the last one
+                    // stays, so the worktree keeps a conversation to type in.
+                    menu.item(
+                        PopupMenuItem::new("Close Conversation")
+                            .disabled(!closable)
+                            .on_click(move |_, _, cx| {
+                                let _ = owner.update(cx, |this, cx| this.close_chat(ix, cx));
+                            }),
+                    )
+                });
+            rail_label(("rail-chat-label", ix), c.title().into(), square, &theme)
         });
+        let toggle = item("toggle-chat".into())
+            .hover(|el| el.bg(theme.list_hover))
+            .on_click(
+                cx.listener(|this, _, window, cx| this.toggle_claude(&ToggleClaude, window, cx)),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::PanelRightClose
+                } else {
+                    IconName::PanelRightOpen
+                })
+                .with_size(Size::Medium),
+            );
+        let toggle_label = if open {
+            format!("Collapse the agent panel ({MOD}-l)")
+        } else {
+            format!("Expand the agent panel ({MOD}-l)")
+        };
+        let new = item("rail-chat-new".into())
+            .hover(|el| el.bg(theme.list_hover))
+            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
+            .child(Icon::new(IconName::Plus).with_size(Size::Medium));
         v_flex()
             .w(px(RAIL_WIDTH))
             .flex_none()
             .h_full()
             .border_l_1()
             .border_color(theme.border)
-            .child(
-                h_flex().justify_center().py_1().child(
-                    Button::new("expand-chat")
-                        .icon(IconName::PanelRightOpen)
-                        .xsmall()
-                        .ghost()
-                        .tooltip(format!("Expand the agent panel ({MOD}-l)"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_claude(&ToggleClaude, window, cx)
-                        })),
-                ),
-            )
+            .child(rail_label(
+                "rail-toggle-label",
+                toggle_label.into(),
+                toggle,
+                &theme,
+            ))
+            .child(rail_label(
+                "rail-new-label",
+                format!("New conversation ({MOD}-n)").into(),
+                new,
+                &theme,
+            ))
             .child(
                 v_flex()
                     .id("chat-rail")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(cells)
-                    .child(
-                        h_flex().justify_center().py_1().child(
-                            Button::new("rail-chat-new")
-                                .label("+")
-                                .xsmall()
-                                .ghost()
-                                .tooltip(format!("New conversation ({MOD}-n)"))
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
-                                ),
-                        ),
-                    ),
+                    .children(cells),
             )
             .into_any_element()
     }
 
+    /// The agent panel: the conversation on screen under a header with its
+    /// agent and title. Switching, New and collapsing live in the rail.
     fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
@@ -4957,58 +4928,9 @@ impl SuperGitApp {
         {
             chat.update(cx, |chat, cx| chat.mark_seen(cx));
         }
-        let tabs = chats.iter().enumerate().map(|(ix, chat)| {
-            let c = chat.read(cx);
-            let title = c.title().chars().take(22).collect::<String>();
-            let provider = c.provider();
-            let dot = match c.status() {
-                sg_agents::chat::Status::Working | sg_agents::chat::Status::Starting => {
-                    Some(theme.blue)
-                }
-                sg_agents::chat::Status::NeedsPermission | sg_agents::chat::Status::NeedsInput => {
-                    Some(theme.warning)
-                }
-                _ => None,
-            };
-            let path = path.clone();
-            h_flex()
-                .id(("chat-tab", ix))
-                .flex_none()
-                .gap_1()
-                .px_2()
-                .py_0p5()
-                .rounded_md()
-                .text_xs()
-                .cursor_pointer()
-                .when(ix == active, |el| el.bg(theme.list_active))
-                .hover(|el| el.bg(theme.list_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.active_chat.insert(path.clone(), ix);
-                    this.queue_persist(cx);
-                    cx.notify();
-                }))
-                .when_some(dot, |el, color| {
-                    el.child(div().size(px(6.)).rounded_full().bg(color))
-                })
-                .child(crate::icons::agent_icon(provider).xsmall())
-                .child(title)
-                .when(c.attention().unread || c.attention().kind.is_live(), |el| {
-                    el.child(div().text_xs().child(c.attention().kind.label()))
-                })
-                .when(chats.len() > 1, |el| {
-                    el.child(
-                        div()
-                            .id(("chat-close", ix))
-                            .px_0p5()
-                            .text_color(theme.muted_foreground)
-                            .hover(|el| el.text_color(theme.foreground))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_chat(ix, cx)
-                            }))
-                            .child("×"),
-                    )
-                })
+        let current = chats.get(active).map(|chat| {
+            let chat = chat.read(cx);
+            (chat.provider(), chat.title())
         });
 
         v_flex()
@@ -5019,53 +4941,29 @@ impl SuperGitApp {
             .border_l_1()
             .border_color(theme.border)
             .child(
+                // As tall as the rail is wide: its first square sits beside.
                 h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
+                    .h(px(RAIL_WIDTH))
+                    .flex_none()
+                    .px_3()
+                    .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child({
-                        let provider = chats.get(active).map(|chat| chat.read(cx).provider());
-                        h_flex()
-                            .flex_none()
-                            .gap_1p5()
-                            .px_1()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .when_some(provider, |el, provider| {
-                                el.child(crate::icons::agent_icon(provider).small())
-                            })
-                            .child(provider.map_or("Agents", |provider| provider.label()))
-                    })
-                    .child(
-                        h_flex()
-                            .id("chat-tabs")
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .overflow_x_scroll()
-                            .children(tabs),
-                    )
-                    .child(self.render_agent_view_toggle("agent-view", cx).xsmall())
-                    .child(
-                        Button::new("chat-new")
-                            .label("+")
-                            .xsmall()
-                            .ghost()
-                            .tooltip(format!("New conversation ({MOD}-n)"))
-                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
-                    )
-                    .child(
-                        Button::new("chat-hide")
-                            .icon(IconName::PanelRightClose)
-                            .xsmall()
-                            .ghost()
-                            .tooltip(format!("Collapse the agent panel ({MOD}-l)"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_claude(&ToggleClaude, window, cx)
-                            })),
-                    ),
+                    .when_some(current, |el, (provider, title)| {
+                        el.child(
+                            crate::icons::agent_icon(provider)
+                                .with_size(gpui_kit::component::Size::Medium),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -5099,13 +4997,16 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
-        // What the active project needs at its narrowest.
+        // What the active project needs at its narrowest (a worktree's agent
+        // rail included).
         let rest = if self.repo.is_none() {
             480.
-        } else if self.chat_open && self.selected.is_some() {
-            680.
-        } else {
+        } else if self.selected.is_none() {
             360.
+        } else if self.chat_open {
+            680. + RAIL_WIDTH
+        } else {
+            360. + RAIL_WIDTH
         };
         let max = (window.viewport_size().width.as_f32() - rest).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         div()
@@ -5122,7 +5023,7 @@ impl SuperGitApp {
                             .size(px(self.persisted.projects.sidebar_width.min(max)))
                             .size_range(px(SIDEBAR_MIN)..px(max))
                             .fixed()
-                            .child(self.render_sidebar(cx)),
+                            .child(self.render_sidebar(window, cx)),
                     )
                     .child(
                         resizable_panel()
@@ -5135,51 +5036,61 @@ impl SuperGitApp {
 
     /// The active project's review and agents, or the welcome screen.
     fn render_project(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // The status bar stays under the center column, so the side panels
+        // and their splitters reach the window's bottom edge.
         if self.repo.is_none() {
-            return self.render_welcome(cx).into_any_element();
+            return v_flex()
+                .size_full()
+                .min_w_0()
+                .child(self.render_welcome(cx))
+                .child(self.render_status_bar(cx))
+                .into_any_element();
         }
         let main = self.render_main(window, cx);
-        if self.chat_open && self.selected.is_some() {
+        let main = v_flex()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .child(div().flex_1().min_h_0().w_full().child(elastic(main)))
+            .child(self.render_status_bar(cx))
+            .into_any_element();
+        if self.selected.is_none() {
+            return main;
+        }
+        let content = if self.chat_open {
             let (chat_max, _) = self.pane_widths(window, cx);
             let chat = self.render_claude_panel(window, cx);
-            div()
-                .flex_1()
-                .min_h_0()
-                .size_full()
+            h_resizable("chat-layout")
+                .with_state(&self.chat_layout)
+                .on_resize(cx.listener(|this, state, _, cx| {
+                    this.remember_layout(LayoutPanel::Chat, state, cx)
+                }))
                 .child(
-                    h_resizable("chat-layout")
-                        .with_state(&self.chat_layout)
-                        .on_resize(cx.listener(|this, state, _, cx| {
-                            this.remember_layout(LayoutPanel::Chat, state, cx)
-                        }))
-                        .child(
-                            resizable_panel()
-                                .size_range(px(360.)..Pixels::MAX)
-                                .child(elastic(main)),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size(px(self.repository_view().chat_width.min(chat_max)))
-                                .size_range(px(320.)..px(chat_max))
-                                .fixed()
-                                .child(chat),
-                        ),
+                    resizable_panel()
+                        .size_range(px(360.)..Pixels::MAX)
+                        .child(elastic(main)),
+                )
+                .child(
+                    resizable_panel()
+                        .size(px(self.repository_view().chat_width.min(chat_max)))
+                        .size_range(px(320.)..px(chat_max))
+                        .fixed()
+                        .child(chat),
                 )
                 .into_any_element()
-        } else if self.selected.is_some() {
-            let rail = self.render_chat_rail(window, cx);
-            // Elastic like the panels above: wide content (a long commit
-            // message, a diff line) must not push the rail off-screen.
-            h_flex()
-                .flex_1()
-                .min_h_0()
-                .size_full()
-                .child(div().flex_1().min_w_0().h_full().child(elastic(main)))
-                .child(rail)
-                .into_any_element()
         } else {
-            main
-        }
+            elastic(main).into_any_element()
+        };
+        let rail = self.render_chat_rail(window, cx);
+        // Elastic like the panels above: wide content (a long commit
+        // message, a diff line) must not push the rail off-screen.
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .child(div().flex_1().min_w_0().h_full().child(content))
+            .child(rail)
+            .into_any_element()
     }
 
     fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5322,9 +5233,11 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::ask_agent_new))
             .on_action(cx.listener(Self::toggle_keep_worktree))
             .on_action(cx.listener(Self::clean_up_worktree))
-            .child(self.render_title_bar(window, cx))
+            // With the sidebar shown on macOS, its first row is the title bar.
+            .when(!FULL_HEIGHT_PANELS || !self.projects_visible(), |el| {
+                el.child(self.render_title_bar(!self.projects_visible(), window, cx))
+            })
             .child(self.render_body(window, cx))
-            .child(self.render_status_bar(cx))
             .when(self.cherry_pick.is_some(), |el| {
                 el.child(self.render_cherry_pick(cx))
             })
@@ -5456,6 +5369,45 @@ pub(crate) fn default_provider() -> Provider {
 
 /// Width of a collapsed side panel (sidebar, agent panel).
 const RAIL_WIDTH: f32 = 48.;
+/// An agent-rail item with its label: shown at once on hover, to the item's
+/// left and centered on it (a tooltip waits and sits at the mouse).
+fn rail_label(
+    id: impl Into<ElementId>,
+    text: SharedString,
+    item: impl IntoElement,
+    theme: &gpui_kit::component::Theme,
+) -> gpui_kit::base::HoverCard {
+    let (bg, fg, border) = (theme.popover, theme.popover_foreground, theme.border);
+    gpui_kit::base::HoverCard::new(id)
+        .anchor(Anchor::RightCenter)
+        .open_delay(Duration::ZERO)
+        .close_delay(Duration::ZERO)
+        .w_full()
+        .trigger(item)
+        .content(move |_, _, _| {
+            // The padding keeps the label clear of the rail.
+            div().id("label").pr_1p5().child(
+                div()
+                    .max_w(px(360.))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(bg)
+                    .text_color(fg)
+                    .shadow_md()
+                    .text_sm()
+                    .truncate()
+                    .child(text),
+            )
+        })
+}
+
+/// macOS: the side panels reach the window's top edge and the window
+/// buttons sit in the sidebar. Elsewhere a title bar keeps the menus and
+/// window buttons above everything.
+const FULL_HEIGHT_PANELS: bool = cfg!(target_os = "macos");
 /// The expanded sidebar's width range.
 const SIDEBAR_MIN: f32 = 220.;
 const SIDEBAR_MAX: f32 = 520.;

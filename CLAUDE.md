@@ -91,7 +91,8 @@ Same protocol as the Agent SDKs and the VS Code extension:
 
 ## Embedded terminal (sg_terminal + supergit/src/terminal.rs)
 
-`Settings::agent_view` (`Chat | Terminal` in the panel header and Settings)
+`Settings::agent_view` (`Chat | Terminal` in Settings and on a new
+conversation's screen)
 decides whether New / Resume open SuperGIT's chat or the agent's own TUI.
 Design notes: docs/EMBEDDED_TERMINAL.md.
 - Build: needs **Zig 0.17.x** on PATH, nothing else. libghostty-vt's Rust
@@ -305,7 +306,10 @@ https://github.com/cli/cli /tmp/x`) — never merge there.
 Set `SUPERGIT_STATE_DIR=/tmp/supergit-profile` for isolated UI checks. Settings,
 recent repositories and workspace restoration then use that directory instead
 of the user's normal application support directory. Agent transcripts remain
-owned by the agent provider. Restored conversations never start automatically.
+owned by the agent provider. Restored chats never start their agent; a
+terminal conversation with history resumes its TUI once it is on screen,
+unless Claude Code's registry of live sessions (`~/.claude/sessions/<pid>.json`)
+shows the session open in another process.
 
 `$SUPERGIT_TEST_REPO` is not set by the project: point it (in your shell or a
 local, untracked `CLAUDE.local.md`) at a real repository with several

@@ -5,6 +5,7 @@
 
 use super::projects::{ATTENTION_ORDER, Activity, project_name, short_path};
 use super::*;
+use gpui_kit::component::menu::DropdownMenu as _;
 
 /// How far worktree rows sit under their project's name.
 const WORKTREE_INDENT: f32 = 22.;
@@ -179,7 +180,7 @@ impl SuperGitApp {
         self.switch_project(root, cx);
     }
 
-    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let roots = self.persisted.projects.roots.clone();
         let tree: Vec<AnyElement> = roots
@@ -187,6 +188,44 @@ impl SuperGitApp {
             .enumerate()
             .map(|(ix, root)| self.render_project_node(ix, root, &theme, cx))
             .collect();
+        let header = h_flex()
+            .w_full()
+            .min_w_0()
+            .pr_2()
+            .gap_1()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .child("SuperGIT"),
+            )
+            .child(self.add_project_button("add-project", cx))
+            .child(self.app_menu_button("app-menu", cx))
+            .child(
+                Button::new("collapse-sidebar")
+                    .icon(IconName::PanelLeftClose)
+                    .xsmall()
+                    .ghost()
+                    .tooltip(format!("Collapse the sidebar ({MOD}-b)"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_sidebar(&ToggleSidebar, window, cx)
+                    })),
+            );
+        // On macOS the sidebar reaches the window's top edge: its first row
+        // is the title bar (window buttons, dragging, double click).
+        let header = if FULL_HEIGHT_PANELS {
+            TitleBar::new()
+                .when(window.is_fullscreen(), |bar| bar.pl(px(0.)))
+                .bg(theme.sidebar)
+                .border_color(theme.sidebar_border)
+                .child(header)
+                .into_any_element()
+        } else {
+            h_flex().pl_3().py_1().child(header).into_any_element()
+        };
         v_flex()
             .w_full()
             .min_w_0()
@@ -195,30 +234,7 @@ impl SuperGitApp {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .justify_between()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("PROJECTS · {}", roots.len()))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(self.add_project_button("add-project", cx))
-                            .child(
-                                Button::new("collapse-sidebar")
-                                    .icon(IconName::PanelLeftClose)
-                                    .xsmall()
-                                    .ghost()
-                                    .tooltip("Collapse the sidebar (cmd-b)")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_sidebar(&ToggleSidebar, window, cx)
-                                    })),
-                            ),
-                    ),
-            )
+            .child(header)
             .child(
                 v_flex()
                     .id("sidebar-tree")
@@ -822,13 +838,23 @@ impl SuperGitApp {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
+            // Room for the window buttons, which a full-height rail is too
+            // narrow to hold: they overlap the next column's padding.
+            .when(FULL_HEIGHT_PANELS, |rail| {
+                rail.child(
+                    TitleBar::new()
+                        .pl(px(0.))
+                        .bg(theme.sidebar)
+                        .border_color(theme.sidebar_border),
+                )
+            })
             .child(
                 h_flex().justify_center().py_1().child(
                     Button::new("expand-sidebar")
                         .icon(IconName::PanelLeftOpen)
                         .xsmall()
                         .ghost()
-                        .tooltip("Expand the sidebar (cmd-b)")
+                        .tooltip(format!("Expand the sidebar ({MOD}-b)"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_sidebar(&ToggleSidebar, window, cx)
                         })),
@@ -843,12 +869,100 @@ impl SuperGitApp {
                     .children(cells),
             )
             .child(
-                h_flex()
-                    .justify_center()
+                v_flex()
+                    .items_center()
                     .py_1()
+                    .gap_1()
+                    .child(self.app_menu_button("app-menu-rail", cx))
                     .child(self.add_project_button("add-project-rail", cx)),
             )
             .into_any_element()
+    }
+
+    /// "⋯": the window-wide actions that used to sit in the title bar —
+    /// conversations needing attention, the switcher, repositories,
+    /// appearance and refresh.
+    fn app_menu_button(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        let owner = cx.entity().downgrade();
+        let attention: Vec<(Kind, usize)> = ATTENTION_ORDER
+            .into_iter()
+            .map(|kind| (kind, self.attention_count(kind, cx)))
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let has_repo = self.repo.is_some();
+        Button::new(id)
+            .icon(IconName::Ellipsis)
+            .xsmall()
+            .ghost()
+            .tooltip("More actions")
+            .dropdown_menu(move |mut menu, window, cx| {
+                // Each opens the exact conversation; repeat to cycle.
+                for &(kind, count) in &attention {
+                    let owner = owner.clone();
+                    let label = format!("{count} {}", kind.label());
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            div()
+                                .text_color(attention_color(kind, cx.theme()))
+                                .child(label.clone())
+                        })
+                        .on_click(move |_, window, cx| {
+                            let _ =
+                                owner.update(cx, |this, cx| this.open_attention(kind, window, cx));
+                        }),
+                    );
+                }
+                menu = menu.separator().item(app_item(
+                    &owner,
+                    "Switch Worktree, Conversation or Project…",
+                    Box::new(OpenSwitcher),
+                    |this, window, cx| this.open_switcher(&OpenSwitcher, window, cx),
+                ));
+                menu = menu.separator().item(app_item(
+                    &owner,
+                    "Open Repository…",
+                    Box::new(OpenRepository),
+                    |this, window, cx| this.open_repository(&OpenRepository, window, cx),
+                ));
+                if has_repo {
+                    let clone_owner = owner.clone();
+                    menu = menu
+                        .item(PopupMenuItem::new("Clone Repository…").on_click(
+                            move |_, window, cx| {
+                                let _ = clone_owner
+                                    .update(cx, |this, cx| this.open_clone_form(window, cx));
+                            },
+                        ))
+                        .item(app_item(
+                            &owner,
+                            "Recent Repositories",
+                            Box::new(CloseRepository),
+                            |this, window, cx| this.close_repository(&CloseRepository, window, cx),
+                        ));
+                }
+                menu.separator()
+                    .submenu("Appearance", window, cx, |mut menu, _, cx| {
+                        let now = crate::appearance::current(cx);
+                        for choice in [
+                            crate::settings::Appearance::System,
+                            crate::settings::Appearance::Light,
+                            crate::settings::Appearance::Dark,
+                        ] {
+                            menu = menu.item(
+                                PopupMenuItem::new(choice.label())
+                                    .checked(now == choice)
+                                    .on_click(move |_, _, cx| crate::appearance::set(choice, cx)),
+                            );
+                        }
+                        menu
+                    })
+                    .item(app_item(
+                        &owner,
+                        "Refresh",
+                        Box::new(Refresh),
+                        |this, window, cx| this.refresh(&Refresh, window, cx),
+                    ))
+            })
     }
 
     /// The active project's worktrees in the rail: initials and agent status
@@ -906,6 +1020,21 @@ impl SuperGitApp {
             })
             .collect()
     }
+}
+
+/// An item of the "⋯" menu: runs on the app and shows the action's shortcut.
+fn app_item(
+    owner: &WeakEntity<SuperGitApp>,
+    label: &'static str,
+    action: Box<dyn Action>,
+    run: impl Fn(&mut SuperGitApp, &mut Window, &mut Context<SuperGitApp>) + 'static,
+) -> PopupMenuItem {
+    let owner = owner.clone();
+    PopupMenuItem::new(label)
+        .action(action)
+        .on_click(move |_, window, cx| {
+            let _ = owner.update(cx, |this, cx| run(this, window, cx));
+        })
 }
 
 /// A signal's dot in the rail (the cell's click selects, so no hit area).

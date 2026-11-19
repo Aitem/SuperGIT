@@ -4,9 +4,9 @@ Status: first cut implemented (branch `libghostty-based-chat`, 2026-11-19).
 
 The agent panel opens conversations either as SuperGIT's native chat or as
 the agent's own TUI (`claude`, `codex`) in an embedded terminal. A
-`Chat | Terminal` switch in the panel header (and in Settings) picks which
-one New, Resume last and session rows open (`settings.json`: `agent_view`).
-The chat stays the default.
+`Chat | Terminal` switch in Settings, repeated under the agent choice on a
+new conversation's screen, picks which one New, Resume last and session rows
+open (`settings.json`: `agent_view`). The chat stays the default.
 
 Why bother when the chat exists: the TUI has every CLI feature on day one
 (slash commands, `/model`, plan approval, `@` mentions, images, new UI). The
@@ -102,9 +102,13 @@ are removed (`CLAUDECODE`, Claude Code session markers, `TMUX`,
 Claude Code makes the child think it is a sub-session ("transcript saving is
 off").
 
-- A new tab starts the agent at once. A restored tab, or the default empty
-  conversation of a worktree, shows Start/Resume and waits. Selecting a
-  worktree never starts a process.
+- New (`+`, MOD-n) shows the agent and view choice and waits for Start;
+  "Start {agent} here", asking about a selection and issue drafts start at
+  once. A conversation with history resumes its TUI once it is on screen
+  (without taking the focus); off screen, nothing starts. A Claude session
+  that Claude Code's registry of live sessions (`~/.claude/sessions/<pid>.json`,
+  the pid checked with signal 0) shows open in another process keeps Resume
+  and says why: two processes would write one transcript.
 - Opening a session that is already open focuses its tab, whichever mode
   that tab uses.
 - When the agent exits, a bar offers Resume (or Start again).

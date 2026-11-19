@@ -127,6 +127,15 @@ fn placeholder(provider: Provider) -> String {
     )
 }
 
+/// What a conversation tells the app.
+pub enum ChatEvent {
+    /// `Chat | Terminal` picked for a new conversation: the default from now
+    /// on, as if picked in Settings.
+    PickedView(crate::settings::AgentView),
+}
+
+impl EventEmitter<ChatEvent> for ChatSession {}
+
 pub struct ChatSession {
     git_busy: bool,
     worktree: PathBuf,
@@ -238,8 +247,12 @@ impl ChatSession {
         {
             convo.session_id = saved.session_id.clone();
         }
-        // The transcript's own title replaces it once read.
-        if !saved.title.is_empty() && saved.title != "New conversation" {
+        // The transcript's own title replaces it once read. A TUI's name
+        // (saved as "Claude Code" by earlier versions) is no title.
+        if !saved.title.is_empty()
+            && saved.title != "New conversation"
+            && !terminal_mode::is_program_name(&saved.title)
+        {
             convo.title = Some(saved.title.clone());
         }
         let cwd = if saved.cwd.is_dir() {
@@ -497,6 +510,16 @@ impl ChatSession {
             .clone()
             .or_else(|| self.terminal_title().map(str::to_string))
             .unwrap_or_else(|| "New conversation".into())
+    }
+
+    /// The agent is busy with a turn here: working, or stopped on a
+    /// question or an approval. A TUI that is only starting up is not.
+    pub fn is_working(&self) -> bool {
+        match self.status() {
+            Status::Working | Status::NeedsPermission | Status::NeedsInput => true,
+            Status::Starting => !self.is_terminal(),
+            Status::Idle | Status::Exited => false,
+        }
     }
 
     /// Put the keyboard focus where the user types: the composer, or the
@@ -1789,8 +1812,10 @@ impl ChatSession {
 }
 
 impl Render for ChatSession {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.is_terminal() {
+            // On screen: a terminal conversation starts its TUI by itself.
+            self.auto_start_terminal(window, cx);
             return self.render_terminal(cx);
         }
         self.load_models(cx);
@@ -1869,6 +1894,7 @@ impl Render for ChatSession {
                             },
                         )))
                     })
+                    .when(fresh, |el| el.child(self.render_view_choice(cx)))
                     .child(
                         div()
                             .text_sm()

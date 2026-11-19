@@ -331,6 +331,7 @@ pub fn from_transcript(path: &Path) -> Result<Conversation> {
     let mut convo = Conversation::new();
     convo.session_id = path.file_stem().map(|s| s.to_string_lossy().into_owned());
     let mut ai_title = None;
+    let mut custom_title = None;
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -343,6 +344,13 @@ pub fn from_transcript(path: &Path) -> Result<Conversation> {
         let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
         if ty == "ai-title" {
             ai_title = v.get("aiTitle").and_then(Value::as_str).map(String::from);
+            continue;
+        }
+        if ty == "custom-title" {
+            custom_title = v
+                .get("customTitle")
+                .and_then(Value::as_str)
+                .map(String::from);
             continue;
         }
         let skip = ["isSidechain", "isMeta", "isCompactSummary"]
@@ -364,8 +372,9 @@ pub fn from_transcript(path: &Path) -> Result<Conversation> {
         apply_inner(&mut convo, &v, false);
     }
     convo.go_live();
-    if ai_title.is_some() {
-        convo.title = ai_title;
+    // The user's name (`/rename`) wins over Claude's.
+    if let Some(title) = custom_title.or(ai_title) {
+        convo.title = Some(title);
     }
     convo.finish_streaming();
     convo.status = Status::Idle;

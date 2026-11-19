@@ -115,6 +115,8 @@ mod tests {
             IconName::ChevronDown,
             IconName::Folder,
             IconName::FolderOpen,
+            IconName::Ellipsis,
+            IconName::Plus,
         ] {
             let path = icon.path();
             assert!(
