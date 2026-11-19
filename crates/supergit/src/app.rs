@@ -313,6 +313,8 @@ pub struct SuperGitApp {
     avatars: avatars::Avatars,
     avatars_root: Option<PathBuf>,
     avatars_task: Option<Task<()>>,
+    /// Other projects' avatars, shown at once when they become active again.
+    project_avatars: HashMap<PathBuf, avatars::Avatars>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -501,6 +503,7 @@ impl SuperGitApp {
             avatars: avatars::Avatars::new(),
             avatars_root: None,
             avatars_task: None,
+            project_avatars: HashMap::new(),
             _subscriptions: vec![
                 subscription,
                 switcher_subscription,
@@ -1874,11 +1877,12 @@ impl SuperGitApp {
             let (patch, details) = cx
                 .background_executor()
                 .spawn(async move {
-                    let patch = sg_git::commit_patch(&request_path, &request_sha)
-                        .map_err(model::git_error_message);
+                    let (patch, details) = sg_git::parallel::join(
+                        || sg_git::commit_patch(&request_path, &request_sha),
+                        || sg_git::commit_details(&request_path, &request_sha),
+                    );
                     // The card is extra: without it the diff still shows.
-                    let details = sg_git::commit_details(&request_path, &request_sha).ok();
-                    (patch, details)
+                    (patch.map_err(model::git_error_message), details.ok())
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1981,8 +1985,12 @@ impl SuperGitApp {
         if self.avatars_root.as_ref() == Some(&root) {
             return;
         }
-        self.avatars_root = Some(root.clone());
-        self.avatars.clear();
+        if let Some(previous) = self.avatars_root.replace(root.clone()) {
+            let avatars = std::mem::take(&mut self.avatars);
+            self.project_avatars.insert(previous, avatars);
+        }
+        // Shown until the refresh (cached, so quick) brings new authors.
+        self.avatars = self.project_avatars.remove(&root).unwrap_or_default();
         self.avatars_task = Some(cx.spawn(async move |this, cx| {
             let request = root.clone();
             let avatars = cx
@@ -3532,10 +3540,11 @@ impl SuperGitApp {
             view.update(cx, |view, cx| view.clear(cx));
             return;
         };
+        // The sides too: a PR's merge base can arrive after its patch.
         let revision = {
             use std::hash::{Hash as _, Hasher as _};
             let mut hasher = std::hash::DefaultHasher::new();
-            patch.hash(&mut hasher);
+            (patch, &old, &new).hash(&mut hasher);
             hasher.finish()
         };
         let request = difft_view::Request {

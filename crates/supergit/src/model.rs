@@ -44,8 +44,12 @@ pub struct AgentSessions {
 impl AgentSessions {
     /// Sessions for each of `worktrees` (same order), most recent first.
     pub fn sessions_by_worktree(&mut self, worktrees: &[PathBuf]) -> Vec<Vec<Session>> {
-        let claude = self.claude.sessions_by_worktree(worktrees);
-        let codex = self.codex.sessions_by_worktree(worktrees);
+        // Separate indexes reading separate files: scan both at once.
+        let Self { claude, codex } = self;
+        let (claude, codex) = sg_git::parallel::join(
+            || claude.sessions_by_worktree(worktrees),
+            || codex.sessions_by_worktree(worktrees),
+        );
         claude
             .into_iter()
             .zip(codex)
@@ -70,41 +74,36 @@ pub fn git_error_message(error: anyhow::Error) -> String {
     error.to_string()
 }
 
-/// Every worktree with its status and agent sessions. Status runs in
-/// parallel: with dozens of worktrees this is the hot path of each refresh.
+/// Every worktree with its status and agent sessions. With dozens of
+/// worktrees this is the hot path of each refresh: statuses run several at
+/// a time, next to the session scan (it needs only the paths).
 pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<WorktreeInfo>> {
     let worktrees = sg_git::list_worktrees(&repo.root)?;
-    let statuses: Vec<_> = std::thread::scope(|scope| {
-        let handles: Vec<_> = worktrees
-            .iter()
-            .map(|wt| {
-                scope.spawn(move || {
-                    let status = if wt.is_bare {
-                        Err("bare".to_string())
-                    } else if let Some(reason) = &wt.prunable {
-                        Err(format!("prunable: {reason}"))
-                    } else {
-                        sg_git::polled_status(&wt.path).map_err(git_error_message)
-                    };
-                    let identity = sg_git::worktree_identity(&repo.common_dir, wt).ok();
-                    (status, identity)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| (Err("status panicked".into()), None))
-            })
-            .collect()
-    });
-
     let paths: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
-    let sessions = index
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .sessions_by_worktree(&paths);
+    let (statuses, sessions) = sg_git::parallel::join(
+        || {
+            sg_git::parallel::map(&worktrees, |wt| {
+                let status = if wt.is_bare {
+                    Err("bare".to_string())
+                } else if let Some(reason) = &wt.prunable {
+                    Err(format!("prunable: {reason}"))
+                } else {
+                    sg_git::polled_status(&wt.path).map_err(git_error_message)
+                };
+                let identity = sg_git::worktree_identity(&repo.common_dir, wt).ok();
+                (status, identity)
+            })
+            .into_iter()
+            .map(|result| result.unwrap_or_else(|_| (Err("status panicked".into()), None)))
+            .collect::<Vec<_>>()
+        },
+        || {
+            index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sessions_by_worktree(&paths)
+        },
+    );
     Ok(worktrees
         .into_iter()
         .zip(statuses)
@@ -216,8 +215,39 @@ pub fn load_details(
     base: Option<String>,
     scope: sg_git::ChangeScope,
 ) -> Details {
-    let suggested_base = sg_git::suggested_base(path);
-    let mut files = status
+    // The suggestion is a separate lookup: next to the diff, not before it.
+    let (suggested_base, changes) = sg_git::parallel::join(
+        || sg_git::suggested_base(path),
+        || changes(path, &status, base.as_deref(), scope),
+    );
+    Details {
+        path: path.to_path_buf(),
+        scope,
+        base,
+        suggested_base,
+        merge_base: changes.merge_base,
+        files: LoadState::from_result(changes.files),
+        status: LoadState::from_result(status),
+        patch: LoadState::from_result(changes.patch),
+        submodules: changes.submodules,
+    }
+}
+
+/// What `load_details` shows of a worktree's changes.
+struct Changes {
+    files: Result<Vec<sg_git::FileChange>, String>,
+    merge_base: Option<String>,
+    submodules: Vec<sg_git::SubmoduleChange>,
+    patch: Result<String, String>,
+}
+
+fn changes(
+    path: &Path,
+    status: &Result<WorktreeStatus, String>,
+    base: Option<&str>,
+    scope: sg_git::ChangeScope,
+) -> Changes {
+    let files = status
         .as_ref()
         .map(|status| {
             status
@@ -227,50 +257,55 @@ pub fn load_details(
                 .collect::<Vec<_>>()
         })
         .map_err(Clone::clone);
-    let mut merge_base = None;
-    let mut submodules = Vec::new();
-    let patch = match &status {
+    match status {
         Ok(st) if base.is_some() => {
-            match sg_git::branch_changes(path, st, base.as_deref().unwrap_or_default())
+            match sg_git::branch_changes(path, st, base.unwrap_or_default())
                 .map_err(git_error_message)
             {
-                Ok(changes) => {
-                    files = Ok(changes.files);
-                    merge_base = Some(changes.merge_base);
-                    submodules = changes.submodules;
-                    Ok(changes.patch)
-                }
-                Err(error) => {
-                    files = Err(error.clone());
-                    Err(error)
-                }
+                Ok(changes) => Changes {
+                    files: Ok(changes.files),
+                    merge_base: Some(changes.merge_base),
+                    submodules: changes.submodules,
+                    patch: Ok(changes.patch),
+                },
+                Err(error) => Changes {
+                    files: Err(error.clone()),
+                    merge_base: None,
+                    submodules: Vec::new(),
+                    patch: Err(error),
+                },
             }
         }
         Ok(st) if !st.is_clean() => match sg_git::scoped_worktree_patch(path, st, scope) {
-            Ok(patch) => {
+            Ok(patch) => Changes {
                 // Each changed submodule's files follow its entry.
-                files = Ok(sg_git::with_submodule_files(
+                files: Ok(sg_git::with_submodule_files(
                     files.unwrap_or_default(),
                     &patch.submodules,
-                ));
-                submodules = patch.submodules;
-                Ok(patch.text)
-            }
-            Err(error) => Err(git_error_message(error)),
+                )),
+                merge_base: None,
+                submodules: patch.submodules,
+                patch: Ok(patch.text),
+            },
+            Err(error) => Changes {
+                files,
+                merge_base: None,
+                submodules: Vec::new(),
+                patch: Err(git_error_message(error)),
+            },
         },
-        Ok(_) => Ok(String::new()),
-        Err(error) => Err(error.clone()),
-    };
-    Details {
-        path: path.to_path_buf(),
-        scope,
-        base,
-        suggested_base,
-        merge_base,
-        files: LoadState::from_result(files),
-        status: LoadState::from_result(status),
-        patch: LoadState::from_result(patch),
-        submodules,
+        Ok(_) => Changes {
+            files,
+            merge_base: None,
+            submodules: Vec::new(),
+            patch: Ok(String::new()),
+        },
+        Err(error) => Changes {
+            files,
+            merge_base: None,
+            submodules: Vec::new(),
+            patch: Err(error.clone()),
+        },
     }
 }
 

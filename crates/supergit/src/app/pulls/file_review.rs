@@ -11,7 +11,17 @@ const REFRESH: Duration = Duration::from_secs(30);
 struct Target {
     number: u64,
     head: String,
+    /// Empty while the PR's details (which carry it) are loading.
     base: String,
+}
+
+impl Target {
+    /// The same revision, as far as both know it.
+    fn matches(&self, other: &Target) -> bool {
+        self.number == other.number
+            && self.head == other.head
+            && (self.base == other.base || self.base.is_empty() || other.base.is_empty())
+    }
 }
 
 struct LoadedReview {
@@ -46,7 +56,6 @@ impl SuperGitApp {
     ) {
         // A refresh must not bring back states GitHub has not confirmed yet.
         if pr.head_oid.is_empty()
-            || base.is_empty()
             || self.pulls.file_review.mutation.is_some()
             || !self.pulls.file_review.queued.is_empty()
         {
@@ -61,11 +70,10 @@ impl SuperGitApp {
         if state
             .load
             .as_ref()
-            .is_some_and(|(pending, _)| *pending == target)
-            || state
-                .loaded
-                .as_ref()
-                .is_some_and(|loaded| loaded.target == target && loaded.at.elapsed() < REFRESH)
+            .is_some_and(|(pending, _)| pending.matches(&target))
+            || state.loaded.as_ref().is_some_and(|loaded| {
+                loaded.target.matches(&target) && loaded.at.elapsed() < REFRESH
+            })
         {
             return;
         }
@@ -90,8 +98,13 @@ impl SuperGitApp {
                     && this.repo.as_ref().is_some_and(|repo| repo.root == root)
                 {
                     state.load = None;
+                    // Started before the details: GitHub named the base.
+                    let mut target = completed;
+                    if let (true, Ok(review)) = (target.base.is_empty(), &result) {
+                        target.base = review.base().to_owned();
+                    }
                     state.loaded = Some(LoadedReview {
-                        target: completed,
+                        target,
                         at: Instant::now(),
                         result,
                     });
