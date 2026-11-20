@@ -83,15 +83,45 @@ Same protocol as the Agent SDKs and the VS Code extension:
   Answer = allow with `updatedInput` = the input plus `answers` {question
   text → label or typed text, an array for `multiSelect`}; Decline = deny.
   The CLI adds no "Other" option: the form always offers free text.
-  Malformed input stays an ordinary permission prompt.
+  Malformed input stays an ordinary permission prompt. A question never
+  gets a tool row: live the permission request brings the form, in history
+  the `tool_use` does (answers from `toolUseResult.answers`).
+- What Claude is doing between messages: `system/status {status}` is
+  `requesting`, `compacting` (repeated while it lasts) or null;
+  `system/thinking_tokens {estimated_tokens}` while it thinks (thinking text
+  itself is empty); a `stream_event` `content_block_start` of a `tool_use`
+  names the tool before its input has streamed (the row shows from then).
+  `compact_boundary` carries `compact_metadata {pre_tokens, post_tokens}`.
+- The user's Stop ends the turn with an *error* `result`
+  (`error_during_execution`, `terminal_reason: aborted_streaming |
+  aborted_tools`): `conversation::was_stopped` → `interrupt_turn`, a notice,
+  not a failed turn. Other failures: `result`, `errors[]` (minus
+  `[ede_diagnostic]`), then the reason codes in words.
+- Permission suggestions: `addRules` names the rule (`ruleContent`, often
+  narrower than the tool) and where it is saved (`destination`: `session`,
+  `localSettings`, `projectSettings`, `userSettings`); the button says both.
+- A background task that ends sends `system/task_notification`; one in the
+  foreground does too, just before its tool result (no notice for those).
 - `Conversation::from_transcript` replays a session jsonl for history.
+  Transcripts hold no `result`: a turn ends at `system/turn_duration` (TUI
+  sessions) or after a message with `stop_reason: end_turn`. A message sent
+  while Claude worked is only an `attachment {type: queued_command}`; a
+  slash command is a `<command-name>` user record, its output
+  `system/local_command`; compaction is `system/compact_boundary`
+  (`compactMetadata {preTokens, postTokens}`).
+- The chat's look: `chat/look.rs` (text sizes, timeline marks, code blocks,
+  durations), `chat/timeline.rs` (which rows show, runs of calls),
+  `chat/activity.rs` (the line above the composer saying what the agent is
+  doing, with a clock). Bash rows read as their `description`; unfolded
+  they show the command and the end of its output.
 - Live test against the real CLI (costs cents): `cargo test -p sg_claude -- --ignored`.
 - UI checks: `SUPERGIT_DEBUG_CHAT=resume` or `SUPERGIT_DEBUG_CHAT='prompt:…'`
   (screenshot builds only) opens/sends on startup, then screenshot it.
 
 ## Embedded terminal (sg_terminal + supergit/src/terminal.rs)
 
-`Settings::agent_view` (`Chat | Terminal` in the panel header and Settings)
+`Settings::agent_view` (`Chat | Terminal` in Settings and on a new
+conversation's screen)
 decides whether New / Resume open SuperGIT's chat or the agent's own TUI.
 Design notes: docs/EMBEDDED_TERMINAL.md.
 - Build: needs **Zig 0.17.x** on PATH, nothing else. libghostty-vt's Rust
@@ -138,8 +168,8 @@ Design notes: docs/EMBEDDED_TERMINAL.md.
   its config files at startup; `terminal::TerminalFont` global), else the
   theme's mono font. Colors stay the app's.
 - Terminal panel (`app/terminal_panel.rs`): `cmd-j` / View ▸ Toggle
-  Terminal / the title bar's Terminal button show the
-  user's shell under the review, one per worktree in its folder; shells
+  Terminal / the status bar's Terminal button / the sidebar's "⋯" menu show
+  the user's shell under the review, one per worktree in its folder; shells
   outlive hiding and worktree switches, end on exit, Kill, worktree cleanup
   or project close. `terminal::spawn_in` gives shells and agent TUIs the
   same environment. Screenshot check: `SUPERGIT_DEBUG_TERMINAL_PANEL=1`.
@@ -279,7 +309,7 @@ Update checks (`updates.rs`, `app/update_check.rs`): the latest release of
 `Aitem/SuperGIT` (`sg_github::latest_release`: `gh api`, else `curl` against
 the public API) at startup and then at most every 12 hours, restarts
 included (`updates.json` in the support dir); a newer tag than
-`CARGO_PKG_VERSION` shows a title bar button whose menu installs it, saves
+`CARGO_PKG_VERSION` shows a status bar button whose menu installs it, saves
 it to Downloads or opens its release page. SuperGIT ▸ Check for Updates…
 checks at once. `updates/install.rs` downloads this platform's package with
 `curl` (no quarantine flag, so the ad-hoc signed app opens), checks it
@@ -330,7 +360,10 @@ https://github.com/cli/cli /tmp/x`) — never merge there.
 Set `SUPERGIT_STATE_DIR=/tmp/supergit-profile` for isolated UI checks. Settings,
 recent repositories and workspace restoration then use that directory instead
 of the user's normal application support directory. Agent transcripts remain
-owned by the agent provider. Restored conversations never start automatically.
+owned by the agent provider. Restored chats never start their agent; a
+terminal conversation with history resumes its TUI once it is on screen,
+unless Claude Code's registry of live sessions (`~/.claude/sessions/<pid>.json`)
+shows the session open in another process.
 
 `$SUPERGIT_TEST_REPO` is not set by the project: point it (in your shell or a
 local, untracked `CLAUDE.local.md`) at a real repository with several

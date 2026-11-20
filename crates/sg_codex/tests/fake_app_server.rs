@@ -191,6 +191,14 @@ fn turn_end(c: &Conversation) -> Option<(bool, Option<String>)> {
     })
 }
 
+/// The turn ended because the user stopped it.
+fn interrupted(c: &Conversation) -> bool {
+    matches!(
+        c.items.last(),
+        Some(Item::Notice { text, is_error: false }) if text == "Interrupted"
+    )
+}
+
 #[test]
 fn collaboration_mode_combines_thread_defaults_and_per_prompt_overrides() {
     let fake = Fake::new("modes", "collaboration", "0.157.1");
@@ -363,8 +371,10 @@ fn interrupt_stops_the_turn_and_expires_the_prompt() {
         s.convo.status == Status::NeedsPermission
     });
     s.process.interrupt().unwrap();
-    s.until("the turn end", |s| turn_end(&s.convo).is_some());
-    assert_eq!(turn_end(&s.convo), Some((true, Some("interrupted".into()))));
+    s.until("the turn end", |s| interrupted(&s.convo));
+    // The user's own Stop is not a failed turn.
+    assert_eq!(turn_end(&s.convo), None);
+    assert_eq!(s.convo.status, Status::Idle);
     assert_eq!(
         s.convo.permission("0").unwrap().decision,
         Some(Decision::Expired)
@@ -468,6 +478,6 @@ fn stop_before_the_handshake_drops_the_waiting_turn() {
     let mut s = Session::start(&fake.program, fake.worktree("wt"), None);
     s.send("hi");
     s.process.interrupt().unwrap();
-    s.until("the turn end", |s| turn_end(&s.convo).is_some());
+    s.until("the turn end", |s| interrupted(&s.convo));
     assert_eq!(s.convo.status, Status::Idle);
 }

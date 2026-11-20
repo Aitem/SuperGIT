@@ -1,5 +1,5 @@
 //! Update checks in the window: the background schedule, SuperGIT ▸ Check
-//! for Updates…, and the title bar button while a newer release is out. Its
+//! for Updates…, and the status bar button while a newer release is out. Its
 //! menu installs the release over this copy, downloads it to Downloads or
 //! opens its page; an installed update waits for "Restart to Update".
 
@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::future::{Either, select};
+use gpui_kit::Anchor;
 use gpui_kit::component::menu::DropdownMenu as _;
 use sg_github::Release;
 
@@ -109,7 +110,7 @@ impl SuperGitApp {
                     this.set_update(Some(latest), cx);
                     let message = match &this.update {
                         Some(release) => format!(
-                            "SuperGIT {} is available: the button in the title bar installs or downloads it",
+                            "SuperGIT {} is available: the button in the status bar installs or downloads it",
                             release.tag
                         ),
                         None => format!("SuperGIT {} is up to date", updates::running_version()),
@@ -125,7 +126,7 @@ impl SuperGitApp {
 
     /// Install the available update over this copy, or save it in Downloads.
     /// The work runs on a thread of its own (a download can take minutes);
-    /// the title bar shows its progress.
+    /// the status bar shows its progress.
     fn start_update_job(&mut self, install: bool, cx: &mut Context<Self>) {
         let Some(release) = self.update.clone() else {
             return;
@@ -182,7 +183,7 @@ impl SuperGitApp {
         });
         cx.notify();
         self.update_job_task = Some(cx.spawn(async move |this, cx| {
-            // Repaint the title bar as the percentage changes.
+            // Repaint the status bar as the percentage changes.
             let mut shown = 0;
             let result = loop {
                 let tick = cx.background_executor().timer(Duration::from_millis(250));
@@ -258,8 +259,9 @@ impl SuperGitApp {
         }
     }
 
-    /// The title bar button while a newer release is out: a menu to install
-    /// it, download it or open its page; then progress; then a restart.
+    /// The status bar button while a newer release is out: a menu (opening
+    /// upward) to install it, download it or open its page; then progress;
+    /// then a restart.
     pub(super) fn update_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let info = cx.theme().info;
         match &self.update_job {
@@ -269,7 +271,7 @@ impl SuperGitApp {
                     Button::new("restart-to-update")
                         .label("Restart to Update")
                         .text_color(info)
-                        .small()
+                        .xsmall()
                         .ghost()
                         .tooltip(format!(
                             "SuperGIT {tag} is installed · Restart now: running agents and terminals stop, conversations can be resumed"
@@ -302,7 +304,7 @@ impl SuperGitApp {
                                 "Downloading"
                             }
                         ))
-                        .small()
+                        .xsmall()
                         .ghost()
                         .loading(true)
                         .into_any_element(),
@@ -318,7 +320,7 @@ impl SuperGitApp {
             Button::new("update-available")
                 .label(format!("{} available", release.tag))
                 .text_color(info)
-                .small()
+                .xsmall()
                 .ghost()
                 .dropdown_caret(true)
                 .tooltip(format!(
@@ -326,7 +328,7 @@ impl SuperGitApp {
                     release.tag,
                     updates::running_version()
                 ))
-                .dropdown_menu(move |mut menu, _, _| {
+                .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
                     let job = |install: bool| {
                         let owner = owner.clone();
                         move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
