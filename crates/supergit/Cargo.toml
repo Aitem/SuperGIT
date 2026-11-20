@@ -27,6 +27,8 @@ sg_codex.workspace = true
 sg_terminal.workspace = true
 # Release tags against the running version (update checks).
 semver = "1"
+# Downloaded updates against the release's SHA256SUMS.
+sha2 = "0.10"
 # Session ids for new terminal conversations (`claude --session-id`).
 uuid = { version = "1", features = ["v4"] }
 # Syntax colors for the difftastic view; the same versions as gpui-kit's

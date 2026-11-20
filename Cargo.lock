@@ -6620,6 +6620,7 @@ dependencies = [
  "sg_git",
  "sg_github",
  "sg_terminal",
+ "sha2 0.10.9",
  "syntect",
  "two-face",
  "uuid",

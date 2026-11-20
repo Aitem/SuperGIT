@@ -12,12 +12,36 @@ pub struct Release {
     pub tag: String,
     /// The release page.
     pub url: String,
+    /// Its downloadable files (packages, `SHA256SUMS`).
+    #[serde(default)]
+    pub assets: Vec<Asset>,
+}
+
+/// A file attached to a release.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Asset {
+    /// The file name, such as `supergit-macos-arm64.zip`.
+    pub name: String,
+    /// Its download URL.
+    pub url: String,
+    /// Bytes.
+    pub size: u64,
 }
 
 #[derive(Deserialize)]
 struct Payload {
     tag_name: String,
     html_url: String,
+    #[serde(default)]
+    assets: Vec<AssetPayload>,
+}
+
+#[derive(Deserialize)]
+struct AssetPayload {
+    name: String,
+    browser_download_url: String,
+    #[serde(default)]
+    size: u64,
 }
 
 /// The latest release of `repository` (`owner/name`) on github.com. `gh`
@@ -38,6 +62,15 @@ fn parse(json: &[u8]) -> Result<Release> {
     Ok(Release {
         tag: payload.tag_name,
         url: payload.html_url,
+        assets: payload
+            .assets
+            .into_iter()
+            .map(|asset| Asset {
+                name: asset.name,
+                url: asset.browser_download_url,
+                size: asset.size,
+            })
+            .collect(),
     })
 }
 
@@ -72,12 +105,19 @@ mod tests {
     fn reads_tag_and_page_from_the_api_payload() {
         let json = br#"{"tag_name":"v0.3.0","name":"v0.3.0","draft":false,
             "prerelease":false,"html_url":"https://github.com/Aitem/SuperGIT/releases/tag/v0.3.0",
-            "assets":[{"name":"SHA256SUMS"}]}"#;
+            "assets":[{"name":"SHA256SUMS","size":280,"browser_download_url":
+            "https://github.com/Aitem/SuperGIT/releases/download/v0.3.0/SHA256SUMS"}]}"#;
         assert_eq!(
             parse(json).unwrap(),
             Release {
                 tag: "v0.3.0".into(),
                 url: "https://github.com/Aitem/SuperGIT/releases/tag/v0.3.0".into(),
+                assets: vec![Asset {
+                    name: "SHA256SUMS".into(),
+                    url: "https://github.com/Aitem/SuperGIT/releases/download/v0.3.0/SHA256SUMS"
+                        .into(),
+                    size: 280,
+                }],
             }
         );
         assert!(parse(br#"{"message":"Not Found"}"#).is_err());

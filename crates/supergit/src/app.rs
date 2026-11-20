@@ -327,6 +327,9 @@ pub struct SuperGitApp {
     /// A release newer than this build, from the last update check.
     update: Option<sg_github::Release>,
     update_task: Option<Task<()>>,
+    /// Downloading or installing `update`, or installed and awaiting a restart.
+    update_job: Option<update_check::UpdateJob>,
+    update_job_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -520,6 +523,8 @@ impl SuperGitApp {
             project_avatars: HashMap::new(),
             update: None,
             update_task: None,
+            update_job: None,
+            update_job_task: None,
             _subscriptions: vec![
                 subscription,
                 switcher_subscription,

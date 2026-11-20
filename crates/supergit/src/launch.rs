@@ -79,6 +79,15 @@ pub fn reveal_in_finder(dir: &Path) -> Result<()> {
     spawn(opener().arg(dir))
 }
 
+/// Show `file` in the file manager: selected in Finder, elsewhere its
+/// folder.
+pub fn reveal_file(file: &Path) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return spawn(Command::new("open").arg("-R").arg(file));
+    }
+    spawn(opener().arg(file.parent().unwrap_or(file)))
+}
+
 pub fn open_url(url: &str) -> Result<()> {
     spawn(opener().arg(url))
 }

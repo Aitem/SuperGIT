@@ -279,10 +279,17 @@ Update checks (`updates.rs`, `app/update_check.rs`): the latest release of
 `Aitem/SuperGIT` (`sg_github::latest_release`: `gh api`, else `curl` against
 the public API) at startup and then at most every 12 hours, restarts
 included (`updates.json` in the support dir); a newer tag than
-`CARGO_PKG_VERSION` shows a title bar button that opens its release page.
-SuperGIT ▸ Check for Updates… checks at once. Screenshot runs stay offline
-unless `SUPERGIT_DEBUG_UPDATE=<version>` (screenshot builds) pretends to run
-that version and checks right away.
+`CARGO_PKG_VERSION` shows a title bar button whose menu installs it, saves
+it to Downloads or opens its release page. SuperGIT ▸ Check for Updates…
+checks at once. `updates/install.rs` downloads this platform's package with
+`curl` (no quarantine flag, so the ad-hoc signed app opens), checks it
+against the release's `SHA256SUMS`, unpacks it next to the target (the
+`.app` bundle, or the Linux binary; never a build in a Cargo target dir),
+runs its `--help`, swaps it in by rename, and "Restart to Update" starts it
+once this process has exited. Screenshot runs stay offline unless
+`SUPERGIT_DEBUG_UPDATE=<version>` (screenshot builds) pretends to run that
+version and checks right away; `SUPERGIT_DEBUG_UPDATE_INSTALL=1` then
+installs it (run a copy of the binary inside a stand-in `SuperGIT.app`).
 
 App-launch specifics (`main.rs`, `shell_env.rs`, `recent.rs`): a Dock launch
 has cwd `/` and launchd's minimal PATH, so `shell_env` imports the login

@@ -116,7 +116,7 @@ impl PrState {
 }
 
 pub use job_log::{ActionsJob, JobLog};
-pub use releases::{Release, latest_release};
+pub use releases::{Asset, Release, latest_release};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Checks {

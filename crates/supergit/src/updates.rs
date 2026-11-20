@@ -5,6 +5,8 @@
 //! do not add checks: a start within `INTERVAL` of the last check uses the
 //! release that check found.
 
+pub mod install;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -107,6 +109,7 @@ mod tests {
         Release {
             tag: tag.into(),
             url: format!("https://github.com/{REPOSITORY}/releases/tag/{tag}"),
+            assets: Vec::new(),
         }
     }
 
