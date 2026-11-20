@@ -12,6 +12,7 @@ mod sidebar;
 mod staged_commit;
 mod staging;
 mod terminal_panel;
+mod update_check;
 mod worktrees;
 
 mod clone_repository;
@@ -83,7 +84,8 @@ actions!(
         AskAgentNewConversation,
         ToggleKeepWorktree,
         CleanUpWorktree,
-        UpdateBase
+        UpdateBase,
+        CheckForUpdates
     ]
 );
 
@@ -329,6 +331,12 @@ pub struct SuperGitApp {
     avatars_task: Option<Task<()>>,
     /// Other projects' avatars, shown at once when they become active again.
     project_avatars: HashMap<PathBuf, avatars::Avatars>,
+    /// A release newer than this build, from the last update check.
+    update: Option<sg_github::Release>,
+    update_task: Option<Task<()>>,
+    /// Downloading or installing `update`, or installed and awaiting a restart.
+    update_job: Option<update_check::UpdateJob>,
+    update_job_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -523,6 +531,10 @@ impl SuperGitApp {
             avatars_root: None,
             avatars_task: None,
             project_avatars: HashMap::new(),
+            update: None,
+            update_task: None,
+            update_job: None,
+            update_job_task: None,
             _subscriptions: vec![
                 subscription,
                 switcher_subscription,
@@ -545,6 +557,7 @@ impl SuperGitApp {
         this.focus_handle.focus(window, cx);
         this.start_polling(cx);
         this.load_inactive_projects(cx);
+        this.start_update_checks(cx);
         this
     }
 
@@ -5272,6 +5285,7 @@ impl SuperGitApp {
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let update = self.update_button(cx);
         let theme = cx.theme();
         h_flex()
             .h(px(26.))
@@ -5311,6 +5325,7 @@ impl SuperGitApp {
                         .child(msg),
                 )
             })
+            .children(update)
             .when(self.repo.is_some(), |bar| {
                 bar.child(self.terminal_button(cx))
             })
@@ -5341,6 +5356,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::ask_agent_new))
             .on_action(cx.listener(Self::toggle_keep_worktree))
             .on_action(cx.listener(Self::clean_up_worktree))
+            .on_action(cx.listener(Self::check_for_updates))
             // With the sidebar shown on macOS, its first row is the title bar.
             .when(!FULL_HEIGHT_PANELS || !self.projects_visible(), |el| {
                 el.child(self.render_title_bar(!self.projects_visible(), window, cx))

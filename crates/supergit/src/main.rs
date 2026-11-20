@@ -23,6 +23,7 @@ mod submodules;
 mod switcher;
 mod syntax;
 mod terminal;
+mod updates;
 mod workspace;
 
 use std::path::PathBuf;
@@ -307,6 +308,7 @@ pub(crate) fn set_app_menus(cx: &mut App) {
         Menu::new("SuperGIT").items(
             [
                 MenuItem::action("Settings…", app::OpenSettings),
+                MenuItem::action("Check for Updates…", app::CheckForUpdates),
                 MenuItem::separator(),
             ]
             .into_iter()
