@@ -135,6 +135,15 @@ Design notes: docs/EMBEDDED_TERMINAL.md.
   `action_context` = the terminal). Programs that track the mouse get
   clicks (right ones too), drags, motion and the wheel instead (libghostty's
   mouse encoder); Shift still selects.
+- Font: Ghostty's `font-family` / `font-size` (`sg_terminal::config` reads
+  its config files at startup; `terminal::TerminalFont` global), else the
+  theme's mono font. Colors stay the app's.
+- Terminal panel (`app/terminal_panel.rs`): `cmd-j` / View ▸ Toggle
+  Terminal / the status bar's Terminal button / the sidebar's "⋯" menu show
+  the user's shell under the review, one per worktree in its folder; shells
+  outlive hiding and worktree switches, end on exit, Kill, worktree cleanup
+  or project close. `terminal::spawn_in` gives shells and agent TUIs the
+  same environment. Screenshot check: `SUPERGIT_DEBUG_TERMINAL_PANEL=1`.
 - Tests: `cargo test -p sg_terminal` (emulation, keys, a real PTY child).
   UI check: write `{"agent_view":"terminal"}` to
   `$SUPERGIT_STATE_DIR/settings.json`, then `SUPERGIT_DEBUG_CHAT=new` (or

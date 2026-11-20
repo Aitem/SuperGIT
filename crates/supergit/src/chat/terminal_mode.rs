@@ -29,44 +29,6 @@ const QUIET: Duration = Duration::from_secs(3);
 /// this long (Claude Code reports no state until a turn starts).
 const SETTLED: Duration = Duration::from_millis(800);
 
-/// Variables that describe *our* surroundings, not the agent's: a terminal
-/// SuperGIT was started from, or a Claude Code session it runs inside
-/// (developing SuperGIT with Claude). Inherited, they mislead the TUI.
-const FOREIGN_ENV: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_CHILD_NOTES_DIR",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_PID",
-    "CLAUDE_EFFORT",
-    "TERM_PROGRAM_VERSION",
-    "TERM_SESSION_ID",
-    "TMUX",
-    "TMUX_PANE",
-    "STY",
-    "ITERM_SESSION_ID",
-    "ITERM_PROFILE",
-    "KITTY_WINDOW_ID",
-    "KITTY_PID",
-    "WEZTERM_PANE",
-    "WEZTERM_UNIX_SOCKET",
-    "GHOSTTY_RESOURCES_DIR",
-    "GHOSTTY_BIN_DIR",
-    "GHOSTTY_SHELL_FEATURES",
-    "ALACRITTY_WINDOW_ID",
-    "ALACRITTY_SOCKET",
-    "KONSOLE_VERSION",
-    "VTE_VERSION",
-    "WT_SESSION",
-    "TERMINAL_EMULATOR",
-    "VSCODE_INJECTION",
-];
-
 /// Terminal-mode state of a conversation.
 #[derive(Default)]
 pub(super) struct TerminalMode {
@@ -210,23 +172,11 @@ impl ChatSession {
                 (program, args)
             }
         };
-        let env = [
-            ("TERM", "xterm-256color"),
-            ("COLORTERM", "truecolor"),
-            ("TERM_PROGRAM", "SuperGIT"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-        .chain([(OsString::from("PWD"), self.cwd.clone().into_os_string())])
-        .collect();
-        Spawn {
+        crate::terminal::spawn_in(
             program,
-            args: args.into_iter().map(OsString::from).collect(),
-            cwd: self.cwd.clone(),
-            env,
-            env_remove: FOREIGN_ENV.iter().map(OsString::from).collect(),
-            size: Default::default(),
-        }
+            args.into_iter().map(OsString::from).collect(),
+            &self.cwd,
+        )
     }
 
     /// The session has a transcript to resume from (`--resume` fails

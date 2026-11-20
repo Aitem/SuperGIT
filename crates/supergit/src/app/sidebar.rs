@@ -880,8 +880,8 @@ impl SuperGitApp {
     }
 
     /// "⋯": the window-wide actions that used to sit in the title bar —
-    /// conversations needing attention, the switcher, repositories,
-    /// appearance and refresh.
+    /// conversations needing attention, the switcher, repositories, the
+    /// terminal panel, appearance and refresh.
     fn app_menu_button(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let owner = cx.entity().downgrade();
         let attention: Vec<(Kind, usize)> = ATTENTION_ORDER
@@ -939,6 +939,14 @@ impl SuperGitApp {
                             Box::new(CloseRepository),
                             |this, window, cx| this.close_repository(&CloseRepository, window, cx),
                         ));
+                }
+                if has_repo {
+                    menu = menu.separator().item(app_item(
+                        &owner,
+                        "Toggle Terminal",
+                        Box::new(ToggleTerminal),
+                        |this, window, cx| this.toggle_terminal(&ToggleTerminal, window, cx),
+                    ));
                 }
                 menu.separator()
                     .submenu("Appearance", window, cx, |mut menu, _, cx| {
