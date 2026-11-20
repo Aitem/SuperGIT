@@ -233,7 +233,7 @@ impl Pulls {
             line_comment: None,
             line_comment_task: None,
             diff,
-            difft: cx.new(|_| DifftView::new(diff_mode(layout))),
+            difft: cx.new(|cx| DifftView::new(diff_mode(layout), cx)),
             diff_shown: None,
             files_filter,
             files_collapsed: HashSet::new(),

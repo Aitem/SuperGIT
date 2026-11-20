@@ -390,8 +390,8 @@ impl SuperGitApp {
         let agent_view = settings.agent_view;
         let changes_diff = new_diff_state(diff_layout, cx);
         let commit_diff = new_diff_state(diff_layout, cx);
-        let changes_difft = cx.new(|_| DifftView::new(diff_mode(diff_layout)));
-        let commit_difft = cx.new(|_| DifftView::new(diff_mode(diff_layout)));
+        let changes_difft = cx.new(|cx| DifftView::new(diff_mode(diff_layout), cx));
+        let commit_difft = cx.new(|cx| DifftView::new(diff_mode(diff_layout), cx));
         let pulls = pulls::Pulls::new(window, diff_layout, cx);
 
         let mut persisted = workspace::load();
@@ -1519,7 +1519,86 @@ impl SuperGitApp {
         self.debug_rebase_once(cx);
         #[cfg(feature = "screenshot")]
         self.debug_commit_once(cx);
+        #[cfg(feature = "screenshot")]
+        self.debug_drag_once(cx);
         cx.notify();
+    }
+
+    /// Screenshot builds only: `SUPERGIT_DEBUG_DRAG=x1,y1,x2,y2` drags the
+    /// mouse between two window points five seconds after startup (press,
+    /// move, release), then prints the window's selected text, which is
+    /// what `cmd-c` copies: for checking text selection (diffs, chat).
+    #[cfg(feature = "screenshot")]
+    fn debug_drag_once(&mut self, cx: &mut Context<Self>) {
+        let Ok(spec) = std::env::var("SUPERGIT_DEBUG_DRAG") else {
+            return;
+        };
+        if std::env::var_os("SUPERGIT_DEBUG_DRAG_DONE").is_some() {
+            return;
+        }
+        let coords: Vec<f32> = spec
+            .split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .collect();
+        let [x1, y1, x2, y2] = coords[..] else {
+            return;
+        };
+        // SAFETY: isolated screenshot builds only, on the main thread.
+        unsafe { std::env::set_var("SUPERGIT_DEBUG_DRAG_DONE", "1") };
+        let Some(window) = cx.windows().first().copied() else {
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            let (from, to) = (point(px(x1), px(y1)), point(px(x2), px(y2)));
+            let middle = point((from.x + to.x) / 2., (from.y + to.y) / 2.);
+            let move_to = |position, pressed_button| {
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button,
+                    modifiers: Modifiers::default(),
+                })
+            };
+            // As a hand would: hover, press, drag in steps, release, with
+            // frames in between (hover and hit tests come from the last one).
+            let steps = [
+                move_to(from, None),
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: from,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                move_to(middle, Some(MouseButton::Left)),
+                move_to(to, Some(MouseButton::Left)),
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: to,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }),
+            ];
+            for step in steps {
+                // An unfocused window draws no frames of its own: draw each
+                // one, so hit tests see the text that is on screen.
+                let _ = window.update(cx, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.dispatch_event(step, cx);
+                });
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let _ = window.update(cx, |_, window, cx| {
+                let text = gpui_kit::base::TextSelection::selected_text(window, cx);
+                eprintln!("SUPERGIT_DEBUG_DRAG selected:\n{text}");
+            });
+        })
+        .detach();
     }
 
     /// Screenshot builds only: `SUPERGIT_DEBUG_COMMIT=<sha prefix>` selects
@@ -1872,8 +1951,8 @@ impl SuperGitApp {
         self.changes_diff = new_diff_state(self.diff_layout, cx);
         self.commit_diff = new_diff_state(self.diff_layout, cx);
         let mode = diff_mode(self.diff_layout);
-        self.changes_difft = cx.new(|_| DifftView::new(mode));
-        self.commit_difft = cx.new(|_| DifftView::new(mode));
+        self.changes_difft = cx.new(|cx| DifftView::new(mode, cx));
+        self.commit_difft = cx.new(|cx| DifftView::new(mode, cx));
     }
 
     fn select_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {

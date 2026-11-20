@@ -331,6 +331,9 @@ real (unfocused) window — keep them few, the user may be working.
 `SUPERGIT_DEBUG_REBASE=<branch>` (screenshot builds) opens the Rebase dialog;
 `SUPERGIT_DEBUG_COMMIT=<sha prefix>` (screenshot builds) selects that History
 commit two seconds after startup, like a click;
+`SUPERGIT_DEBUG_DRAG=x1,y1,x2,y2` (screenshot builds) drags the mouse between
+two window points (= PNG pixels) five seconds after startup, drawing a frame
+per step, and prints what `cmd-c` would copy (text selection checks);
 `SUPERGIT_DEBUG_PR=<number>` (screenshot builds, with `SUPERGIT_TAB=prs`)
 selects that pull request, `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its details
 (conversation, review threads), `SUPERGIT_DEBUG_PR_FILES=1` opens its Files
@@ -388,7 +391,11 @@ never commit, push or create worktrees there without asking.
   (`diff_layout`, `difftastic`) and the toolbar above each diff. The
   difftastic view needs `difft` on PATH (`DFT_UNSTABLE=yes --display json`);
   JSON gives novel token ranges only, so `sg_git::difftastic` reads both
-  sides itself and lines them up. Screenshot checks: write
+  sides itself and lines them up. Its text selection
+  (`difft_view/selection.rs`) works like the built-in diff's: the list is
+  one selection participant, the ends are (file, side, line, offset) keys,
+  a selection stays on the side it starts on, and the copy is read from the
+  data, not from the rows on screen. Screenshot checks: write
   `{"diff_layout":"split","difftastic":true}` to
   `$SUPERGIT_STATE_DIR/settings.json`.
 - **Submodules**: every patch is `git diff` with `PATCH_OPTIONS`
