@@ -3,6 +3,9 @@
 //! with syntax colors, where only the tokens difftastic found novel are
 //! emphasized. Reformatting that changes no syntax shows as no change.
 
+mod selection;
+
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -20,6 +23,7 @@ use sg_git::SubmoduleChange;
 use sg_git::difftastic::{self, FilePair, FileRequest, Line, Outcome, Source, StructuralFile};
 
 use crate::syntax::{self, LineHighlights};
+use selection::{CodeText, Geometry, Selected, SelectionLayer};
 
 /// Unchanged rows shown around each change, as in the built-in diff.
 const CONTEXT_ROWS: usize = 3;
@@ -133,10 +137,43 @@ pub struct DifftView {
     horizontal: ScrollHandle,
     generation: u64,
     task: Option<Task<()>>,
+    /// Text selection (drag, `cmd-c`): one participant for the whole list.
+    selection: gpui_kit::base::TextSelectionHandle,
+    /// Focused when a selection starts, so `cmd-c` reaches the window's
+    /// copy (not, say, the chat's composer).
+    focus: FocusHandle,
+    geometry: Rc<RefCell<Geometry>>,
+    /// Counts the contents shown (another commit, worktree); a selection
+    /// made in earlier contents is dropped.
+    contents: u64,
+    selection_contents: u64,
+    _selection: Subscription,
 }
 
 impl DifftView {
-    pub fn new(mode: DiffMode) -> Self {
+    pub fn new(mode: DiffMode, cx: &mut Context<Self>) -> Self {
+        let geometry = Rc::new(RefCell::new(Geometry::default()));
+        let selection = selection::handle(cx.entity().downgrade(), &geometry, cx);
+        let focus = cx.focus_handle();
+        selection.focus_with(
+            {
+                let focus = focus.clone();
+                move |window, cx| window.focus(&focus, cx)
+            },
+            cx,
+        );
+        let view = cx.entity().downgrade();
+        let subscription = selection.subscribe(
+            move |event, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if let gpui_kit::base::TextSelectionEvent::SelectionChanged(Some(_)) = event {
+                        this.selection_contents = this.contents;
+                    }
+                    cx.notify();
+                });
+            },
+            cx,
+        );
         Self {
             status: Status::Empty,
             request: None,
@@ -152,7 +189,21 @@ impl DifftView {
             horizontal: ScrollHandle::new(),
             generation: 0,
             task: None,
+            selection,
+            focus,
+            geometry,
+            contents: 0,
+            selection_contents: 0,
+            _selection: subscription,
         }
+    }
+
+    /// The selected text, for `cmd-c`.
+    fn selected_text(&self, cx: &App) -> String {
+        Selected::of(&self.selection, cx)
+            .filter(|_| self.selection_contents == self.contents)
+            .map(|selected| selected.text(&self.files))
+            .unwrap_or_default()
     }
 
     pub fn set_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
@@ -170,6 +221,7 @@ impl DifftView {
         self.request = None;
         self.status = Status::Empty;
         self.files = Rc::default();
+        self.contents += 1;
         self.cache.clear();
         self.rebuild(true);
         cx.notify();
@@ -187,6 +239,7 @@ impl DifftView {
         if !refresh {
             // Another commit or worktree: start from the top, empty.
             self.files = Rc::default();
+            self.contents += 1;
             self.collapsed.clear();
             self.expanded.clear();
             self.rebuild(true);
@@ -475,6 +528,8 @@ struct Presentation {
     sign_width: Pixels,
     /// Split: long lines wrap within their half.
     wrap: bool,
+    selected: Option<Selected>,
+    geometry: Rc<RefCell<Geometry>>,
 }
 
 impl Render for DifftView {
@@ -482,6 +537,17 @@ impl Render for DifftView {
         let theme = cx.theme().clone();
         let frame = v_flex()
             .id(("difft", cx.entity_id()))
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &gpui_kit::base::input::Copy, _, cx| {
+                // Not the window's copy, which trims: code keeps the
+                // indentation of its first line.
+                let text = this.selected_text(cx);
+                if text.is_empty() {
+                    cx.propagate();
+                } else {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }))
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -521,6 +587,13 @@ impl Render for DifftView {
         // GitHub; Unified keeps lines whole and scrolls sideways.
         let wrap = self.mode == DiffMode::Split;
         let text_width = char_width * self.max_chars as f32 + rem;
+        let selected = Selected::of(&self.selection, cx);
+        if selected.is_some() && self.selection_contents != self.contents {
+            // Made in contents no longer shown.
+            window.defer(cx, |window, cx| {
+                gpui_kit::base::TextSelection::clear(window, cx)
+            });
+        }
         let content_width = rem + gutter_width * 2. + sign_width + text_width;
         let presentation = Rc::new(Presentation {
             files: self.files.clone(),
@@ -532,6 +605,8 @@ impl Render for DifftView {
             gutter_width,
             sign_width,
             wrap,
+            selected: selected.filter(|_| self.selection_contents == self.contents),
+            geometry: self.geometry.clone(),
         });
         let rows = list(self.list.clone(), move |ix, window, cx| {
             render_item(ix, &presentation, window, cx)
@@ -543,7 +618,7 @@ impl Render for DifftView {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .child(
+            .child(SelectionLayer::new(
                 div()
                     .id("difft-horizontal")
                     .size_full()
@@ -554,7 +629,11 @@ impl Render for DifftView {
                     } else {
                         rows.w(content_width).min_w_full()
                     }),
-            )
+                self.list.clone(),
+                self.horizontal.clone(),
+                self.selection.clone(),
+                self.geometry.clone(),
+            ))
             .when(!wrap, |el| {
                 el.child(ScrollableMask::new(Axis::Horizontal, &self.horizontal).id("difft-wheel"))
             })
@@ -656,7 +735,7 @@ fn render_item(ix: usize, p: &Presentation, _window: &mut Window, cx: &mut App) 
                     .min_w_0()
                     .overflow_hidden()
                     .when_some(background, |el, background| el.bg(background))
-                    .child(code_line(prepared, side, ix, p, cx))
+                    .child(code_line(*file, prepared, side, ix, p, cx))
             };
             h_flex()
                 .id(("difft-row", ix))
@@ -675,11 +754,11 @@ fn render_item(ix: usize, p: &Presentation, _window: &mut Window, cx: &mut App) 
             old,
             new,
             kind,
-        } => unified_line(&p.files[*file], *old, *new, *kind, p, cx),
+        } => unified_line(*file, &p.files[*file], *old, *new, *kind, p, cx),
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
     Old,
     New,
@@ -828,8 +907,25 @@ fn code_row(p: &Presentation, cx: &App) -> Div {
         })
 }
 
-/// The text part of a code row.
-fn code_cell(text: StyledText, p: &Presentation) -> Div {
+/// The text part of a code row, selectable (drag, `cmd-c`): it shows
+/// `lines` of `file` (Unified shows an unchanged line once for both sides).
+fn code_cell(
+    file: usize,
+    lines: Vec<(Side, usize)>,
+    line: &Line,
+    highlights: Option<&LineHighlights>,
+    status: Hsla,
+    p: &Presentation,
+    cx: &App,
+) -> Div {
+    let mut styles = code_highlights(line, highlights, status, cx);
+    if let Some(range) = p
+        .selected
+        .and_then(|selected| selected.in_line(file, &lines, &line.text))
+    {
+        styles = selection::overlay_background(styles, range, cx.theme().selection);
+    }
+    let text = SharedString::from(line.text.clone());
     div()
         .map(|el| {
             if p.wrap {
@@ -838,11 +934,18 @@ fn code_cell(text: StyledText, p: &Presentation) -> Div {
                 el.flex_shrink_0()
             }
         })
-        .child(text)
+        .child(CodeText::new(
+            StyledText::new(text.clone()).with_highlights(styles),
+            text,
+            file,
+            lines,
+            p.geometry.clone(),
+        ))
 }
 
 /// One side's line in Split mode; `ix` is `None` where the side has no line.
 fn code_line(
+    file: usize,
     prepared: &Prepared,
     side: Side,
     ix: Option<usize>,
@@ -872,13 +975,19 @@ fn code_line(
                 .child(sign),
         )
         .child(code_cell(
-            code_text(line, highlights.get(ix), status, cx),
+            file,
+            vec![(side, ix)],
+            line,
+            highlights.get(ix),
+            status,
             p,
+            cx,
         ))
         .into_any_element()
 }
 
 fn unified_line(
+    file: usize,
     prepared: &Prepared,
     old: Option<usize>,
     new: Option<usize>,
@@ -893,12 +1002,20 @@ fn unified_line(
         LineKind::Added => (theme.success, "+"),
     };
     // Unchanged lines show the new text; difftastic considers both the same.
-    let (line, highlights) = match (kind, new, old) {
-        (LineKind::Removed, _, Some(old)) | (LineKind::Context, None, Some(old)) => {
-            (prepared.file.old.get(old), prepared.old_syntax.get(old))
-        }
-        (_, Some(new), _) => (prepared.file.new.get(new), prepared.new_syntax.get(new)),
-        _ => (None, None),
+    let (side, ix, line, highlights) = match (kind, new, old) {
+        (LineKind::Removed, _, Some(old)) | (LineKind::Context, None, Some(old)) => (
+            Side::Old,
+            old,
+            prepared.file.old.get(old),
+            prepared.old_syntax.get(old),
+        ),
+        (_, Some(new), _) => (
+            Side::New,
+            new,
+            prepared.file.new.get(new),
+            prepared.new_syntax.get(new),
+        ),
+        _ => (Side::New, 0, None, None),
     };
     let changed = kind != LineKind::Context;
     code_row(p, cx)
@@ -913,7 +1030,15 @@ fn unified_line(
                 .child(sign),
         )
         .when_some(line, |el, line| {
-            el.child(code_cell(code_text(line, highlights, status, cx), p))
+            // An unchanged line is both sides' line: a selection on either
+            // side passes through it.
+            let lines = match (kind, old, new) {
+                (LineKind::Context, Some(old), Some(new)) => {
+                    vec![(Side::New, new), (Side::Old, old)]
+                }
+                _ => vec![(side, ix)],
+            };
+            el.child(code_cell(file, lines, line, highlights, status, p, cx))
         })
         .into_any_element()
 }
@@ -932,13 +1057,13 @@ fn gutter(ix: Option<usize>, tint: Option<Hsla>, p: &Presentation, cx: &App) -> 
         .when_some(ix, |el, ix| el.child((ix + 1).to_string()))
 }
 
-/// The line with syntax colors, and difftastic's novel tokens emphasized.
-fn code_text(
+/// The line's syntax colors, and difftastic's novel tokens emphasized.
+fn code_highlights(
     line: &Line,
     highlights: Option<&LineHighlights>,
     status: Hsla,
     cx: &App,
-) -> StyledText {
+) -> Vec<(Range<usize>, HighlightStyle)> {
     let theme = &cx.theme().highlight_theme;
     let syntax: Vec<(Range<usize>, HighlightStyle)> = highlights
         .into_iter()
@@ -954,8 +1079,7 @@ fn code_text(
             },
         )
     });
-    StyledText::new(SharedString::from(line.text.clone()))
-        .with_highlights(combine_highlights(syntax, novel).collect::<Vec<_>>())
+    combine_highlights(syntax, novel).collect()
 }
 
 #[cfg(test)]
