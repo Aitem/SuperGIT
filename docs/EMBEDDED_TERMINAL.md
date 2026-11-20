@@ -130,6 +130,18 @@ off").
   that is already running keeps its theme until it restarts, unless it
   reloads `--settings` files (not verified).
 
+## Font
+
+The terminal (agent TUIs and the terminal panel) uses the font of the
+user's Ghostty: `font-family` and `font-size` from Ghostty's config files
+(`sg_terminal::config`: `~/.config/ghostty/config`, then on macOS
+`~/Library/Application Support/com.mitchellh.ghostty/config`, both also as
+`config.ghostty`, with `config-file` includes). The first listed family
+that is installed wins. Without a config, or with none of its fonts
+installed, it is the theme's monospace font (Menlo 13 on macOS). The files
+are read once at startup, off the main thread; Ghostty's colors and theme
+are not used (the terminal keeps the app's colors).
+
 ## Status and attention
 
 Claude Code asks `OSC 7501 ; ?` (the program-status protocol). libghostty
@@ -151,6 +163,35 @@ Text typed into a terminal tab waits until the TUI has drawn its screen and
 gone quiet for 0.8 s. Claude reports no state before its first turn, so this
 is the only readiness signal. This covers issue drafts, Ask agent context
 (pasted, not sent) and `SUPERGIT_DEBUG_CHAT=prompt:` (pasted and sent).
+
+## Terminal panel (`cmd-j`)
+
+As in VS Code: `cmd-j` (`ctrl-j` on Linux), View ▸ Toggle Terminal, or the
+Terminal button in the title bar (panel icon, lit while open) show a panel
+under the review with the user's shell (`$SHELL`, a login shell on macOS)
+in the selected worktree's folder (`app/terminal_panel.rs`).
+
+- One shell per worktree, started the first time the panel shows that
+  worktree. Shells keep running while the panel is hidden or another
+  worktree or project is shown. Cleaning up a worktree or closing its
+  project ends its shell.
+- A shell that exits (`exit`, `ctrl-d`) is gone, and the panel hides if it
+  showed it; the next `cmd-j` starts a new one. Kill in the header does the
+  same for a stuck shell. SuperGIT no longer opens external terminal apps
+  (`SUPERGIT_TERMINAL` is gone).
+- The panel spans the review only: the sidebar and the agent panel keep
+  their full height. Its height is saved per project (`terminal_height`);
+  whether it is open is not.
+- Same environment as agent TUIs (`terminal::spawn_in`): `TERM`,
+  `COLORTERM`, `TERM_PROGRAM=SuperGIT`, without SuperGIT's own
+  surroundings, so `claude` started in it is not a sub-session.
+- `ctrl-j` stays the app's inside the terminal on Linux (the shell gets
+  Enter for a new line anyway), so the panel can be hidden from inside it.
+- A session row's Terminal button (Agents tab) resumes the session in the
+  agent panel as the agent's TUI; with the panel switched to Terminal, Open
+  does that already and the button is not shown.
+- Screenshot check: `SUPERGIT_DEBUG_TERMINAL_PANEL=1` opens the panel once
+  the worktrees load.
 
 ## Verified
 
@@ -180,7 +221,7 @@ TUI in the terminal.
 - Clickable OSC 8 links and file paths that open in the diff view.
 - Switching an idle conversation between chat and terminal (same session
   id: stop one driver, resume in the other).
-- Plain shell tabs per worktree.
+- Several shells per worktree (tabs in the terminal panel).
 - Codex: new sessions get no id until its rollout exists, so a restored
   Codex terminal tab starts a fresh session.
 - When `libghostty-vt` reaches crates.io with 1.0 support, move off the git

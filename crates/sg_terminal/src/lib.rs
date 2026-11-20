@@ -3,6 +3,7 @@
 //! data the app draws. UI-agnostic like the other `sg_*` crates; the GPUI
 //! side lives in `supergit/src/terminal.rs`.
 
+pub mod config;
 pub mod keys;
 pub mod pty;
 pub mod term;

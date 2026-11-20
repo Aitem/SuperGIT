@@ -1,6 +1,7 @@
-//! The embedded terminal: an agent's own TUI (`claude`, `codex`) on a PTY,
-//! emulated by Ghostty's libghostty-vt (`sg_terminal`) and drawn here with
-//! GPUI, in the app's colors (`theme`).
+//! The embedded terminal: an agent's own TUI (`claude`, `codex`) or the
+//! user's shell (the terminal panel, `cmd-j`) on a PTY, emulated by
+//! Ghostty's libghostty-vt (`sg_terminal`) and drawn here with GPUI, in the
+//! app's colors (`theme`).
 //!
 //! The terminal lives on the main thread (libghostty handles are `!Send`);
 //! a reader thread only moves bytes. Output is fed in batches with one
@@ -9,6 +10,8 @@
 
 pub mod theme;
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
@@ -34,6 +37,135 @@ const PADDING: f32 = 6.;
 const AUTOSCROLL_EVERY: Duration = Duration::from_millis(60);
 /// The longest a program may hold a synchronized frame back.
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Variables that describe *our* surroundings, not the program's: a
+/// terminal SuperGIT was started from, or a Claude Code session it runs
+/// inside (developing SuperGIT with Claude). Inherited, they mislead a TUI
+/// (an agent, or one started from a shell here).
+const FOREIGN_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_CHILD_NOTES_DIR",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "TERM_PROGRAM_VERSION",
+    "TERM_SESSION_ID",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "GHOSTTY_SHELL_FEATURES",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "KONSOLE_VERSION",
+    "VTE_VERSION",
+    "WT_SESSION",
+    "TERMINAL_EMULATOR",
+    "VSCODE_INJECTION",
+];
+
+/// `program args` in `cwd` on our PTY, told it runs in SuperGIT's terminal
+/// (`TERM`, true color) and without the variables of SuperGIT's own
+/// surroundings.
+pub fn spawn_in(program: PathBuf, args: Vec<OsString>, cwd: &Path) -> Spawn {
+    let env = [
+        ("TERM", "xterm-256color"),
+        ("COLORTERM", "truecolor"),
+        ("TERM_PROGRAM", "SuperGIT"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+    .chain([(OsString::from("PWD"), cwd.as_os_str().to_owned())])
+    .collect();
+    Spawn {
+        program,
+        args,
+        cwd: cwd.to_path_buf(),
+        env,
+        env_remove: FOREIGN_ENV.iter().map(OsString::from).collect(),
+        size: Size::default(),
+    }
+}
+
+/// The user's interactive shell (`$SHELL`) in `cwd`; a login shell on
+/// macOS, as Terminal.app and VS Code start it.
+pub fn shell_in(cwd: &Path) -> Spawn {
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let fallback = if cfg!(target_os = "macos") {
+                "/bin/zsh"
+            } else {
+                "/bin/bash"
+            };
+            if Path::new(fallback).exists() {
+                fallback.into()
+            } else {
+                "/bin/sh".into()
+            }
+        });
+    let args = if cfg!(target_os = "macos") {
+        vec![OsString::from("-l")]
+    } else {
+        Vec::new()
+    };
+    spawn_in(shell, args, cwd)
+}
+
+/// The font of the user's Ghostty (`font-family`, `font-size`): the
+/// embedded terminal looks like their own. Until it is looked up, and
+/// without one installed, the theme's monospace font.
+#[derive(Clone, Default)]
+pub struct TerminalFont {
+    family: Option<SharedString>,
+    size: Option<Pixels>,
+}
+
+impl Global for TerminalFont {}
+
+/// Look up the terminal font off the main thread (config files, and the
+/// installed families: Ghostty's list may name fonts this machine lacks).
+pub fn load_font(cx: &mut App) {
+    cx.set_global(TerminalFont::default());
+    let text_system = cx.text_system().clone();
+    cx.spawn(async move |cx| {
+        let font = cx
+            .background_executor()
+            .spawn(async move {
+                let config = sg_terminal::config::font();
+                let family = if config.families.is_empty() {
+                    None
+                } else {
+                    let installed = text_system.all_font_names();
+                    config
+                        .families
+                        .into_iter()
+                        .find(|family| installed.iter().any(|name| name == family))
+                };
+                TerminalFont {
+                    family: family.map(SharedString::from),
+                    size: config.size.map(px),
+                }
+            })
+            .await;
+        cx.update(|cx| cx.set_global(font));
+    })
+    .detach();
+}
 
 pub enum TerminalEvent {
     /// The program wrote something.
@@ -120,6 +252,7 @@ impl TerminalView {
             cx.on_focus(&focus, window, |this, _, cx| this.focus_changed(true, cx)),
             cx.on_blur(&focus, window, |this, _, cx| this.focus_changed(false, cx)),
             cx.observe_global::<gpui_kit::component::Theme>(|this, cx| this.theme_changed(cx)),
+            cx.observe_global::<TerminalFont>(|_, cx| cx.notify()),
         ];
         Self {
             terminal,
@@ -153,6 +286,11 @@ impl TerminalView {
 
     pub fn exit_code(&self) -> Option<Option<i32>> {
         self.exited
+    }
+
+    /// Why the program could not start (or the terminal could not).
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     /// Output within `window`, not just the echo of a key just typed.
@@ -648,9 +786,13 @@ fn hsla(c: Rgb) -> Hsla {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let family = theme.mono_font_family.clone();
+        let chosen = cx.try_global::<TerminalFont>().cloned().unwrap_or_default();
+        let family = chosen
+            .family
+            .unwrap_or_else(|| theme.mono_font_family.clone());
         let rem = window.rem_size();
-        let font_size = rem * (f32::from(theme.mono_font_size) / 16.);
+        let size = chosen.size.unwrap_or(theme.mono_font_size);
+        let font_size = rem * (f32::from(size) / 16.);
         let background = hsla(self.screen.background);
         let selection = theme.selection;
         let focused = self.focus.is_focused(window);

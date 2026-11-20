@@ -100,6 +100,8 @@ pub struct RepositoryView {
     /// The pull request list beside a PR's details.
     pub pulls_width: f32,
     pub chat_open: bool,
+    /// The terminal panel under the review (`cmd-j`).
+    pub terminal_height: f32,
     /// File lists (Changes, and a commit's files in History) show a folder
     /// tree instead of flat paths.
     pub changes_tree: bool,
@@ -130,6 +132,7 @@ impl Default for RepositoryView {
             commit_files_width: 240.,
             pulls_width: 320.,
             chat_open: true,
+            terminal_height: 280.,
             changes_tree: false,
         }
     }
@@ -142,6 +145,7 @@ impl RepositoryView {
         self.history_width = finite(self.history_width, 300.).clamp(160., 800.);
         self.commit_files_width = finite(self.commit_files_width, 240.).clamp(140., 600.);
         self.pulls_width = finite(self.pulls_width, 320.).clamp(200., 640.);
+        self.terminal_height = finite(self.terminal_height, 280.).clamp(100., 2000.);
     }
 }
 

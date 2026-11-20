@@ -64,10 +64,6 @@ USAGE:
     supergit --dump [PATH]   print worktrees, agent sessions and PRs as text
 
 ENV:
-    SUPERGIT_TERMINAL   macOS: ghostty | iterm | terminal; Linux: ghostty | kitty |
-                        wezterm | alacritty | konsole | gnome-terminal | ptyxis |
-                        xfce4-terminal | foot | xterm (default: $TERMINAL, the
-                        desktop's own, then the first installed)
     SUPERGIT_EDITOR     editor CLI for \"Editor\" (default: VS Code)
     SUPERGIT_NEW_INSTANCE  Linux: start a separate instance instead of handing
                         the folder to the running one
@@ -76,7 +72,8 @@ ENV:
 /// Keys inside the embedded terminal. Copy and paste are its own actions;
 /// keys that outer bindings would take (Tab moves focus, and on Linux the
 /// app's `ctrl-` shortcuts and `ctrl-c`) are released to the program:
-/// `NoAction` in the deeper context outranks them.
+/// `NoAction` in the deeper context outranks them. `ctrl-j` stays the app's
+/// on Linux, as in VS Code: it hides the terminal panel from inside it.
 fn bind_terminal_keys(cx: &mut App) {
     let context = Some(terminal::KEY_CONTEXT);
     cx.bind_keys([
@@ -182,6 +179,7 @@ fn main() -> Result<()> {
     app.run(move |cx| {
         gpui_kit::init(cx);
         appearance::init(cx);
+        terminal::load_font(cx);
         let mut notifications = notifications::init(cx);
 
         cx.bind_keys([
@@ -191,6 +189,7 @@ fn main() -> Result<()> {
             KeyBinding::new(shortcut!("shift-o"), app::CloseRepository, None),
             KeyBinding::new(shortcut!("l"), app::ToggleClaude, None),
             KeyBinding::new(shortcut!("b"), app::ToggleSidebar, None),
+            KeyBinding::new(shortcut!("j"), app::ToggleTerminal, None),
             KeyBinding::new(shortcut!("n"), app::NewClaudeChat, None),
             KeyBinding::new(shortcut!("p"), app::OpenSwitcher, None),
             KeyBinding::new(shortcut!(","), app::OpenSettings, None),
@@ -338,6 +337,7 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Toggle Sidebar", app::ToggleSidebar),
             MenuItem::action("Toggle Agent Panel", app::ToggleClaude),
+            MenuItem::action("Toggle Terminal", app::ToggleTerminal),
             MenuItem::action("New Agent Conversation", app::NewClaudeChat),
             MenuItem::separator(),
             MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),

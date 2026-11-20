@@ -396,6 +396,8 @@ impl SuperGitApp {
                     }
                 }
                 workspace::save_repository(&root,view);
+                // Shells are keyed by worktree path: end them whichever project is shown.
+                this.drop_shells(|path| removed.contains(path));
                 let same_repository=this.repo.as_ref().is_some_and(|repo| repo.root == root);
                 if same_repository {
                     for path in &removed {this.chats.remove(path);this.active_chat.remove(path);this.chat_projects.remove(path);this.review_views.remove(path);}

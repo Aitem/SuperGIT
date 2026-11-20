@@ -11,6 +11,7 @@ mod pulls;
 mod sidebar;
 mod staged_commit;
 mod staging;
+mod terminal_panel;
 mod worktrees;
 
 mod clone_repository;
@@ -49,7 +50,7 @@ use crate::chat::ChatSession;
 use crate::difft_view::{self, DifftView};
 use crate::file_tree::{self, TreeRow};
 use crate::graph;
-use crate::launch::{self, TerminalApp};
+use crate::launch;
 use crate::model::{self, Details, History, LoadState, SharedSessionIndex, WorktreeInfo};
 use crate::notifications;
 use crate::settings::{Appearance, DiffLayout};
@@ -71,6 +72,7 @@ actions!(
         CloseRepository,
         ToggleClaude,
         ToggleSidebar,
+        ToggleTerminal,
         NewClaudeChat,
         OpenSwitcher,
         CloseSwitcher,
@@ -113,6 +115,8 @@ impl MainTab {
 #[derive(Clone, Copy)]
 enum LayoutPanel {
     Chat,
+    /// The terminal panel's height (under the review).
+    Terminal,
     Changes,
     History,
     CommitFiles,
@@ -229,7 +233,6 @@ pub struct SuperGitApp {
     clone_repository: Option<clone_repository::CloneForm>,
     clone_focus: FocusHandle,
     launch_dir: PathBuf,
-    terminal: TerminalApp,
     index: SharedSessionIndex,
 
     worktrees: Vec<WorktreeInfo>,
@@ -298,6 +301,8 @@ pub struct SuperGitApp {
     /// The repository root each conversation's worktree belongs to.
     chat_projects: HashMap<PathBuf, PathBuf>,
     chat_open: bool,
+    /// Shells per worktree under the review (`cmd-j`).
+    terminal_panel: terminal_panel::TerminalPanel,
     message: Option<(String, bool)>,
 
     persisted: workspace::Store,
@@ -446,7 +451,6 @@ impl SuperGitApp {
             clone_repository: None,
             clone_focus: cx.focus_handle(),
             launch_dir,
-            terminal: TerminalApp::detect(),
             index: Default::default(),
             worktrees: Vec::new(),
             load_error: None,
@@ -492,6 +496,7 @@ impl SuperGitApp {
             active_chat: HashMap::new(),
             chat_projects: HashMap::new(),
             chat_open,
+            terminal_panel: terminal_panel::TerminalPanel::new(cx),
             message: None,
             persisted,
             review_views: HashMap::new(),
@@ -888,7 +893,8 @@ impl SuperGitApp {
         state: &Entity<ResizableState>,
         cx: &mut Context<Self>,
     ) {
-        let ix = if matches!(panel, LayoutPanel::Chat) {
+        // The chat and the terminal come second in their groups.
+        let ix = if matches!(panel, LayoutPanel::Chat | LayoutPanel::Terminal) {
             1
         } else {
             0
@@ -904,6 +910,7 @@ impl SuperGitApp {
             .or_default();
         match panel {
             LayoutPanel::Chat => view.chat_width = width,
+            LayoutPanel::Terminal => view.terminal_height = width,
             LayoutPanel::Changes => view.changes_width = width,
             LayoutPanel::History => view.history_width = width,
             LayoutPanel::CommitFiles => view.commit_files_width = width,
@@ -1539,6 +1546,23 @@ impl SuperGitApp {
                 });
             }
         }
+        // `SUPERGIT_DEBUG_TERMINAL_PANEL=1`: the terminal panel (`cmd-j`).
+        if std::env::var_os("SUPERGIT_DEBUG_TERMINAL_PANEL").is_some()
+            && std::env::var_os("SUPERGIT_DEBUG_TERMINAL_PANEL_DONE").is_none()
+            && self.selected.is_some()
+            && let Some(window) = cx.windows().first().copied()
+        {
+            // SAFETY: isolated screenshot builds only, on the main thread.
+            unsafe { std::env::set_var("SUPERGIT_DEBUG_TERMINAL_PANEL_DONE", "1") };
+            let this = cx.entity();
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.toggle_terminal(&ToggleTerminal, window, cx)
+                    });
+                });
+            });
+        }
         let Ok(spec) = std::env::var("SUPERGIT_DEBUG_CHAT") else {
             return;
         };
@@ -1974,6 +1998,7 @@ impl SuperGitApp {
             self.repo = Some(repo);
             self.reset_view(cx);
             self.chat_layout = cx.new(|_| ResizableState::default());
+            self.terminal_panel.reset_layout(cx);
             self.changes_layout = cx.new(|_| ResizableState::default());
             self.history_layout = cx.new(|_| ResizableState::default());
             self.commit_files_layout = cx.new(|_| ResizableState::default());
@@ -2355,8 +2380,21 @@ impl SuperGitApp {
         self.new_chat(window, cx);
     }
 
-    /// Open an existing agent session in the panel (history + resume).
+    /// Open an existing agent session in the panel (history + resume), as
+    /// the panel's Chat | Terminal switch says.
     fn open_session_chat(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_session(session, self.agent_view, window, cx);
+    }
+
+    /// Open an existing agent session in the panel as a chat or as the
+    /// agent's TUI; one already open is shown as it is.
+    fn open_session(
+        &mut self,
+        session: Session,
+        view: crate::settings::AgentView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(path) = self.selected.clone() else {
             return;
         };
@@ -2371,7 +2409,7 @@ impl SuperGitApp {
             cx.notify();
             return;
         }
-        if self.agent_view == crate::settings::AgentView::Terminal {
+        if view == crate::settings::AgentView::Terminal {
             let chat =
                 cx.new(|cx| ChatSession::resume_terminal(path.clone(), &session, window, cx));
             self.add_chat(path, chat.clone(), window, cx);
@@ -2775,6 +2813,7 @@ impl SuperGitApp {
                                         })),
                                 )
                             })
+                            .when(self.repo.is_some(), |el| el.child(self.terminal_button(cx)))
                             .child({
                                 let current = crate::appearance::current(cx);
                                 Button::new("appearance")
@@ -2954,9 +2993,6 @@ impl SuperGitApp {
             }
             Err(e) => e.clone(),
         };
-        let terminal = self.terminal;
-
-        let p3 = path.clone();
         let p4 = path.clone();
         let last_session = info.sessions.first().cloned();
 
@@ -3035,17 +3071,6 @@ impl SuperGitApp {
                                 })),
                         )
                     })
-                    .child(
-                        Button::new("terminal")
-                            .label(terminal.name())
-                            .small()
-                            .ghost()
-                            .tooltip(format!("Open a shell here in {}", terminal.name()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let r = launch::open_terminal(terminal, &p3, None);
-                                this.report(r, "Terminal opened", cx);
-                            })),
-                    )
                     .child(
                         Button::new("editor")
                             .label("Editor")
@@ -4725,8 +4750,6 @@ impl SuperGitApp {
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let terminal = self.terminal;
-        let path = info.wt.path.clone();
         if info.sessions.is_empty() {
             return v_flex()
                 .size_full()
@@ -4750,11 +4773,14 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
+        // Open follows the panel's Chat | Terminal switch; with Chat, Terminal
+        // opens the agent's own TUI instead.
+        let chat_view = self.agent_view == crate::settings::AgentView::Chat;
         let rows = info.sessions.iter().enumerate().map(|(ix, s)| {
-            let id = s.id.clone();
             let provider = s.provider;
-            let dir = s.start_cwd.clone().unwrap_or_else(|| path.clone());
+            let command = launch::resume_command(provider, &s.id);
             let session = s.clone();
+            let in_terminal = s.clone();
             session_row(ix, s, theme)
                 .child(
                     Button::new(("open-session", ix))
@@ -4765,21 +4791,26 @@ impl SuperGitApp {
                             this.open_session_chat(session.clone(), window, cx)
                         })),
                 )
-                .child(
-                    Button::new(("resume-terminal", ix))
-                        .label("Terminal")
-                        .small()
-                        .ghost()
-                        .tooltip(format!(
-                            "{} in {}",
-                            launch::resume_command(provider, &id),
-                            terminal.name()
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let r = launch::agent_resume(terminal, provider, &dir, &id);
-                            this.report(r, "Session resumed in a new terminal", cx);
-                        })),
-                )
+                .when(chat_view, |row| {
+                    row.child(
+                        Button::new(("resume-terminal", ix))
+                            .label("Terminal")
+                            .small()
+                            .ghost()
+                            .tooltip(format!(
+                                "Continue in the agent panel as {}'s own terminal UI ({command})",
+                                provider.label()
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_session(
+                                    in_terminal.clone(),
+                                    crate::settings::AgentView::Terminal,
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                })
         });
         v_flex()
             .id("sessions")
@@ -5139,6 +5170,7 @@ impl SuperGitApp {
             return self.render_welcome(cx).into_any_element();
         }
         let main = self.render_main(window, cx);
+        let main = self.with_terminal(main, window, cx);
         if self.chat_open && self.selected.is_some() {
             let (chat_max, _) = self.pane_widths(window, cx);
             let chat = self.render_claude_panel(window, cx);
@@ -5314,6 +5346,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::close_repository))
             .on_action(cx.listener(Self::toggle_claude))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::new_chat_action))
             .on_action(cx.listener(Self::update_creation_base))
             .on_action(cx.listener(Self::open_switcher))
