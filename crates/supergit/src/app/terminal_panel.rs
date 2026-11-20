@@ -1,7 +1,7 @@
-//! The terminal panel under the review, as in VS Code (`cmd-j`, or the
-//! title bar's Terminal button): the user's
-//! shell, one per worktree, started in the worktree's folder the first time
-//! the panel shows that worktree. Shells keep running while the panel is
+//! The terminal panel under the review, as in VS Code (`cmd-j`, the status
+//! bar's Terminal button or the "⋯" menu): the user's shell, one per
+//! worktree, started in the worktree's folder the first time the panel
+//! shows that worktree. Shells keep running while the panel is
 //! hidden or another worktree (or project) is shown. A shell that exits is
 //! gone, and the panel hides if it was the one shown; the next `cmd-j`
 //! starts a new one.
@@ -58,7 +58,8 @@ impl TerminalPanel {
 }
 
 impl SuperGitApp {
-    /// `cmd-j`, the title bar's Terminal button, View ▸ Toggle Terminal.
+    /// `cmd-j`, the status bar's Terminal button, "⋯" and View ▸ Toggle
+    /// Terminal.
     pub fn toggle_terminal(
         &mut self,
         _: &ToggleTerminal,
@@ -292,12 +293,13 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// The title bar's Terminal button: the panel's icon, lit while open.
+    /// The status bar's Terminal button, right under where the panel opens:
+    /// the panel's icon, lit while open.
     pub(super) fn terminal_button(&self, cx: &mut Context<Self>) -> Button {
         Button::new("toggle-terminal")
             .icon(IconName::PanelBottom)
             .label("Terminal")
-            .small()
+            .xsmall()
             .ghost()
             .selected(self.terminal_panel.open && self.selected.is_some())
             .tooltip(format!("Show or hide the worktree's terminal ({MOD}-j)"))

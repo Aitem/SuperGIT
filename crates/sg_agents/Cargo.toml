@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+# Signal 0: is a live session's process still there.
+rustix = { version = "1", features = ["process"] }
 
 [lints]
 workspace = true

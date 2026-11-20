@@ -6257,6 +6257,7 @@ name = "sg_agents"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "rustix",
  "serde_json",
 ]
 

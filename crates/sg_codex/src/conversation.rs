@@ -99,7 +99,7 @@ impl CodexFold {
                 self.on_item(c, item, false, false);
             }
             match turn.get("status").and_then(Value::as_str) {
-                Some("interrupted") => c.push_notice("Interrupted", false),
+                Some("interrupted") => c.push_notice(sg_agents::chat::INTERRUPTED, false),
                 Some("failed") => c.push_notice(turn_error(turn), true),
                 _ => {}
             }
@@ -186,7 +186,8 @@ impl CodexFold {
                 let turn = p.get("turn").unwrap_or(&Value::Null);
                 let duration = turn.get("durationMs").and_then(Value::as_u64);
                 match turn.get("status").and_then(Value::as_str) {
-                    Some("interrupted") => c.end_turn(duration, true, Some("interrupted".into())),
+                    // The user's own Stop, not a failure.
+                    Some("interrupted") => c.interrupt_turn(),
                     Some("failed") => c.end_turn(duration, true, Some(turn_error(turn))),
                     _ => c.end_turn(duration, false, None),
                 }

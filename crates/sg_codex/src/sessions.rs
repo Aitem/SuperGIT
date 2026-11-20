@@ -138,6 +138,7 @@ impl CodexSessionIndex {
             start_cwd: Some(head.cwd.clone()),
             modified: mtime,
             state: classify(tail.last_kind, age(now, mtime)),
+            busy: false,
         })
     }
 

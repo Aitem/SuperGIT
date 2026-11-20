@@ -47,14 +47,6 @@ impl Appearance {
         }
     }
 
-    pub fn next(self) -> Self {
-        match self {
-            Self::System => Self::Light,
-            Self::Light => Self::Dark,
-            Self::Dark => Self::System,
-        }
-    }
-
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "system" | "auto" => Some(Self::System),
@@ -111,6 +103,9 @@ pub struct Settings {
     pub difftastic: bool,
     /// What New / Resume open: the native chat or the agent's TUI.
     pub agent_view: AgentView,
+    /// The chat's text box height in pixels, dragged by the composer's top
+    /// edge; none: it grows with the text.
+    pub composer_height: Option<f32>,
 }
 
 fn file() -> Option<PathBuf> {
@@ -188,7 +183,6 @@ mod tests {
         assert_eq!(s.agent_view, AgentView::Chat);
         let s: Settings = serde_json::from_str(r#"{"agent_view":"terminal"}"#).unwrap();
         assert_eq!(s.agent_view, AgentView::Terminal);
-        assert_eq!(Appearance::System.next().next().next(), Appearance::System);
     }
 
     #[test]

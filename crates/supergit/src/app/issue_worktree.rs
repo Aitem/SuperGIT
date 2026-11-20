@@ -280,7 +280,7 @@ impl SuperGitApp {
                             if this.selected.as_ref() == Some(&path)
                                 && let Some(issue) = &issue
                             {
-                                this.new_chat(window, cx);
+                                this.new_chat_with(default_provider(), window, cx);
                                 if let Some(chat) = this.active_chat_entity() {
                                     chat.update(cx, |chat, cx| {
                                         chat.set_draft(issue_draft(issue), window, cx);

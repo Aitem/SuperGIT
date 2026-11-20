@@ -114,6 +114,9 @@ pub struct Session {
     pub start_cwd: Option<PathBuf>,
     pub modified: SystemTime,
     pub state: AgentState,
+    /// A live Claude Code process is in a turn of this session right now
+    /// (Claude Code's registry), whichever window or terminal runs it.
+    pub busy: bool,
 }
 
 impl Session {
@@ -140,6 +143,93 @@ pub fn claude_home() -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude"))
+}
+
+/// The running Claude Code process that has this session open (another
+/// SuperGIT, a terminal), from Claude Code's own registry of live sessions:
+/// `~/.claude/sessions/<pid>.json`.
+pub fn claude_session_process(session_id: &str) -> Option<u32> {
+    live_sessions(&claude_home()?.join("sessions"))
+        .into_iter()
+        .find(|live| live.session_id == session_id)
+        .map(|live| live.pid)
+}
+
+/// A session's own name from its transcript: the user's (`/rename`), else
+/// Claude's. Claude Code repeats both near the end.
+pub fn transcript_title(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail = read_range(&mut file, len.saturating_sub(TAIL_BYTES), len)?;
+    let mut ai_title = None;
+    for line in tail.lines().rev() {
+        // Most lines are messages: skip them without parsing.
+        if !line.contains("-title\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("custom-title") => {
+                return v.get("customTitle").and_then(Value::as_str).map(clean);
+            }
+            Some("ai-title") if ai_title.is_none() => {
+                ai_title = v.get("aiTitle").and_then(Value::as_str).map(clean);
+            }
+            _ => {}
+        }
+    }
+    ai_title
+}
+
+/// A session a live Claude Code process has open.
+struct LiveSession {
+    session_id: String,
+    pid: u32,
+    /// In a turn (`"status": "busy"`), not waiting for a prompt.
+    busy: bool,
+}
+
+/// Claude Code's registry of live sessions. Entries left behind by
+/// processes that are gone don't count.
+fn live_sessions(registry: &Path) -> Vec<LiveSession> {
+    let Ok(entries) = std::fs::read_dir(registry) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                return None;
+            }
+            let v: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let session_id = v.get("sessionId")?.as_str()?.to_string();
+            let pid = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
+            let busy = v.get("status").and_then(Value::as_str) == Some("busy");
+            process_alive(pid).then_some(LiveSession {
+                session_id,
+                pid,
+                busy,
+            })
+        })
+        .collect()
+}
+
+/// Signal 0 checks that a process exists without touching it; one of
+/// another user exists too.
+fn process_alive(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    matches!(
+        rustix::process::test_kill_process(pid),
+        Ok(()) | Err(rustix::io::Errno::PERM)
+    )
 }
 
 /// Claude Code stores a project's transcripts under its cwd with every
@@ -209,6 +299,16 @@ impl SessionIndex {
         }
         for list in &mut out {
             list.sort_by_key(|s| std::cmp::Reverse(s.modified));
+        }
+        let busy: Vec<String> = claude_home()
+            .map(|home| live_sessions(&home.join("sessions")))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|live| live.busy)
+            .map(|live| live.session_id)
+            .collect();
+        for session in out.iter_mut().flatten() {
+            session.busy = busy.contains(&session.id);
         }
         out
     }
@@ -307,6 +407,9 @@ fn parse_session(path: &Path, mtime: SystemTime, now: SystemTime) -> Option<(Ses
     let len = file.metadata().ok()?.len();
 
     let tail = read_range(&mut file, len.saturating_sub(TAIL_BYTES), len)?;
+    // The user's name (`/rename`) wins over Claude's; Claude Code repeats
+    // both near the end.
+    let mut custom_title = None;
     let mut ai_title = None;
     let mut last_prompt = None;
     let mut git_branch = None;
@@ -320,6 +423,9 @@ fn parse_session(path: &Path, mtime: SystemTime, now: SystemTime) -> Option<(Ses
         };
         let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
         match ty {
+            "custom-title" if custom_title.is_none() => {
+                custom_title = v.get("customTitle").and_then(Value::as_str).map(clean);
+            }
             "ai-title" if ai_title.is_none() => {
                 ai_title = v.get("aiTitle").and_then(Value::as_str).map(clean);
             }
@@ -342,7 +448,8 @@ fn parse_session(path: &Path, mtime: SystemTime, now: SystemTime) -> Option<(Ses
             }
             _ => {}
         }
-        if ai_title.is_some()
+        if custom_title.is_some()
+            && ai_title.is_some()
             && last_prompt.is_some()
             && last_kind.is_some()
             && git_branch.is_some()
@@ -375,8 +482,8 @@ fn parse_session(path: &Path, mtime: SystemTime, now: SystemTime) -> Option<(Ses
     // Transcripts with no conversation (e.g. only metadata) are not sessions.
     let last_kind = last_kind?;
 
-    let title = ai_title
-        .clone()
+    let title = custom_title
+        .or_else(|| ai_title.clone())
         .or_else(|| last_prompt.clone())
         .unwrap_or_else(|| id.clone());
     let session = Session {
@@ -390,6 +497,7 @@ fn parse_session(path: &Path, mtime: SystemTime, now: SystemTime) -> Option<(Ses
         start_cwd,
         modified: mtime,
         state: classify(last_kind, age(now, mtime)),
+        busy: false,
     };
     Some((session, last_kind))
 }
@@ -450,6 +558,45 @@ fn read_range(file: &mut File, start: u64, end: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renamed_session_is_called_by_its_new_name() {
+        let path =
+            std::env::temp_dir().join(format!("sg_agents_title_{}.jsonl", std::process::id()));
+        let ai = r#"{"type":"ai-title","aiTitle":"Login bug fix"}"#;
+        let user = r#"{"type":"user","message":{"content":"fix the login"}}"#;
+        let renamed = r#"{"type":"custom-title","customTitle":"Auth"}"#;
+        std::fs::write(&path, [ai, user].join("\n")).unwrap();
+        assert_eq!(transcript_title(&path).as_deref(), Some("Login bug fix"));
+        // Claude Code repeats the user's name next to its own.
+        std::fs::write(&path, [renamed, ai, user].join("\n")).unwrap();
+        assert_eq!(transcript_title(&path).as_deref(), Some("Auth"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_session_is_open_elsewhere_while_its_process_lives() {
+        let dir = std::env::temp_dir().join(format!("sg_agents_live_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        std::fs::write(
+            dir.join(format!("{me}.json")),
+            format!(r#"{{"pid":{me},"sessionId":"live","status":"busy"}}"#),
+        )
+        .unwrap();
+        // Left behind by a process that is gone: no process has this pid.
+        std::fs::write(
+            dir.join("2147483646.json"),
+            r#"{"pid":2147483646,"sessionId":"gone","status":"busy"}"#,
+        )
+        .unwrap();
+        let live = live_sessions(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!((live[0].session_id.as_str(), live[0].pid), ("live", me));
+        assert!(live[0].busy);
+    }
 
     #[test]
     fn encodes_like_claude_code() {

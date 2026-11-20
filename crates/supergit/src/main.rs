@@ -179,6 +179,7 @@ fn main() -> Result<()> {
     app.run(move |cx| {
         gpui_kit::init(cx);
         appearance::init(cx);
+        chat::init(cx);
         terminal::load_font(cx);
         let mut notifications = notifications::init(cx);
 
@@ -240,6 +241,13 @@ fn main() -> Result<()> {
             // Wayland app id / X11 class: matches `supergit.desktop`
             // (scripts/install-linux.sh) for the taskbar icon.
             app_id: Some("supergit".into()),
+            // macOS: the window buttons centred in the sidebar's header,
+            // which is as tall as the rails are wide (48px; the default
+            // suits a 34px bar).
+            titlebar: Some(TitlebarOptions {
+                traffic_light_position: Some(app::window_buttons_home()),
+                ..TitleBar::title_bar_options()
+            }),
             ..TitleBar::window_options()
         };
         let (_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {

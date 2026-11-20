@@ -12,12 +12,22 @@ GitKraken" juggling.
 Done (v0.2): native chat via stream-json, permission cards, inline diffs,
 tabs per worktree, resume with history, modes, stop.
 
-Next: `@file` mentions and the current selection/diff as context, images and
-paste, slash commands from `initialize` (`commands`), model and effort picker,
-TodoWrite rendered as a checklist, subagent (Task) calls folded into a tree,
-plan-mode "accept plan" card, per-hunk accept/revert of edits, macOS
-notification when a conversation needs approval or finishes, queued messages
-while Claude works, copy buttons.
+Also done: a line above the composer saying what the agent is doing
+(thinking, running a tool, compacting, waiting for the user) with a clock;
+tool rows that appear as soon as Claude names the tool and read as what the
+command is for; a plan card (Markdown) with Approve / Keep planning; the
+user's Stop as "Interrupted", not a failure; history with turn ends, slash
+commands, compaction, background tasks and the messages sent while Claude
+worked; a subagent's calls folded apart from the agent's own; copy buttons
+on code blocks.
+
+Next: `@file` mentions (`file_suggestions`) and the current selection/diff as
+context, images and paste, slash commands and the model list from
+`initialize` (`commands`, `models`), context and rate-limit meters
+(`get_context_usage`, `rate_limit_event`), a subagent's progress on its row
+(`system/task_progress`), hook activity (`--include-hook-events`), denying
+with a comment, per-hunk accept/revert of edits, withdrawing a queued message
+(`cancel_async_message`).
 
 ## 1a. Codex alongside Claude
 

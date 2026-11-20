@@ -1,4 +1,5 @@
-use gpui_kit::component::{Theme, h_flex, v_flex};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{Icon, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sg_agents::chat::{PlanStepStatus, TurnPlan};
@@ -14,10 +15,9 @@ pub(super) fn render(plan: &TurnPlan, theme: &Theme) -> AnyElement {
         .count();
     v_flex()
         .gap_2()
-        .rounded_md()
+        .rounded_lg()
         .border_1()
         .border_color(theme.border)
-        .bg(theme.muted)
         .p_3()
         .child(
             h_flex()
@@ -46,15 +46,25 @@ pub(super) fn render(plan: &TurnPlan, theme: &Theme) -> AnyElement {
         })
         .children(plan.steps.iter().map(|step| {
             let (mark, status, color) = match step.status {
-                PlanStepStatus::Completed => ("✓", "Done", theme.success),
-                PlanStepStatus::InProgress if !plan.finished => ("◐", "In progress", theme.primary),
-                PlanStepStatus::InProgress => ("○", "Unfinished", theme.muted_foreground),
-                PlanStepStatus::Pending => ("○", "Pending", theme.muted_foreground),
+                PlanStepStatus::Completed => (IconName::CircleCheck, "Done", theme.success),
+                PlanStepStatus::InProgress if !plan.finished => {
+                    (IconName::LoaderCircle, "In progress", theme.blue)
+                }
+                PlanStepStatus::InProgress => {
+                    (IconName::Circle, "Unfinished", theme.muted_foreground)
+                }
+                PlanStepStatus::Pending => (IconName::Circle, "Pending", theme.muted_foreground),
             };
             h_flex()
                 .items_start()
                 .gap_2()
-                .child(div().w_4().flex_none().text_color(color).child(mark))
+                // Level with the first line of the step's text.
+                .child(
+                    div()
+                        .flex_none()
+                        .pt(px(3.))
+                        .child(Icon::new(mark).small().text_color(color)),
+                )
                 .child(div().flex_1().min_w_0().text_sm().child(step.text.clone()))
                 .child(div().flex_none().text_xs().text_color(color).child(status))
         }))

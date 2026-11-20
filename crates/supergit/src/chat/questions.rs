@@ -217,16 +217,27 @@ impl ChatSession {
             InputResolution::Declined => "Declined to answer".into(),
             InputResolution::Expired => "Questions closed".into(),
         };
+        let pending = request.resolution == InputResolution::Pending;
+        // Like an approval prompt: marked while it waits for the user.
         let mut card = v_flex()
             .gap_2()
             .p_3()
             .min_w_0()
-            .rounded_md()
+            .rounded_lg()
             .border_1()
-            .border_color(theme.border)
+            .border_color(if pending { theme.warning } else { theme.border })
             .text_sm()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(header));
-        if request.resolution != InputResolution::Pending {
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .when(!pending, |header| {
+                        header
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted_foreground)
+                    })
+                    .child(header),
+            );
+        if !pending {
             return card
                 .children(request.questions.iter().map(|question| {
                     let answer = request
@@ -241,9 +252,7 @@ impl ChatSession {
                                 .text_color(theme.muted_foreground)
                                 .child(strip_ansi(&question.prompt)),
                         )
-                        .when_some(answer, |row, answer| {
-                            row.child(div().child(format!("→ {answer}")))
-                        })
+                        .when_some(answer, |row, answer| row.child(div().child(answer)))
                 }))
                 .into_any_element();
         }

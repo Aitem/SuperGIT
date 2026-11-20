@@ -8,12 +8,12 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-use sg_agents::chat::{Item, ToolCall};
+use sg_agents::chat::{InputResolution, Item};
 
 /// How a transcript row is drawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Row {
-    /// Takes no space: finished thinking, the later calls of a folded run.
+    /// Takes no space: thinking, the later calls of a folded run.
     Hidden,
     User,
     /// One step on the agent's timeline. `first`/`last`: the line starts or
@@ -34,21 +34,32 @@ pub(super) enum Shape {
     InRun,
 }
 
-/// Finished thinking is not shown and does not break a run.
+/// Thinking is not a row (the line above the composer says "Thinking…"
+/// while it lasts) and does not break a run.
 fn quiet(item: &Item) -> bool {
-    matches!(item, Item::Thinking { streaming: false })
+    matches!(item, Item::Thinking { .. })
+}
+
+/// Whether a subagent made the call: its calls fold among themselves, not
+/// with the agent's own.
+fn nested(item: &Item) -> bool {
+    matches!(item, Item::Tool(tool) if tool.parent.is_some())
 }
 
 /// The run of tool calls around `ix`: at least two calls `groupable`
-/// accepts, with nothing but finished thinking between them.
+/// accepts, all the agent's own or all its subagents', with nothing but
+/// thinking between them.
 pub(super) fn run_at(
     items: &[Item],
     ix: usize,
     groupable: &dyn Fn(&Item) -> bool,
 ) -> Option<Range<usize>> {
-    if !groupable(items.get(ix)?) {
+    let anchor = items.get(ix)?;
+    if !groupable(anchor) {
         return None;
     }
+    let inner = nested(anchor);
+    let groupable = |item: &Item| groupable(item) && nested(item) == inner;
     let fits = |i: usize| groupable(&items[i]) || quiet(&items[i]);
     let mut start = ix;
     while start > 0 && fits(start - 1) {
@@ -148,13 +159,29 @@ pub(super) fn row(
     }
 }
 
+/// Is the text at `ix` the agent's last word of its turn (a turn's end, a
+/// user turn or — once the agent is idle — nothing follows it)? That one
+/// carries the answer's time; the remarks before it do not.
+pub(super) fn closes_turn(items: &[Item], ix: usize, busy: bool) -> bool {
+    for item in items.iter().skip(ix + 1) {
+        match item {
+            Item::User { .. } | Item::TurnEnd { .. } => return true,
+            Item::Thinking { .. } | Item::Notice { .. } => {}
+            Item::Permission(p) if p.decision.is_some() => {}
+            Item::UserInput(request) if request.resolution != InputResolution::Pending => {}
+            _ => return false,
+        }
+    }
+    !busy
+}
+
 /// "Bash ×3, Read ×2": the run's tools by name, in order of first use.
-pub(super) fn run_label<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> String {
+pub(super) fn run_label<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
     let mut counts: Vec<(&str, usize)> = Vec::new();
-    for call in calls {
-        match counts.iter_mut().find(|(name, _)| *name == call.name) {
+    for name in names {
+        match counts.iter_mut().find(|(counted, _)| *counted == name) {
             Some((_, n)) => *n += 1,
-            None => counts.push((&call.name, 1)),
+            None => counts.push((name, 1)),
         }
     }
     counts
@@ -171,6 +198,7 @@ pub(super) fn run_label<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> St
 mod tests {
     use super::*;
     use serde_json::Value;
+    use sg_agents::chat::ToolCall;
 
     fn tool(name: &str) -> Item {
         Item::Tool(ToolCall {
@@ -181,6 +209,25 @@ mod tests {
             parent: None,
             checking: false,
         })
+    }
+
+    /// A call a subagent made.
+    fn inner(name: &str) -> Item {
+        match tool(name) {
+            Item::Tool(call) => Item::Tool(ToolCall {
+                parent: Some("agent".into()),
+                ..call
+            }),
+            item => item,
+        }
+    }
+
+    fn end() -> Item {
+        Item::TurnEnd {
+            duration_ms: None,
+            is_error: false,
+            message: None,
+        }
     }
 
     fn user() -> Item {
@@ -262,13 +309,75 @@ mod tests {
 
     #[test]
     fn labels_count_tools_in_order_of_first_use() {
-        let calls: Vec<ToolCall> = ["Bash", "Read", "Bash", "Bash", "Grep"]
-            .into_iter()
-            .map(|name| match tool(name) {
-                Item::Tool(call) => call,
-                _ => unreachable!(),
-            })
-            .collect();
-        assert_eq!(run_label(&calls), "Bash ×3, Read, Grep");
+        assert_eq!(
+            run_label(["Bash", "Read", "Bash", "Bash", "Grep"]),
+            "Bash ×3, Read, Grep"
+        );
+    }
+
+    #[test]
+    fn thinking_is_never_a_row() {
+        let items = [
+            user(),
+            Item::Thinking { streaming: true },
+            tool("Bash"),
+            Item::Thinking { streaming: true },
+        ];
+        let none = HashSet::new();
+        assert_eq!(row(&items, 1, &not_edit, &none), Row::Hidden);
+        assert_eq!(row(&items, 3, &not_edit, &none), Row::Hidden);
+        // The call is the turn's only row: the line starts and ends at it.
+        assert_eq!(
+            row(&items, 2, &not_edit, &none),
+            step(Shape::Single, true, true)
+        );
+    }
+
+    #[test]
+    fn a_subagents_calls_fold_apart_from_the_agents_own() {
+        let items = [
+            user(),        // 0
+            tool("Read"),  // 1
+            inner("Bash"), // 2
+            inner("Read"), // 3
+            inner("Bash"), // 4
+            tool("Bash"),  // 5
+            tool("Grep"),  // 6
+        ];
+        assert_eq!(run_at(&items, 1, &not_edit), None);
+        assert_eq!(run_at(&items, 3, &not_edit), Some(2..5));
+        assert_eq!(run_at(&items, 6, &not_edit), Some(5..7));
+        let none = HashSet::new();
+        assert_eq!(
+            row(&items, 2, &not_edit, &none),
+            step(Shape::Run(2..5), false, false)
+        );
+        assert_eq!(
+            row(&items, 5, &not_edit, &none),
+            step(Shape::Run(5..7), false, true)
+        );
+    }
+
+    #[test]
+    fn only_the_last_text_of_a_turn_closes_it() {
+        let items = [
+            user(),                              // 0
+            text(),                              // 1: a remark
+            tool("Bash"),                        // 2
+            text(),                              // 3: the answer
+            Item::Thinking { streaming: false }, // 4
+            end(),                               // 5
+            user(),                              // 6
+            text(),                              // 7
+            Item::Notice {
+                text: "Interrupted".into(),
+                is_error: false,
+            }, // 8
+        ];
+        assert!(!closes_turn(&items, 1, false));
+        assert!(closes_turn(&items, 3, false));
+        // Nothing follows: the answer, unless the agent is still at it.
+        assert!(closes_turn(&items, 7, false));
+        assert!(!closes_turn(&items, 7, true));
     }
 }
