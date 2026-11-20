@@ -102,7 +102,8 @@ are removed (`CLAUDECODE`, Claude Code session markers, `TMUX`,
 Claude Code makes the child think it is a sub-session ("transcript saving is
 off").
 
-- New (`+`, MOD-n) shows the agent and view choice and waits for Start;
+- New (`+`, MOD-n) shows the agent and view choice and waits for Start, in
+  either view (a chat shows its composer only then);
   "Start {agent} here", asking about a selection and issue drafts start at
   once. A conversation with history resumes its TUI once it is on screen
   (without taking the focus); off screen, nothing starts. A Claude session

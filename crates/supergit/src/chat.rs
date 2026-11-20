@@ -5,24 +5,30 @@
 //! permission prompts as cards. Each provider keeps its own controls: Claude's
 //! permission modes, Codex's approval + sandbox policies.
 
+mod composer_height;
 mod options;
+
+pub use composer_height::init;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use crate::agent_context::{Attachment, MAX_ATTACHMENTS};
 use crate::attention::{Attention, Kind};
 use futures::StreamExt as _;
+use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::diff::{Diff, DiffState};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::Value;
@@ -35,6 +41,8 @@ use sg_claude::conversation::Reply;
 use sg_claude::{ClaudeEvents as _, ClaudeProcess, PermissionMode, SpawnOptions};
 use sg_codex::{CodexFold, CodexProcess, CollaborationMode, Policy};
 
+mod activity;
+mod look;
 mod questions;
 mod terminal_mode;
 mod timeline;
@@ -42,9 +50,6 @@ mod timeline;
 mod collaboration;
 mod turn_plan;
 mod usage;
-
-/// Max lines of tool output shown when a tool row is expanded.
-const OUTPUT_LINES: usize = 40;
 
 /// Claude chats start in auto mode unless the user picks another. Where auto
 /// mode is unavailable (plan, model, settings) the CLI starts in `default`
@@ -121,10 +126,7 @@ impl Backend {
 }
 
 fn placeholder(provider: Provider) -> String {
-    format!(
-        "Ask {}…  (Enter to send, Shift+Enter for a new line)",
-        provider.label()
-    )
+    format!("Ask {}…", provider.label())
 }
 
 /// What a conversation tells the app.
@@ -137,6 +139,9 @@ pub enum ChatEvent {
 impl EventEmitter<ChatEvent> for ChatSession {}
 
 pub struct ChatSession {
+    /// Start pressed: a new chat shows its composer (the agent itself starts
+    /// with the first message). Until then its screen offers the choices.
+    started: bool,
     git_busy: bool,
     worktree: PathBuf,
     attachments: Vec<Attachment>,
@@ -151,6 +156,7 @@ pub struct ChatSession {
     backend: Backend,
     options: options::AgentOptions,
     input: Entity<TextareaState>,
+    composer: composer_height::ComposerSize,
     scroller: Entity<MessageScrollerState>,
     diffs: HashMap<String, (Entity<DiffState>, usize)>,
     question_forms: HashMap<String, Vec<questions::AnswerDraft>>,
@@ -160,6 +166,10 @@ pub struct ChatSession {
     /// The latest user message has scrolled out above the chat: it sticks
     /// to the top.
     sticky_prompt: bool,
+    /// Since when the agent has been busy, for the activity line's clock,
+    /// and what redraws that clock every second.
+    busy_since: Option<Instant>,
+    busy_clock: Option<Task<()>>,
     stderr_tail: Vec<String>,
     reader: Option<Task<()>>,
     /// Reading a Claude transcript for the history.
@@ -374,6 +384,7 @@ impl ChatSession {
         });
         let backend = Backend::new(provider, &convo);
         Self {
+            started: false,
             git_busy: false,
             worktree,
             attachments: Vec::new(),
@@ -393,12 +404,15 @@ impl ChatSession {
             backend,
             options: Default::default(),
             input,
+            composer: Default::default(),
             scroller,
             diffs: HashMap::new(),
             question_forms: HashMap::new(),
             expanded: HashSet::new(),
             open_runs: HashSet::new(),
             sticky_prompt: false,
+            busy_since: None,
+            busy_clock: None,
             stderr_tail: Vec::new(),
             reader: None,
             transcript_load: None,
@@ -556,6 +570,32 @@ impl ChatSession {
 
     pub fn follows_tail(&self, cx: &App) -> bool {
         self.is_terminal() || self.scroller.read(cx).is_following_tail()
+    }
+
+    /// A new conversation's screen: the agent and the view still to pick,
+    /// then Start. A draft (restored, or typed in by Ask Agent) skips it.
+    fn choosing(&self, cx: &App) -> bool {
+        self.is_fresh() && !self.started && !self.has_draft(cx)
+    }
+
+    /// Start a new conversation the way it was picked: its TUI, or the chat
+    /// to type the first message in.
+    pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_terminal() {
+            self.start_terminal(window, cx);
+        } else {
+            self.started = true;
+            self.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Back to the choices (New on an untouched conversation).
+    pub fn offer_choices(&mut self, cx: &mut Context<Self>) {
+        if self.started {
+            self.started = false;
+            cx.notify();
+        }
     }
 
     pub fn has_draft(&self, cx: &App) -> bool {
@@ -806,8 +846,15 @@ impl ChatSession {
                         {
                             *mode = reported;
                         }
-                        (v.get("type").and_then(Value::as_str) == Some("result"))
-                            .then(|| v.get("is_error").and_then(Value::as_bool).unwrap_or(false))
+                        (v.get("type").and_then(Value::as_str) == Some("result")).then(|| {
+                            if sg_claude::conversation::was_stopped(&v) {
+                                Outcome::Stopped
+                            } else if v.get("is_error").and_then(Value::as_bool) == Some(true) {
+                                Outcome::Failed
+                            } else {
+                                Outcome::Completed
+                            }
+                        })
                     }
                     Backend::Codex { process, fold, .. } => {
                         match fold.apply(&mut self.convo, &v) {
@@ -829,17 +876,12 @@ impl ChatSession {
                         codex_outcome(&v)
                     }
                 };
-                if let Some(is_error) = outcome {
-                    self.attention.set(
-                        if is_error {
-                            Kind::Failed
-                        } else {
-                            Kind::Completed
-                        },
-                        None,
-                    );
-                } else {
-                    self.sync_pending_attention();
+                match outcome {
+                    Some(Outcome::Completed) => self.attention.set(Kind::Completed, None),
+                    Some(Outcome::Failed) => self.attention.set(Kind::Failed, None),
+                    // The user's own Stop: nothing to come back to.
+                    Some(Outcome::Stopped) => self.attention.set(Kind::Idle, None),
+                    None => self.sync_pending_attention(),
                 }
             }
             ProcessEvent::Stderr(line) => {
@@ -879,6 +921,7 @@ impl ChatSession {
     }
 
     fn items_changed(&mut self, before: usize, cx: &mut Context<Self>) {
+        self.track_activity(cx);
         self.question_forms.retain(|id, _| {
             self.convo
                 .user_input(id)
@@ -1074,6 +1117,48 @@ impl ChatSession {
         }
     }
 
+    /// The name a tool row shows.
+    fn tool_label(&self, tool: &ToolCall) -> String {
+        match self.provider() {
+            Provider::Claude => sg_claude::tools::display_name(&tool.name),
+            Provider::Codex => tool.name.clone(),
+        }
+    }
+
+    /// What an unfolded tool row shows above the output: the command itself,
+    /// where the row's summary is what the command is for.
+    fn tool_detail(&self, tool: &ToolCall) -> Option<String> {
+        match self.provider() {
+            Provider::Claude => sg_claude::tools::detail(&tool.name, &tool.input),
+            Provider::Codex => None,
+        }
+    }
+
+    /// The plan a plan row unfolds into.
+    fn tool_plan(&self, tool: &ToolCall) -> Option<String> {
+        if self.provider() != Provider::Claude || tool.name != sg_claude::tools::PLAN {
+            return None;
+        }
+        tool.input.get("plan")?.as_str().map(String::from)
+    }
+
+    /// Whether the tool's output is read from its end (a command's).
+    fn reads_from_end(&self, tool: &ToolCall) -> bool {
+        match self.provider() {
+            Provider::Claude => sg_claude::tools::reads_from_end(&tool.name),
+            // Codex's calls with output are commands.
+            Provider::Codex => true,
+        }
+    }
+
+    /// The plan an approval prompt asks about (Claude leaving plan mode).
+    fn permission_plan(&self, p: &PermissionRequest) -> Option<String> {
+        if self.provider() != Provider::Claude || p.tool_name != sg_claude::tools::PLAN {
+            return None;
+        }
+        p.input.get("plan")?.as_str().map(String::from)
+    }
+
     /// The diff of an applied edit.
     fn tool_patch(&self, tool: &ToolCall) -> Option<String> {
         if tool.result.as_ref().is_none_or(|r| r.is_error) {
@@ -1154,7 +1239,8 @@ impl ChatSession {
     }
 
     /// The latest user message, stuck to the top of the chat while it is
-    /// scrolled out of view, like a message card; a click scrolls back to it.
+    /// scrolled out of view; a click scrolls back to it. It floats over the
+    /// conversation, so it is a raised bar, not one more message card.
     fn render_sticky_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.sticky_prompt {
             return None;
@@ -1173,23 +1259,24 @@ impl ChatSession {
                 .top_0()
                 .left_0()
                 .right_0()
-                // Level with the message cards (the scroller's 12px + 16px).
-                .px(px(28.))
+                // Level with the message cards.
+                .px_3()
                 .pt_2()
                 .child(
-                    div()
+                    h_flex()
                         .id("sticky-prompt")
+                        .gap_2()
+                        .items_center()
                         .px_3()
                         .py_1p5()
-                        .rounded_md()
+                        .rounded_lg()
                         .border_1()
                         .border_color(theme.border)
-                        .bg(theme.secondary)
-                        .shadow_sm()
+                        .bg(theme.background)
+                        .shadow_md()
                         .text_sm()
-                        .text_color(theme.secondary_foreground)
                         .cursor_pointer()
-                        .hover(|el| el.border_color(theme.muted_foreground))
+                        .hover(|el| el.bg(theme.muted))
                         .tooltip(|window, cx| {
                             Tooltip::new("Scroll to this message").build(window, cx)
                         })
@@ -1197,7 +1284,13 @@ impl ChatSession {
                             this.scroller
                                 .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
                         }))
-                        .child(div().truncate().child(line)),
+                        .child(
+                            Icon::new(IconName::ArrowUp)
+                                .xsmall()
+                                .flex_none()
+                                .text_color(theme.muted_foreground),
+                        )
+                        .child(div().min_w_0().truncate().child(line)),
                 )
                 .into_any_element(),
         )
@@ -1224,18 +1317,23 @@ impl ChatSession {
             timeline::Row::User => return self.render_user_message(ix, item, &theme, cx),
             timeline::Row::Step { shape, first, last } => (shape, first, last),
         };
+        let busy = self.convo.status.is_busy();
         // Tool calls run together; messages and cards get some air.
         let (top, bottom) = match (&shape, &item) {
             (timeline::Shape::Run(_), _) => (px(3.), px(3.)),
-            (_, Item::Tool(_) | Item::Thinking { .. }) => (px(2.), px(2.)),
-            (_, Item::Text { .. }) => (px(8.), px(8.)),
+            (_, Item::Tool(_)) => (px(2.), px(2.)),
+            (_, Item::Permission(p)) if p.decision.is_some() => (px(2.), px(2.)),
+            (_, Item::Text { .. }) => (px(7.), px(7.)),
             (_, Item::Notice { .. } | Item::TurnEnd { .. }) => (px(4.), px(4.)),
             _ => (px(6.), px(6.)),
         };
-        let dot = match &shape {
-            timeline::Shape::Run(run) => Some((self.run_color(run.clone(), &theme), 8.)),
-            timeline::Shape::InRun => Some((step_color(&item, &theme), 5.)),
-            timeline::Shape::Single => Some((step_color(&item, &theme), 8.)),
+        let mark = match &shape {
+            timeline::Shape::Run(run) => look::Mark::Dot {
+                color: self.run_color(run.clone(), busy, &theme),
+                size: 7.,
+            },
+            timeline::Shape::InRun => look::step_mark(&item, busy, &theme).in_run(),
+            timeline::Shape::Single => look::step_mark(&item, busy, &theme),
         };
         let body = match (shape, item) {
             (timeline::Shape::Run(run), _) => self.render_run(ix, run, &theme, cx),
@@ -1246,26 +1344,30 @@ impl ChatSession {
                     streaming,
                     at,
                 },
-            ) => v_flex()
-                .min_w_0()
-                .gap_1()
-                .text_sm()
-                .child(TextView::markdown(("md", ix), text).selectable(true))
-                .when(streaming, |el| {
-                    el.child(div().text_color(theme.muted_foreground).child("▍"))
-                })
-                .when(!streaming, |el| {
-                    el.child(message_footer(("response", ix), at, &theme))
-                })
-                .into_any_element(),
-            (_, Item::Thinking { .. }) => div()
-                .text_xs()
-                .italic()
-                .text_color(theme.muted_foreground)
-                .child("Thinking…")
-                .into_any_element(),
+            ) => {
+                // Only the answer carries its time, not every remark on the
+                // way to it.
+                let closes = !streaming && timeline::closes_turn(&self.convo.items, ix, busy);
+                v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .text_sm()
+                    .child(
+                        TextView::markdown(("md", ix), text)
+                            .selectable(true)
+                            // Words appear as they are written.
+                            .stream_fade(streaming)
+                            .code_block_actions(|block, _, _| {
+                                Clipboard::new("copy").value(block.code()).xsmall()
+                            }),
+                    )
+                    .when(closes, |el| {
+                        el.child(look::time_footer(("response", ix), at, &theme))
+                    })
+                    .into_any_element()
+            }
             (_, Item::Tool(tool)) => self.render_tool(ix, &tool, &theme, cx).into_any_element(),
-            (_, Item::Permission(p)) => self.render_permission(&p, &theme, cx).into_any_element(),
+            (_, Item::Permission(p)) => self.render_permission(&p, &theme, cx),
             (_, Item::UserInput(request)) => self.render_user_input(&request, window, cx),
             (_, Item::Plan(plan)) => turn_plan::render(&plan, &theme),
             (_, Item::Notice { text, is_error }) => div()
@@ -1285,15 +1387,24 @@ impl ChatSession {
                     message,
                 },
             ) => {
-                let secs = duration_ms.map(|ms| format!("{:.1}s", ms as f64 / 1000.0));
-                let text = match (is_error, message) {
-                    (true, Some(m)) => format!("✗ {m}"),
-                    (true, None) => "✗ failed".into(),
-                    _ => format!(
-                        "✓ done{}",
-                        secs.map(|s| format!(" · {s}")).unwrap_or_default()
-                    ),
-                };
+                // The mark beside it says how the turn ended.
+                let mut facts = vec![match (is_error, message) {
+                    (true, Some(message)) => message,
+                    (true, None) => "Failed".to_string(),
+                    _ => "Done".to_string(),
+                }];
+                facts.extend(duration_ms.map(|ms| look::duration_text(Duration::from_millis(ms))));
+                // What the session has cost so far ends its latest turn.
+                if let Some(cost) = self.convo.total_cost_usd
+                    && self
+                        .convo
+                        .items
+                        .iter()
+                        .rposition(|item| matches!(item, Item::TurnEnd { .. }))
+                        == Some(ix)
+                {
+                    facts.push(format!("${cost:.2} total"));
+                }
                 div()
                     .text_xs()
                     .text_color(if is_error {
@@ -1301,25 +1412,23 @@ impl ChatSession {
                     } else {
                         theme.muted_foreground
                     })
-                    .child(text)
+                    .child(facts.join(" · "))
                     .into_any_element()
             }
-            // `timeline::row` makes user turns `Row::User`.
-            (_, Item::User { .. }) => div().into_any_element(),
+            // `timeline::row` hides thinking and makes user turns `Row::User`.
+            (_, Item::Thinking { .. } | Item::User { .. }) => div().into_any_element(),
         };
+        // Not `h_flex`: the gutter stretches to the row's height for its line.
         div()
-            .px_4()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .child(timeline_gutter(first, last, top, dot, &theme))
-                    .child(div().flex_1().min_w_0().pt(top).pb(bottom).child(body)),
-            )
+            .flex()
+            .flex_row()
+            .child(look::gutter(first, last, top, mark, &theme))
+            .child(div().flex_1().min_w_0().pt(top).pb(bottom).child(body))
             .into_any_element()
     }
 
-    /// A user turn: a bubble on the right, its time under it.
+    /// A user turn: a card across the chat, its time under it. A long one (a
+    /// pasted log) shows its first lines until it is unfolded.
     fn render_user_message(
         &mut self,
         ix: usize,
@@ -1331,60 +1440,70 @@ impl ChatSession {
             return div().into_any_element();
         };
         let attached = text.split_once(crate::agent_context::CONTEXT_MARKER);
+        let prompt = attached.map_or(text.as_str(), |(question, _)| question);
+        let long = prompt.lines().count() > look::PROMPT_LINES || prompt.chars().count() > 1200;
         let expanded = self.expanded.contains(&ix);
-        let display = if expanded {
-            text.clone()
-        } else {
-            attached
-                .map(|(question, _)| question.to_string())
-                .unwrap_or_else(|| text.clone())
+        let toggle = match (attached.is_some(), long, expanded) {
+            (true, _, false) => Some("Show diff context"),
+            (true, _, true) => Some("Hide diff context"),
+            (false, true, false) => Some("Show more"),
+            (false, true, true) => Some("Show less"),
+            (false, false, _) => None,
         };
-        // A card across the chat, left-aligned, its time under it.
+        let mut body = TextView::html(
+            ("user-message", ix),
+            plain_message_html(if expanded { &text } else { prompt }),
+        )
+        .selectable(true);
+        if long && !expanded {
+            body = body.max_lines(look::PROMPT_LINES);
+        }
         v_flex()
-            .px_4()
-            .pt(px(12.))
+            // The first message opens the conversation, later ones a turn.
+            .pt(px(if ix == 0 { 0. } else { 14. }))
             .pb(px(6.))
             .gap_1()
             .child(
-                div()
+                v_flex()
+                    .gap_1()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.secondary)
-                    .text_color(theme.secondary_foreground)
-                    .child(
-                        TextView::html(("user-message", ix), plain_message_html(&display))
-                            .selectable(true),
-                    )
-                    .when(attached.is_some(), |bubble| {
-                        bubble.child(
-                            Button::new(("message-context", ix))
-                                .label(if expanded {
-                                    "Hide diff context"
-                                } else {
-                                    "Show diff context"
-                                })
-                                .xsmall()
-                                .ghost()
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.toggle_expanded(ix, cx)),
-                                ),
+                    .bg(theme.muted)
+                    .text_sm()
+                    .child(body)
+                    .when_some(toggle, |card, label| {
+                        // In a row of its own, so that it keeps its width.
+                        card.child(
+                            h_flex().child(
+                                Button::new(("message-more", ix))
+                                    .label(label)
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_expanded(ix, cx)
+                                    })),
+                            ),
                         )
                     }),
             )
-            .child(message_footer(("user", ix), at, theme))
+            .child(look::time_footer(("user", ix), at, theme))
             .into_any_element()
     }
 
-    /// Tool calls that may fold into a run: not edits, which show a diff.
+    /// Tool calls that may fold into a run: not edits, which show a diff,
+    /// nor the calls that are a step of their own (a subagent, a plan).
     fn groupable(&self, item: &Item) -> bool {
         let Item::Tool(tool) = item else {
             return false;
         };
         match self.provider() {
-            Provider::Claude => !sg_claude::tools::is_edit(&tool.name),
+            Provider::Claude => {
+                !sg_claude::tools::is_edit(&tool.name)
+                    && !sg_claude::tools::stands_alone(&tool.name)
+            }
             Provider::Codex => !sg_codex::tools::is_edit(tool),
         }
     }
@@ -1400,21 +1519,27 @@ impl ChatSession {
     }
 
     /// The run's dot: running while any call runs, red after a failed one.
-    fn run_color(&self, run: std::ops::Range<usize>, theme: &Theme) -> Hsla {
+    fn run_color(&self, run: std::ops::Range<usize>, busy: bool, theme: &Theme) -> Hsla {
         let calls = self.run_calls(run);
-        if calls.iter().any(|call| call.result.is_none()) {
-            theme.blue
-        } else if calls
-            .iter()
-            .any(|call| call.result.as_ref().is_some_and(|r| r.is_error))
+        let failed = |call: &ToolCall| call.result.as_ref().is_some_and(|r| r.is_error);
+        if let Some(running) = calls.iter().find(|call| call.result.is_none())
+            && busy
         {
+            let checking = calls.iter().find(|call| call.checking);
+            look::tool_color(checking.unwrap_or(running), busy, theme)
+        } else if calls.iter().any(failed) {
             theme.danger
+        } else if let Some(done) = calls.iter().find(|call| call.result.is_some()) {
+            look::tool_color(done, busy, theme)
         } else {
-            theme.success
+            // Stopped with its turn before anything came back.
+            calls.first().map_or(theme.muted_foreground, |call| {
+                look::tool_color(call, busy, theme)
+            })
         }
     }
 
-    /// A folded run of tool calls ("▸ Bash ×3, Read · the latest call");
+    /// A folded run of tool calls ("› Bash ×3, Read · the latest call");
     /// unfolded, the first call follows and the rest are their own rows.
     fn render_run(
         &mut self,
@@ -1425,38 +1550,47 @@ impl ChatSession {
     ) -> AnyElement {
         let calls = self.run_calls(run);
         let open = self.open_runs.contains(&ix);
+        let names: Vec<String> = calls.iter().map(|call| self.tool_label(call)).collect();
         let latest = calls
             .last()
             .filter(|_| !open)
-            .map(|call| self.tool_summary(call));
+            .map(|call| self.tool_summary(call))
+            .filter(|summary| !summary.is_empty());
         let checking = calls.iter().any(|call| call.checking);
+        // A subagent's calls sit under its own.
+        let nested = calls.first().is_some_and(|call| call.parent.is_some());
         let header = h_flex()
             .id(("run", ix))
-            .gap_2()
+            .gap_1p5()
             .min_w_0()
+            .items_center()
+            .when(nested, |el| el.pl_3())
             .cursor_pointer()
-            .text_sm()
+            .text_size(px(look::STEP_TEXT))
             .text_color(theme.muted_foreground)
+            .hover(|el| el.text_color(theme.foreground))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_run(ix, cx)))
-            .child(div().flex_none().child(if open { "▾" } else { "▸" }))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .xsmall()
+                .flex_none(),
+            )
             .child(
                 div()
                     .flex_none()
+                    .max_w(relative(0.62))
+                    .truncate()
                     .font_weight(FontWeight::MEDIUM)
-                    .child(timeline::run_label(&calls)),
+                    .child(timeline::run_label(names.iter().map(String::as_str))),
             )
             .when_some(latest, |el, summary| {
-                el.child(div().min_w_0().truncate().opacity(0.75).child(summary))
+                el.child(div().min_w_0().truncate().opacity(0.8).child(summary))
             })
-            .when(checking, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .child("safety check…"),
-                )
-            });
+            .when(checking, |el| el.child(safety_check(theme)));
         let first = calls.into_iter().next().filter(|_| open);
         v_flex()
             .gap_1()
@@ -1476,6 +1610,9 @@ impl ChatSession {
         self.items_changed(len, cx);
     }
 
+    /// A tool call: its name and what it is about on one line. Unfolded, a
+    /// command shows itself and its output, a plan the plan; an edit always
+    /// shows its diff, a failed call why it failed.
     fn render_tool(
         &mut self,
         ix: usize,
@@ -1483,13 +1620,9 @@ impl ChatSession {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let name = self.tool_label(tool);
         let summary = self.tool_summary(tool);
-        // Calls are background: muted, red only when one failed (its state
-        // is the timeline dot).
-        let label_color = match &tool.result {
-            Some(r) if r.is_error => theme.danger,
-            _ => theme.muted_foreground,
-        };
+        let failed = tool.result.as_ref().is_some_and(|r| r.is_error);
         let expanded = self.expanded.contains(&ix);
         // While the edit awaits approval the permission card shows the diff.
         let diff = match self.diffs.get(&tool.id) {
@@ -1498,116 +1631,196 @@ impl ChatSession {
                 .tool_patch(tool)
                 .and_then(|patch| self.diff_for(&tool.id, &patch, cx)),
         };
+        let plan = self.tool_plan(tool).filter(|_| expanded);
+        let detail = self
+            .tool_detail(tool)
+            .filter(|_| expanded && diff.is_none());
         let output = tool
             .result
             .as_ref()
-            .filter(|_| expanded && diff.is_none())
-            .map(|r| {
-                let mut lines: Vec<&str> = r.text.lines().take(OUTPUT_LINES).collect();
-                if r.text.lines().count() > OUTPUT_LINES {
-                    lines.push("…");
-                }
-                lines.join("\n")
-            });
+            .filter(|r| expanded && diff.is_none() && plan.is_none() && !r.text.trim().is_empty())
+            .map(|r| look::excerpt(&r.text, self.reads_from_end(tool)));
+        // Folded, a failed call still says why.
+        let error = tool
+            .result
+            .as_ref()
+            .filter(|r| r.is_error && !expanded)
+            .and_then(|r| r.text.lines().map(str::trim).find(|line| !line.is_empty()))
+            .map(String::from);
 
         v_flex()
             .gap_1()
-            .when(tool.parent.is_some(), |el| el.pl_4())
+            .min_w_0()
+            .when(tool.parent.is_some(), |el| el.pl_3())
             .child(
                 h_flex()
                     .id(("tool", ix))
-                    .gap_2()
+                    .gap_1p5()
                     .min_w_0()
+                    .items_center()
                     .cursor_pointer()
+                    .text_size(px(look::STEP_TEXT))
+                    // Calls are background: muted, red only when one failed
+                    // (its state is the timeline dot).
+                    .text_color(theme.muted_foreground)
+                    .hover(|el| el.text_color(theme.foreground))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_expanded(ix, cx)))
                     .child(
                         div()
                             .flex_none()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(label_color)
-                            .child(tool.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .opacity(0.75)
+                            .max_w(relative(0.62))
                             .truncate()
-                            .child(summary),
+                            .font_weight(FontWeight::MEDIUM)
+                            .when(failed, |el| el.text_color(theme.danger))
+                            .child(name),
                     )
-                    .when(tool.checking, |el| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(theme.warning)
-                                .child("safety check…"),
-                        )
-                    }),
+                    .child(div().min_w_0().truncate().opacity(0.8).child(summary))
+                    .when(tool.checking, |el| el.child(safety_check(theme))),
             )
+            .when_some(error, |el, line| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .truncate()
+                        .child(line),
+                )
+            })
             .when_some(diff, |el, (state, lines)| {
                 el.child(diff_box(&state, lines, theme))
             })
+            .when_some(plan, |el, plan| {
+                el.child(plan_box(("plan", ix), plan, theme))
+            })
+            .when_some(detail, |el, command| {
+                el.child(look::code_box(command, theme.foreground, theme))
+            })
             .when_some(output, |el, text| {
-                el.child(
-                    div()
-                        .p_2()
-                        .rounded_md()
-                        .bg(theme.muted)
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child(text),
-                )
+                el.child(look::code_box(text, theme.muted_foreground, theme))
             })
     }
 
+    /// An approval prompt: what the agent wants to do and what that would
+    /// change, until it is answered; then one line saying how.
     fn render_permission(
         &mut self,
         p: &PermissionRequest,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let pending = p.decision.is_none();
-        let (patch, text) = self.permission_preview(p);
-        let preview: Option<AnyElement> = match patch
-            .and_then(|patch| self.diff_for(&format!("perm:{}", p.request_id), &patch, cx))
-        {
-            Some((state, lines)) => Some(diff_box(&state, lines, theme).into_any_element()),
-            None => text.map(|t| {
-                let t: String = t.lines().take(20).collect::<Vec<_>>().join("\n");
-                div()
-                    .p_2()
-                    .rounded_md()
-                    .bg(theme.muted)
-                    .text_xs()
-                    .font_family(theme.mono_font_family.clone())
-                    .child(t)
-                    .into_any_element()
-            }),
+    ) -> AnyElement {
+        let plan = self.permission_plan(p);
+        if let Some(decision) = p.decision {
+            let (icon, color, text) = match (decision, plan.is_some()) {
+                (Decision::Allowed, true) => {
+                    (IconName::Check, theme.success, "Plan approved".into())
+                }
+                (Decision::Allowed, false) => (
+                    IconName::Check,
+                    theme.success,
+                    format!("Allowed {}", p.display_name),
+                ),
+                // What was allowed from now on, in the button's own words.
+                (Decision::AllowedForSession, _) => (
+                    IconName::Check,
+                    theme.success,
+                    p.session_label
+                        .clone()
+                        .unwrap_or_else(|| format!("Allowed {} from now on", p.display_name)),
+                ),
+                (Decision::Denied, true) => (
+                    IconName::Close,
+                    theme.muted_foreground,
+                    "Plan sent back".into(),
+                ),
+                (Decision::Denied, false) => (
+                    IconName::Close,
+                    theme.muted_foreground,
+                    format!("Denied {}", p.display_name),
+                ),
+                (Decision::Expired, _) => (
+                    IconName::Close,
+                    theme.muted_foreground,
+                    format!("{} was not answered", p.display_name),
+                ),
+            };
+            return h_flex()
+                .gap_1p5()
+                .min_w_0()
+                .items_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(icon).xsmall().flex_none().text_color(color))
+                .child(div().min_w_0().truncate().child(text))
+                .into_any_element();
+        }
+
+        let is_plan = plan.is_some();
+        let preview: Option<AnyElement> = match plan {
+            Some(plan) => Some(
+                plan_box(
+                    SharedString::from(format!("plan-{}", p.request_id)),
+                    plan,
+                    theme,
+                )
+                .into_any_element(),
+            ),
+            None => {
+                let (patch, text) = self.permission_preview(p);
+                match patch
+                    .and_then(|patch| self.diff_for(&format!("perm:{}", p.request_id), &patch, cx))
+                {
+                    Some((state, lines)) => Some(diff_box(&state, lines, theme).into_any_element()),
+                    None => text.map(|text| {
+                        let text: String = text.lines().take(20).collect::<Vec<_>>().join("\n");
+                        look::code_box(text, theme.foreground, theme).into_any_element()
+                    }),
+                }
+            }
         };
+        let button = |action: &str| SharedString::from(format!("{action}-{}", p.request_id));
         let rid = p.request_id.clone();
         let rid2 = p.request_id.clone();
         let rid3 = p.request_id.clone();
         let session_label = p.session_label.clone();
+        let focused = self
+            .convo
+            .pending_permission()
+            .is_some_and(|pending| pending.request_id == p.request_id);
 
         v_flex()
             .p_3()
             .gap_2()
+            .min_w_0()
             .rounded_lg()
             .border_1()
-            .border_color(if pending { theme.warning } else { theme.border })
+            .border_color(theme.warning)
             .child(
                 h_flex()
                     .gap_2()
+                    .min_w_0()
+                    .items_center()
+                    .child(
+                        Icon::new(if is_plan {
+                            IconName::Map
+                        } else {
+                            IconName::TriangleAlert
+                        })
+                        .small()
+                        .flex_none()
+                        .text_color(theme.warning),
+                    )
                     .child(
                         div()
+                            .flex_none()
+                            .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("Allow {}?", p.display_name)),
+                            .child(if is_plan {
+                                "Plan ready".to_string()
+                            } else {
+                                format!("Allow {}?", p.display_name)
+                            }),
                     )
-                    .when_some(p.description.clone(), |el, d| {
+                    .when_some(p.description.clone().filter(|_| !is_plan), |el, d| {
                         el.child(
                             div()
                                 .min_w_0()
@@ -1618,17 +1831,17 @@ impl ChatSession {
                         )
                     }),
             )
-            .when_some(p.reason.clone().filter(|_| pending), |el, reason| {
+            .when_some(p.reason.clone(), |el, reason| {
                 el.child(div().text_xs().text_color(theme.warning).child(reason))
             })
             .children(preview)
-            .child(if pending {
+            .child(
                 h_flex()
                     .gap_2()
                     .flex_wrap()
                     .child(
-                        Button::new(("allow", rid.len()))
-                            .label("Allow")
+                        Button::new(button("allow"))
+                            .label(if is_plan { "Approve plan" } else { "Allow" })
                             .small()
                             .primary()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1636,98 +1849,69 @@ impl ChatSession {
                             })),
                     )
                     .when_some(session_label, |el, label| {
-                        el.child(Button::new("allow-session").label(label).small().on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.decide(rid2.clone(), Decision::AllowedForSession, cx)
-                            }),
-                        ))
+                        el.child(
+                            Button::new(button("allow-session"))
+                                .label(label)
+                                .small()
+                                .outline()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.decide(rid2.clone(), Decision::AllowedForSession, cx)
+                                })),
+                        )
                     })
                     .child(
-                        Button::new("deny")
-                            .label("Deny")
+                        Button::new(button("deny"))
+                            .label(if is_plan { "Keep planning" } else { "Deny" })
                             .small()
                             .ghost()
-                            .when(
-                                self.convo
-                                    .pending_permission()
-                                    .is_some_and(|pending| pending.request_id == p.request_id),
-                                |button| button.track_focus(&self.permission_focus),
-                            )
+                            .when(focused, |button| button.track_focus(&self.permission_focus))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.decide(rid3.clone(), Decision::Denied, cx)
                             })),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(match p.decision {
-                        Some(Decision::Denied) => "Denied",
-                        Some(Decision::AllowedForSession) => "Allowed for this session",
-                        Some(Decision::Expired) => "No longer needed",
-                        _ => "Allowed",
-                    })
-                    .into_any_element()
-            })
+                    ),
+            )
+            .into_any_element()
     }
 
+    /// The composer, flush with the panel under a top border that resizes
+    /// the text box: attachments and the text box, then a row with the mode
+    /// on the left and the model, the effort and Send (Stop while the agent
+    /// works) on the right.
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let busy = self.convo.status.is_busy();
-        let modes: Vec<AnyElement> = match &self.backend {
-            Backend::Claude { mode: current, .. } => PermissionMode::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(i, mode)| {
-                    let active = mode == *current;
-                    Button::new(("mode", i))
-                        .label(mode.label())
-                        .xsmall()
-                        .when(active, |b| b.secondary())
-                        .when(!active, |b| b.ghost())
-                        .tooltip(match mode {
-                            PermissionMode::Default => "Ask before edits and commands",
-                            PermissionMode::AcceptEdits => "Auto-accept file edits",
-                            PermissionMode::Plan => "Plan only, no changes",
-                            PermissionMode::Auto => {
-                                "Claude decides; a safety check blocks risky actions"
-                            }
-                            PermissionMode::BypassPermissions => "Never ask (careful)",
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
-                        .into_any_element()
-                })
-                .collect(),
-            Backend::Codex {
-                policy: current, ..
-            } => Policy::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(i, policy)| {
-                    let active = policy == *current;
-                    Button::new(("policy", i))
-                        .label(policy.label())
-                        .xsmall()
-                        .when(active, |b| b.secondary())
-                        .when(!active, |b| b.ghost())
-                        .tooltip(format!(
-                            "{} · approvals {}, sandbox {} · applies from the next turn",
-                            policy.description(),
-                            policy.approval_policy(),
-                            policy.sandbox_mode()
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_policy(policy, cx)))
-                        .into_any_element()
-                })
-                .collect(),
-        };
         let loading = self.history_loading();
+        let send = if busy {
+            Button::new("stop")
+                .icon(IconName::Square)
+                .rounded_full()
+                .tooltip("Stop")
+                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+        } else {
+            Button::new("send")
+                .icon(IconName::ArrowUp)
+                .primary()
+                .rounded_full()
+                .disabled(self.git_busy || loading || !self.has_draft(cx))
+                .tooltip(if self.git_busy {
+                    "A Git operation is running"
+                } else if loading {
+                    "Loading the conversation…"
+                } else {
+                    "Send (Enter)"
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+        };
         v_flex()
-            .p_2()
-            .gap_2()
-            .border_t_1()
-            .border_color(theme.border)
+            .gap_1()
+            .px_3()
+            .pt_2()
+            .pb_3()
+            .relative()
+            .bg(theme.background)
+            .on_drag_move(
+                cx.listener(|this, event, window, cx| this.drag_composer_edge(event, window, cx)),
+            )
             .when(!self.attachments.is_empty(), |composer| {
                 composer.child(
                     v_flex()
@@ -1777,7 +1961,7 @@ impl ChatSession {
                                         )
                                         .child(
                                             Button::new(("remove-context", ix))
-                                                .label("×")
+                                                .icon(IconName::Close)
                                                 .xsmall()
                                                 .ghost()
                                                 .tooltip("Remove attachment")
@@ -1819,34 +2003,25 @@ impl ChatSession {
                         })),
                 )
             })
-            .child(self.render_model_options(cx))
-            .child(Textarea::new(&self.input))
-            .children(self.render_codex_collaboration(cx))
+            .child(self.render_text_box(cx))
             .child(
                 h_flex()
-                    .justify_between()
-                    .child(h_flex().gap_0p5().children(modes))
-                    .child(if busy {
-                        Button::new("stop")
-                            .label("Stop")
-                            .small()
-                            .danger()
-                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
-                    } else {
-                        Button::new("send")
-                            .label(if self.git_busy {
-                                "Git operation…"
-                            } else if loading {
-                                "Loading history…"
-                            } else {
-                                "Send"
-                            })
-                            .disabled(self.git_busy || loading)
-                            .small()
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
-                    }),
+                    .gap_1()
+                    .items_center()
+                    .child(self.render_mode_options(cx))
+                    .children(self.render_codex_collaboration(cx))
+                    .child(div().flex_1())
+                    .children(self.render_codex_usage(cx).map(|usage| {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(usage)
+                    }))
+                    .child(self.render_model_options(cx))
+                    .child(send),
             )
+            // Last, so it lies over the padding it shares the top edge with.
+            .child(self.render_composer_edge(cx))
     }
 }
 
@@ -1862,91 +2037,28 @@ impl Render for ChatSession {
             return self.render_terminal(cx);
         }
         self.load_models(cx);
+        self.sync_composer_height(window, cx);
         let theme = cx.theme().clone();
-        let status = match self.convo.status {
-            Status::Idle => None,
-            Status::Starting => Some(("starting…", theme.muted_foreground)),
-            Status::Working => Some(("working…", theme.blue)),
-            Status::NeedsPermission => Some(("needs your approval", theme.warning)),
-            Status::NeedsInput => Some(("needs your answer", theme.warning)),
-            Status::Exited => Some((
-                "stopped — your next message resumes",
-                theme.muted_foreground,
-            )),
-        };
-        let cost = self.convo.total_cost_usd.map(|c| format!("${c:.2}"));
-        let usage = self.render_codex_usage(cx);
+        let choosing = self.choosing(cx);
         v_flex()
             .size_full()
-            .when(
-                cost.is_some() || status.is_some() || usage.is_some(),
-                |chat| {
-                    chat.child(
-                        h_flex()
-                            .px_4()
-                            .py_1()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(div().flex_1().children(cost))
-                            .children(usage)
-                            .when_some(status, |el, (label, color)| {
-                                el.child(div().text_color(color).child(label))
-                            }),
-                    )
-                },
-            )
             .child(if self.convo.items.is_empty() {
-                let provider = self.provider();
-                let fresh = self.is_fresh();
+                // The panel's header names the agent: here only the
+                // choices and Start (or that the history is loading).
                 v_flex()
                     .flex_1()
                     .items_center()
                     .justify_center()
-                    .gap_2()
+                    .gap_8()
                     .px_6()
                     .text_color(theme.muted_foreground)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .text_lg()
-                            .child(crate::icons::agent_icon(provider).size_5())
-                            .child(provider.label()),
-                    )
-                    .when(fresh, |el| {
-                        el.child(h_flex().gap_1().children(Provider::ALL.into_iter().map(
-                            |choice| {
-                                let active = choice == provider;
-                                Button::new(("agent-choice", choice as usize))
-                                    .icon(crate::icons::agent_icon(choice))
-                                    .label(choice.label())
-                                    .small()
-                                    .when(active, |b| b.secondary())
-                                    .when(!active, |b| b.ghost())
-                                    .tooltip(format!(
-                                        "Talk to {} in this conversation",
-                                        choice.label()
-                                    ))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_provider(choice, window, cx);
-                                        let input = this.input.clone();
-                                        input.update(cx, |input, cx| input.focus(window, cx));
-                                    }))
-                            },
-                        )))
+                    .when(choosing, |el| {
+                        el.child(self.render_new_choices(cx))
+                            .child(self.render_start("Start", cx))
                     })
-                    .when(fresh, |el| el.child(self.render_view_choice(cx)))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_center()
-                            .child(if self.history_loading() {
-                                "Loading the conversation…".to_string()
-                            } else {
-                                format!("Working in {}", self.cwd.display())
-                            }),
-                    )
+                    .when(self.history_loading(), |el| {
+                        el.child(ShimmerText::new("Loading the conversation…").text_sm())
+                    })
                     .into_any_element()
             } else {
                 div()
@@ -1962,115 +2074,53 @@ impl Render for ChatSession {
                             }),
                         )
                         // Its 32px between rows made runs of tool calls sparse;
-                        // `render_item` spaces rows by kind instead.
-                        .with_row_style(StyleRefinement::default().pb(px(0.))),
+                        // `render_item` spaces rows by kind instead. Its own
+                        // 12px at the sides line the rows up with the panel's
+                        // header and the composer.
+                        .with_row_style(StyleRefinement::default().pb(px(0.)))
+                        .with_list_style(StyleRefinement::default().pt_3().pb_3())
+                        // Scrolled up, the conversation fades out at the
+                        // bottom instead of ending mid-line.
+                        .with_bottom_fade(theme.background),
                     )
                     .children(self.render_sticky_prompt(cx))
                     .into_any_element()
             })
-            .child(self.render_composer(cx))
+            .children(self.render_activity(cx))
+            .when(!choosing, |el| el.child(self.render_composer(cx)))
             .into_any_element()
     }
 }
 
-/// Under a message: when it was sent (the full date on hover). The text
-/// itself is selectable for copying.
-fn message_footer(
-    (kind, ix): (&'static str, usize),
-    at: Option<SystemTime>,
-    theme: &Theme,
-) -> impl IntoElement {
-    let time = at.map(message_time);
-    h_flex()
-        .gap_2()
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .when_some(time, |row, (short, full)| {
-            row.child(
-                div()
-                    .id(SharedString::from(format!("time-{kind}-{ix}")))
-                    .opacity(0.8)
-                    .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
-                    .child(short),
-            )
-        })
+/// How a turn ended, for the conversation's mark and its notification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Completed,
+    Failed,
+    /// The user stopped it.
+    Stopped,
 }
 
-/// Width of the timeline column left of the agent's steps.
-const GUTTER: f32 = 18.;
-
-/// The timeline beside one step: the line through it (starting or ending at
-/// its dot at a turn's edges) and the dot, level with the step's first line.
-fn timeline_gutter(
-    first: bool,
-    last: bool,
-    top: Pixels,
-    dot: Option<(Hsla, f32)>,
-    theme: &Theme,
-) -> Div {
-    let center = top + px(10.);
-    let line = div()
-        .absolute()
-        .left(px(GUTTER / 2. - 0.5))
-        .w(px(1.))
-        .bg(theme.border);
-    let line = match (first, last) {
-        (true, true) => None,
-        (true, false) => Some(line.top(center).bottom_0()),
-        (false, true) => Some(line.top_0().h(center)),
-        (false, false) => Some(line.top_0().bottom_0()),
-    };
+/// "safety check…": auto mode is taking a while to judge a call.
+fn safety_check(theme: &Theme) -> Div {
     div()
-        .relative()
         .flex_none()
-        .w(px(GUTTER))
-        .children(line)
-        .when_some(dot, |el, (color, size)| {
-            el.child(
-                div()
-                    .absolute()
-                    .left(px(GUTTER / 2. - size / 2.))
-                    .top(center - px(size / 2.))
-                    .size(px(size))
-                    .rounded_full()
-                    .bg(color),
-            )
-        })
+        .text_xs()
+        .text_color(theme.warning)
+        .child("safety check…")
 }
 
-/// A step's dot: tool calls by state, prompts while waiting, messages grey.
-fn step_color(item: &Item, theme: &Theme) -> Hsla {
-    match item {
-        Item::Tool(tool) => match &tool.result {
-            None if tool.checking => theme.warning,
-            None => theme.blue,
-            Some(r) if r.is_error => theme.danger,
-            Some(_) => theme.success,
-        },
-        Item::Permission(p) if p.decision.is_none() => theme.warning,
-        Item::UserInput(request) if request.resolution == InputResolution::Pending => theme.warning,
-        Item::Plan(_) => theme.blue,
-        Item::Notice { is_error: true, .. } | Item::TurnEnd { is_error: true, .. } => theme.danger,
-        _ => theme.muted_foreground,
-    }
-}
-
-/// A message's time: short in the chat ("14:05" today, "18 Nov 14:05" this
-/// year, "2025-11-18 14:05" before), and in full for the tooltip.
-fn message_time(at: SystemTime) -> (String, String) {
-    let at = chrono::DateTime::<chrono::Local>::from(at);
-    let now = chrono::Local::now();
-    let short = if at.date_naive() == now.date_naive() {
-        at.format("%H:%M")
-    } else if at.format("%Y").to_string() == now.format("%Y").to_string() {
-        at.format("%-d %b %H:%M")
-    } else {
-        at.format("%Y-%m-%d %H:%M")
-    };
-    (
-        short.to_string(),
-        at.format("%A, %-d %B %Y, %H:%M:%S").to_string(),
-    )
+/// A plan as Claude wrote it (Markdown).
+fn plan_box(id: impl Into<ElementId>, plan: String, theme: &Theme) -> Div {
+    div()
+        .min_w_0()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .text_sm()
+        .child(TextView::markdown(id, plan).selectable(true))
 }
 
 fn plain_message_html(text: &str) -> String {
@@ -2120,14 +2170,20 @@ fn on_mode_response(
     convo.push_notice(format!("Can't switch to {wanted}: {error}"), true);
 }
 
-/// Whether a Codex event ended the turn, and if so whether it failed.
-fn codex_outcome(v: &Value) -> Option<bool> {
+/// Whether a Codex event ended the turn, and if so how.
+fn codex_outcome(v: &Value) -> Option<Outcome> {
     if v.get("method").and_then(Value::as_str) == Some("turn/completed") {
-        return Some(v.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed"));
+        return Some(
+            match v.pointer("/params/turn/status").and_then(Value::as_str) {
+                Some("failed") => Outcome::Failed,
+                Some("interrupted") => Outcome::Stopped,
+                _ => Outcome::Completed,
+            },
+        );
     }
     let startup = matches!(
         v.get("response").and_then(Value::as_str),
         Some("initialize" | "account/read" | "thread/start" | "thread/resume" | "turn/start")
     );
-    (startup && v.get("error").is_some()).then_some(true)
+    (startup && v.get("error").is_some()).then_some(Outcome::Failed)
 }

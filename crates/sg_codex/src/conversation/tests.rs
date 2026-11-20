@@ -326,8 +326,9 @@ fn interruption_failure_errors_and_unsupported_requests() {
         Item::Notice { text, is_error: false } if text == "stream disconnected — retrying…")));
     assert!(matches!(
         c.items.last(),
-        Some(Item::TurnEnd { is_error: true, message: Some(m), .. }) if m == "interrupted"
+        Some(Item::Notice { text, is_error: false }) if text == "Interrupted"
     ));
+    assert_eq!(c.status, Status::Idle);
     assert!(!c.items.iter().any(|i| matches!(
         i,
         Item::Text {

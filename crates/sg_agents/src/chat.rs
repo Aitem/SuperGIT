@@ -195,6 +195,11 @@ pub struct Conversation {
     pub permission_mode: Option<String>,
     pub status: Status,
     pub total_cost_usd: Option<f64>,
+    /// The agent is summarizing the conversation to free its context.
+    pub compacting: bool,
+    /// About how many tokens the agent has thought in the thinking block
+    /// it is writing, when it says.
+    pub thinking_tokens: Option<u64>,
     streaming_text: Option<usize>,
     streaming_thinking: Option<usize>,
     /// While history is replayed: when its current event happened (`None`
@@ -420,6 +425,7 @@ impl Conversation {
     }
 
     pub fn complete_thinking(&mut self) {
+        self.thinking_tokens = None;
         match self.streaming_thinking.take() {
             Some(ix) => {
                 if let Some(Item::Thinking { streaming }) = self.items.get_mut(ix) {
@@ -434,6 +440,7 @@ impl Conversation {
     pub fn finish_streaming(&mut self) {
         self.streaming_text = None;
         self.streaming_thinking = None;
+        self.thinking_tokens = None;
         for item in &mut self.items {
             match item {
                 Item::Text { streaming, .. } | Item::Thinking { streaming } => *streaming = false,
@@ -452,16 +459,16 @@ impl Conversation {
             is_error,
             message,
         });
-        for item in &mut self.items {
-            match item {
-                Item::Permission(p) if p.decision.is_none() => p.decision = Some(Decision::Denied),
-                Item::UserInput(request) if request.resolution == InputResolution::Pending => {
-                    request.resolution = InputResolution::Expired;
-                }
-                Item::Tool(t) => t.checking = false,
-                _ => {}
-            }
-        }
+        self.settle_open(Decision::Denied);
+        self.status = Status::Idle;
+    }
+
+    /// The user stopped the turn. Not a failure: the conversation says
+    /// where it stopped and waits for the next message.
+    pub fn interrupt_turn(&mut self) {
+        self.finish_streaming();
+        self.push_notice(INTERRUPTED, false);
+        self.settle_open(Decision::Expired);
         self.status = Status::Idle;
     }
 
@@ -471,24 +478,36 @@ impl Conversation {
         if self.status.is_busy() {
             self.push_notice(reason.unwrap_or_else(|| format!("{agent} exited")), true);
         }
+        self.settle_open(Decision::Expired);
+        self.status = Status::Exited;
+    }
+
+    /// Nothing waits for the user or runs any more: open prompts get
+    /// `unanswered`, safety checks and compaction are over.
+    fn settle_open(&mut self, unanswered: Decision) {
+        self.compacting = false;
         for item in &mut self.items {
             match item {
-                Item::Permission(p) if p.decision.is_none() => p.decision = Some(Decision::Expired),
+                Item::Permission(p) if p.decision.is_none() => p.decision = Some(unanswered),
                 Item::UserInput(request) if request.resolution == InputResolution::Pending => {
                     request.resolution = InputResolution::Expired;
                 }
+                Item::Tool(t) => t.checking = false,
                 _ => {}
             }
         }
-        self.status = Status::Exited;
     }
 }
 
-/// A conversation title from its first prompt: one line, at most 48 chars.
+/// The notice a turn the user stopped ends with.
+pub const INTERRUPTED: &str = "Interrupted";
+
+/// A conversation title from its first prompt: one line, at most 120 chars.
+/// Where it is shown, the layout cuts it to the width it has.
 pub fn short_title(text: &str) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if line.chars().count() > 48 {
-        format!("{}…", line.chars().take(47).collect::<String>())
+    if line.chars().count() > 120 {
+        format!("{}…", line.chars().take(119).collect::<String>())
     } else {
         line
     }
@@ -602,6 +621,40 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_turn_is_not_a_failure() {
+        let mut c = Conversation::new();
+        c.push_user("go");
+        c.start_thinking();
+        c.thinking_tokens = Some(120);
+        c.compacting = true;
+        c.push_permission(PermissionRequest {
+            request_id: "r1".into(),
+            tool_name: "Bash".into(),
+            display_name: "Bash".into(),
+            description: None,
+            reason: None,
+            input: Value::Null,
+            suggestions: Vec::new(),
+            session_label: None,
+            tool_use_id: None,
+            decision: None,
+        });
+        c.interrupt_turn();
+        assert_eq!(c.status, Status::Idle);
+        assert!(!c.compacting && c.thinking_tokens.is_none());
+        assert!(matches!(
+            c.items.last(),
+            Some(Item::Notice { text, is_error: false }) if text == INTERRUPTED
+        ));
+        assert!(!c.items.iter().any(|i| matches!(i, Item::TurnEnd { .. })));
+        assert!(matches!(c.items[1], Item::Thinking { streaming: false }));
+        assert_eq!(
+            c.permission("r1").unwrap().decision,
+            Some(Decision::Expired)
+        );
+    }
+
+    #[test]
     fn blocking_and_optional_questions_have_independent_lifetimes() {
         let mut conversation = Conversation {
             status: Status::Working,
@@ -671,9 +724,9 @@ mod tests {
 
     #[test]
     fn titles_cut_by_characters() {
-        let long = "Исправь ".repeat(10);
+        let long = "Исправь ".repeat(30);
         let title = short_title(&long);
-        assert_eq!(title.chars().count(), 48);
+        assert_eq!(title.chars().count(), 120);
         assert!(title.ends_with('…'));
     }
 }

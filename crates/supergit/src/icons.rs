@@ -64,7 +64,8 @@ gpui_kit::assets::icon_assets!(
         Columns2,
         FileDiff,
         ChevronsUpDown,
-        FolderGit2
+        FolderGit2,
+        Circle
     ]
 );
 
@@ -117,6 +118,19 @@ mod tests {
             IconName::FolderOpen,
             IconName::Ellipsis,
             IconName::Plus,
+            IconName::ArrowUp,
+            IconName::Square,
+            // The chat: step marks, cards, the activity line, copy buttons.
+            IconName::Check,
+            IconName::Close,
+            IconName::CircleX,
+            IconName::CircleCheck,
+            IconName::Circle,
+            IconName::LoaderCircle,
+            IconName::Loader,
+            IconName::TriangleAlert,
+            IconName::Map,
+            IconName::Copy,
         ] {
             let path = icon.path();
             assert!(

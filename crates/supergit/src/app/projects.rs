@@ -5,7 +5,6 @@
 //! native conversations keep running.
 
 use super::*;
-use crate::MOD;
 use gpui_kit::component::menu::DropdownMenu as _;
 
 /// What a project showed when it was last active, or what a background read
@@ -462,7 +461,7 @@ impl SuperGitApp {
     /// "+": recent repositories not in the sidebar yet, and the folder dialog.
     pub(super) fn add_project_button(
         &self,
-        id: &'static str,
+        button: Button,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let owner = cx.entity().downgrade();
@@ -472,35 +471,29 @@ impl SuperGitApp {
             .filter(|root| !self.persisted.projects.roots.contains(root))
             .cloned()
             .collect();
-        Button::new(id)
-            .icon(IconName::Plus)
-            .xsmall()
-            .ghost()
-            .tooltip(format!("Add a project ({MOD}-o)"))
-            .dropdown_menu(move |mut menu, _, _| {
-                for root in &recent {
-                    let owner = owner.clone();
-                    let target = root.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(format!("{}  {}", project_name(root), short_path(root)))
-                            .on_click(move |_, _, cx| {
-                                let _ =
-                                    owner.update(cx, |this, cx| this.open_path(target.clone(), cx));
-                            }),
-                    );
-                }
-                if !recent.is_empty() {
-                    menu = menu.separator();
-                }
+        button.dropdown_menu(move |mut menu, _, _| {
+            for root in &recent {
                 let owner = owner.clone();
-                menu.item(
-                    PopupMenuItem::new("Open Folder…").on_click(move |_, window, cx| {
-                        let _ = owner.update(cx, |this, cx| {
-                            this.open_repository(&OpenRepository, window, cx)
-                        });
-                    }),
-                )
-            })
+                let target = root.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("{}  {}", project_name(root), short_path(root)))
+                        .on_click(move |_, _, cx| {
+                            let _ = owner.update(cx, |this, cx| this.open_path(target.clone(), cx));
+                        }),
+                );
+            }
+            if !recent.is_empty() {
+                menu = menu.separator();
+            }
+            let owner = owner.clone();
+            menu.item(
+                PopupMenuItem::new("Open Folder…").on_click(move |_, window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.open_repository(&OpenRepository, window, cx)
+                    });
+                }),
+            )
+        })
     }
 
     pub(super) fn project_menu(

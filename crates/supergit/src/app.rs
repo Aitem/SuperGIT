@@ -218,6 +218,13 @@ pub struct SuperGitApp {
     rebase_handle: FocusHandle,
     prs_fetched_at: Option<std::time::Instant>,
     focus_handle: FocusHandle,
+    /// macOS, sidebar collapsed: the pointer is in the window's top-left
+    /// corner, so the window buttons show (see `sync_window_buttons`).
+    window_buttons_revealed: bool,
+    /// Where the window buttons were last put (`None`: not yet).
+    window_buttons_at: Option<Point<Pixels>>,
+    /// A press on the header that may become a window drag.
+    window_drag: bool,
     settings_open: bool,
     settings_focus: Option<FocusHandle>,
     settings_handle: FocusHandle,
@@ -436,6 +443,9 @@ impl SuperGitApp {
             rebase_handle: cx.focus_handle(),
             prs_fetched_at: None,
             focus_handle: cx.focus_handle(),
+            window_buttons_revealed: false,
+            window_buttons_at: None,
+            window_drag: false,
             settings_open: cfg!(feature = "screenshot")
                 && std::env::var_os("SUPERGIT_DEBUG_SETTINGS").is_some(),
             settings_focus: None,
@@ -524,6 +534,13 @@ impl SuperGitApp {
             ],
         };
         this._subscriptions.extend(filter_subscriptions);
+        // A focused element leaving the screen (the chat's text box when its
+        // panel closes) sends keys to the window's root, which knows none of
+        // the app's actions: the next ⌘L would do nothing. Take focus back.
+        let focus_lost = cx.on_focus_lost(window, |this, window, cx| {
+            this.focus_handle.focus(window, cx);
+        });
+        this._subscriptions.push(focus_lost);
         this.detect_difftastic(cx);
         this.focus_handle.focus(window, cx);
         this.start_polling(cx);
@@ -2379,10 +2396,10 @@ impl SuperGitApp {
             chat.update(cx, |chat, cx| {
                 chat.set_provider(provider, window, cx);
                 chat.set_view(view, cx);
-                if start && chat.is_terminal() {
-                    chat.start_terminal(window, cx);
+                if start {
+                    chat.start(window, cx);
                 } else {
-                    chat.focus(window, cx);
+                    chat.offer_choices(cx);
                 }
             });
             cx.notify();
@@ -2390,11 +2407,9 @@ impl SuperGitApp {
         }
         let chat = cx.new(|cx| ChatSession::new(path.clone(), provider, window, cx));
         self.add_chat(path, chat.clone(), window, cx);
-        chat.update(cx, |chat, cx| {
-            if start && chat.is_terminal() {
-                chat.start_terminal(window, cx);
-            }
-        });
+        if start {
+            chat.update(cx, |chat, cx| chat.start(window, cx));
+        }
     }
 
     pub fn new_chat_action(
@@ -2738,6 +2753,61 @@ impl SuperGitApp {
     /// and on macOS only while there is no sidebar to hold the window
     /// buttons. `title`: show the app's name (the sidebar shows it
     /// otherwise). Its actions live in the sidebar's "⋯" menu.
+    /// macOS: the window buttons sit in the sidebar's header. With the
+    /// sidebar collapsed there is no room for them: they hide past the
+    /// window's edge and show right of the expand square while the pointer
+    /// is in that corner (as in Arc). Applied only when the place changes.
+    fn sync_window_buttons(&mut self, window: &Window) {
+        if !FULL_HEIGHT_PANELS {
+            return;
+        }
+        let collapsed =
+            self.projects_visible() && self.persisted.projects.collapsed && !window.is_fullscreen();
+        let at = match (collapsed, self.window_buttons_revealed) {
+            (false, _) => window_buttons_home(),
+            (true, true) => point(px(RAIL_WIDTH + 12.), window_buttons_home().y),
+            (true, false) => point(px(-200.), window_buttons_home().y),
+        };
+        if self.window_buttons_at != Some(at) {
+            self.window_buttons_at = Some(at);
+            window.set_traffic_light_position(at);
+        }
+    }
+
+    /// macOS full-height layout: dragging the row moves the window and a
+    /// double click zooms it, as on a title bar (a press on one of its
+    /// buttons stays a click: buttons prevent the default).
+    fn window_drag_area(&self, row: impl IntoElement, cx: &mut Context<Self>) -> AnyElement {
+        if !FULL_HEIGHT_PANELS {
+            return row.into_any_element();
+        }
+        div()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, _| {
+                    if window.default_prevented() {
+                        return;
+                    }
+                    if event.click_count == 2 {
+                        window.titlebar_double_click();
+                    } else {
+                        this.window_drag = true;
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.window_drag = false),
+            )
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, window, _| {
+                if std::mem::take(&mut this.window_drag) {
+                    window.start_window_move();
+                }
+            }))
+            .child(row)
+            .into_any_element()
+    }
+
     fn render_title_bar(
         &self,
         title: bool,
@@ -2746,6 +2816,9 @@ impl SuperGitApp {
     ) -> impl IntoElement {
         let menu_bar = crate::menu_bar(cx);
         TitleBar::new()
+            // On macOS as tall as the sidebar's header, which the window
+            // buttons are placed for.
+            .when(FULL_HEIGHT_PANELS, |bar| bar.h(px(RAIL_WIDTH)))
             // The bar keeps 80px on the left for the window buttons, which a
             // full-screen window does not show: start at the edge there (the
             // bar's own 12px inset remains).
@@ -2845,11 +2918,13 @@ impl SuperGitApp {
         };
         let _ = window;
 
+        let header = self.render_header(&info, &theme, cx).into_any_element();
+        let header = self.window_drag_area(header, cx);
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_header(&info, &theme, cx))
+            .child(header)
             .child(
                 h_flex()
                     .px_3()
@@ -4818,19 +4893,7 @@ impl SuperGitApp {
         let owner = cx.entity().downgrade();
         // The first square is as tall as the panel's header: their lines
         // meet.
-        let item = |id: ElementId| {
-            div()
-                .id(id)
-                .w_full()
-                .h(px(RAIL_WIDTH))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .border_b_1()
-                .border_color(theme.border)
-                .cursor_pointer()
-        };
+        let item = |id: ElementId| rail_square(id, theme.border);
         // Busy in any process, this window's or another (Claude Code's
         // registry, read with the sessions).
         let busy: Vec<(Provider, String)> = self
@@ -4881,7 +4944,13 @@ impl SuperGitApp {
                             }),
                     )
                 });
-            rail_label(("rail-chat-label", ix), c.title().into(), square, &theme)
+            rail_label(
+                ("rail-chat-label", ix),
+                c.title().into(),
+                square,
+                LabelSide::Left,
+                &theme,
+            )
         });
         let toggle = item("toggle-chat".into())
             .hover(|el| el.bg(theme.list_hover))
@@ -4915,12 +4984,14 @@ impl SuperGitApp {
                 "rail-toggle-label",
                 toggle_label.into(),
                 toggle,
+                LabelSide::Left,
                 &theme,
             ))
             .child(rail_label(
                 "rail-new-label",
                 format!("New conversation ({MOD}-n)").into(),
                 new,
+                LabelSide::Left,
                 &theme,
             ))
             .child(
@@ -5016,7 +5087,7 @@ impl SuperGitApp {
             return h_flex()
                 .flex_1()
                 .min_h_0()
-                .child(self.render_sidebar_rail(cx))
+                .child(self.render_sidebar_rail(window, cx))
                 .child(
                     div()
                         .flex_1()
@@ -5248,6 +5319,7 @@ impl SuperGitApp {
 
 impl Render for SuperGitApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_window_buttons(window);
         let theme = cx.theme().clone();
         v_flex()
             .size_full()
@@ -5407,36 +5479,86 @@ pub(crate) fn default_provider() -> Provider {
 const RAIL_WIDTH: f32 = 48.;
 /// An agent-rail item with its label: shown at once on hover, to the item's
 /// left and centered on it (a tooltip waits and sits at the mouse).
+/// A rail's square: as tall as the rail is wide, a line under it, the
+/// whole square hovering (the caller picks the colors).
+fn rail_square(id: impl Into<ElementId>, border: Hsla) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w_full()
+        .h(px(RAIL_WIDTH))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .border_b_1()
+        .border_color(border)
+        .cursor_pointer()
+}
+
+/// A button shaped like a rail's square, for headers and the rail's own
+/// controls; callers add the lines and what it does.
+fn square_button(id: &'static str, icon: IconName) -> Button {
+    Button::new(id)
+        .icon(icon)
+        .ghost()
+        .rounded_none()
+        .size(px(RAIL_WIDTH))
+        .flex_none()
+}
+
+/// The window buttons' place (macOS): centred in the 48px header row.
+pub(crate) fn window_buttons_home() -> Point<Pixels> {
+    point(px(12.), px(17.))
+}
+
+/// Where a rail's labels open: away from the window's edge it hugs.
+#[derive(Clone, Copy)]
+enum LabelSide {
+    /// The agent rail, at the right edge.
+    Left,
+    /// The collapsed sidebar, at the left edge.
+    Right,
+}
+
 fn rail_label(
     id: impl Into<ElementId>,
     text: SharedString,
     item: impl IntoElement,
+    side: LabelSide,
     theme: &gpui_kit::component::Theme,
 ) -> gpui_kit::base::HoverCard {
     let (bg, fg, border) = (theme.popover, theme.popover_foreground, theme.border);
     gpui_kit::base::HoverCard::new(id)
-        .anchor(Anchor::RightCenter)
+        .anchor(match side {
+            LabelSide::Left => Anchor::RightCenter,
+            LabelSide::Right => Anchor::LeftCenter,
+        })
         .open_delay(Duration::ZERO)
         .close_delay(Duration::ZERO)
         .w_full()
         .trigger(item)
         .content(move |_, _, _| {
             // The padding keeps the label clear of the rail.
-            div().id("label").pr_1p5().child(
-                div()
-                    .max_w(px(360.))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .bg(bg)
-                    .text_color(fg)
-                    .shadow_md()
-                    .text_sm()
-                    .truncate()
-                    .child(text),
-            )
+            div()
+                .id("label")
+                .map(|label| match side {
+                    LabelSide::Left => label.pr_1p5(),
+                    LabelSide::Right => label.pl_1p5(),
+                })
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(bg)
+                        .text_color(fg)
+                        .shadow_md()
+                        .text_sm()
+                        .whitespace_nowrap()
+                        .child(text),
+                )
         })
 }
 

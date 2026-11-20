@@ -5,6 +5,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
+/// The tool Claude leaves plan mode with: its input is the plan.
+pub const PLAN: &str = "ExitPlanMode";
+
 fn str_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
@@ -31,14 +34,20 @@ fn first_line(s: &str, max: usize) -> String {
     out
 }
 
-/// "Read src/main.rs", "Bash cargo test", "Grep TODO" — the bit after the
-/// tool name shown on a collapsed tool row.
+/// "Read src/main.rs", "Bash Run the tests", "Grep TODO" — the bit after the
+/// tool name shown on a collapsed tool row. A command reads as what Claude
+/// says it is for (`description`); [`detail`] has the command itself.
 pub fn summary(name: &str, input: &Value, cwd: Option<&Path>) -> String {
     let path = |key| str_field(input, key).map(|p| short_path(p, cwd));
     let text = match name {
         "Read" | "Write" | "Edit" | "MultiEdit" => path("file_path"),
         "NotebookEdit" => path("notebook_path"),
-        "Bash" => str_field(input, "command").map(|c| first_line(c, 120)),
+        "Bash" => str_field(input, "description")
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(|d| first_line(d, 120))
+            .or_else(|| str_field(input, "command").map(|c| first_line(c, 120))),
+        PLAN => str_field(input, "plan").map(plan_title),
         "Grep" => str_field(input, "pattern").map(|p| match path("path") {
             Some(where_) => format!("{p}  in {where_}"),
             None => p.to_string(),
@@ -61,6 +70,56 @@ pub fn summary(name: &str, input: &Value, cwd: Option<&Path>) -> String {
             .map(|s| first_line(s, 100))
     })
     .unwrap_or_default()
+}
+
+/// What an expanded tool row shows above the output: the whole command.
+pub fn detail(name: &str, input: &Value) -> Option<String> {
+    match name {
+        "Bash" => str_field(input, "command")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(String::from),
+        _ => None,
+    }
+}
+
+/// The name a tool row shows: MCP tools without their wire prefix
+/// ("mcp__github__create_issue" → "github · create_issue"), a plan as "Plan".
+pub fn display_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("mcp__")
+        && let Some((server, tool)) = rest.split_once("__")
+        && !server.is_empty()
+        && !tool.is_empty()
+    {
+        return format!("{server} · {tool}");
+    }
+    match name {
+        PLAN => "Plan".into(),
+        "Task" => "Agent".into(),
+        _ => name.to_string(),
+    }
+}
+
+/// Calls that are a step of their own, never folded into a run of calls: a
+/// subagent (its own calls follow it) and a plan.
+pub fn stands_alone(name: &str) -> bool {
+    matches!(name, "Agent" | "Task" | PLAN)
+}
+
+/// A plan's first heading or line, without Markdown marks.
+fn plan_title(plan: &str) -> String {
+    let line = plan
+        .lines()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    first_line(line, 100)
+}
+
+/// Output worth reading from its end: a build's or a test run's last lines
+/// say how it went.
+pub fn reads_from_end(name: &str) -> bool {
+    name == "Bash"
 }
 
 /// Whether the tool changes files (and so deserves an inline diff).
@@ -165,7 +224,7 @@ fn hunk(old: &str, new: &str) -> String {
 /// Plain text of a `tool_result` content (a string or text blocks).
 pub fn result_text(content: &Value) -> String {
     match content {
-        Value::String(s) => s.clone(),
+        Value::String(s) => unwrap_error(s).to_string(),
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|b| match b.get("type").and_then(Value::as_str) {
@@ -178,6 +237,14 @@ pub fn result_text(content: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// The CLI wraps its own refusals in `<tool_use_error>`: keep the message.
+fn unwrap_error(text: &str) -> &str {
+    text.trim()
+        .strip_prefix("<tool_use_error>")
+        .and_then(|rest| rest.strip_suffix("</tool_use_error>"))
+        .map_or(text, str::trim)
 }
 
 #[cfg(test)]
@@ -196,6 +263,22 @@ mod tests {
         assert_eq!(
             summary("Bash", &json!({"command": "cargo test\necho hi"}), None),
             "cargo test…"
+        );
+        // What the command is for, when Claude says; the command on demand.
+        let bash = json!({"command": "cargo test -p sg_git 2>&1 | tail -5", "description": "Run the git tests"});
+        assert_eq!(summary("Bash", &bash, None), "Run the git tests");
+        assert_eq!(
+            detail("Bash", &bash).as_deref(),
+            Some("cargo test -p sg_git 2>&1 | tail -5")
+        );
+        assert_eq!(detail("Read", &json!({"file_path": "/a"})), None);
+        assert_eq!(
+            summary(
+                "ExitPlanMode",
+                &json!({"plan": "\n# Add a README\n\n1. Write it"}),
+                None
+            ),
+            "Add a README"
         );
         assert_eq!(
             summary(
@@ -236,8 +319,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_names_read_without_wire_prefixes() {
+        assert_eq!(
+            display_name("mcp__chrome-devtools__take_screenshot"),
+            "chrome-devtools · take_screenshot"
+        );
+        assert_eq!(display_name("mcp__odd"), "mcp__odd");
+        assert_eq!(display_name("ExitPlanMode"), "Plan");
+        assert_eq!(display_name("Task"), "Agent");
+        assert_eq!(display_name("Bash"), "Bash");
+    }
+
+    #[test]
     fn result_text_from_blocks() {
         assert_eq!(result_text(&json!("ok")), "ok");
+        assert_eq!(
+            result_text(&json!("<tool_use_error>Blocked: sleep 30</tool_use_error>")),
+            "Blocked: sleep 30"
+        );
         assert_eq!(
             result_text(&json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])),
             "a\nb"

@@ -7,10 +7,13 @@ use super::projects::{ATTENTION_ORDER, Activity, project_name, short_path};
 use super::*;
 use gpui_kit::component::menu::DropdownMenu as _;
 
-/// How far worktree rows sit under their project's name.
-const WORKTREE_INDENT: f32 = 22.;
-/// The indent guide's x: under the project's chevron.
-const INDENT_GUIDE_X: f32 = 12.;
+/// How far worktree rows sit under their project's name: level with the
+/// project's icon.
+const WORKTREE_INDENT: f32 = 32.;
+/// Rows of the tree, a line under each as in the agent rail: projects a
+/// little taller than their worktrees.
+const PROJECT_ROW: f32 = 40.;
+const WORKTREE_ROW: f32 = 36.;
 
 /// What a status dot shows: the most urgent agent signal of a worktree or a
 /// project, in the title bar's colors (needs approval, failed, unread,
@@ -76,6 +79,7 @@ impl SuperGitApp {
     pub fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         let projects = &mut self.persisted.projects;
         projects.collapsed = !projects.collapsed;
+        self.window_buttons_revealed = false;
         self.queue_persist(cx);
         cx.notify();
     }
@@ -188,43 +192,59 @@ impl SuperGitApp {
             .enumerate()
             .map(|(ix, root)| self.render_project_node(ix, root, &theme, cx))
             .collect();
+        // Its buttons are squares as in the agent rail, a line between them.
+        let square = |id, icon| {
+            square_button(id, icon)
+                .border_l_1()
+                .border_color(theme.sidebar_border)
+        };
         let header = h_flex()
-            .w_full()
+            .size_full()
             .min_w_0()
-            .pr_2()
-            .gap_1()
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_sm()
-                    .font_weight(FontWeight::BOLD)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child("SuperGIT"),
             )
-            .child(self.add_project_button("add-project", cx))
-            .child(self.app_menu_button("app-menu", cx))
+            .child(self.add_project_button(
+                square("add-project", IconName::Plus).tooltip(format!("Add a project ({MOD}-o)")),
+                cx,
+            ))
+            .child(self.app_menu_button(
+                square("app-menu", IconName::Ellipsis).tooltip("More actions"),
+                cx,
+            ))
             .child(
-                Button::new("collapse-sidebar")
-                    .icon(IconName::PanelLeftClose)
-                    .xsmall()
-                    .ghost()
+                square("collapse-sidebar", IconName::PanelLeftClose)
                     .tooltip(format!("Collapse the sidebar ({MOD}-b)"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_sidebar(&ToggleSidebar, window, cx)
                     })),
             );
-        // On macOS the sidebar reaches the window's top edge: its first row
-        // is the title bar (window buttons, dragging, double click).
+        // As tall as the rails are wide, like the agent panel's header: their
+        // lines meet. On macOS the sidebar reaches the window's top edge and
+        // this is the title bar (window buttons, dragging, double click).
         let header = if FULL_HEIGHT_PANELS {
             TitleBar::new()
+                .h(px(RAIL_WIDTH))
                 .when(window.is_fullscreen(), |bar| bar.pl(px(0.)))
                 .bg(theme.sidebar)
                 .border_color(theme.sidebar_border)
                 .child(header)
                 .into_any_element()
         } else {
-            h_flex().pl_3().py_1().child(header).into_any_element()
+            h_flex()
+                .h(px(RAIL_WIDTH))
+                .flex_none()
+                .pl_3()
+                .border_b_1()
+                .border_color(theme.sidebar_border)
+                .child(header)
+                .into_any_element()
         };
         v_flex()
             .w_full()
@@ -276,17 +296,15 @@ impl SuperGitApp {
         let fold_target = root.to_path_buf();
         let row = h_flex()
             .id("project")
-            .pl_1()
-            .pr_2()
-            .h(px(30.))
+            .h(px(PROJECT_ROW))
+            .flex_none()
+            .pl_2()
+            .pr_3()
             .gap_1()
             .cursor_pointer()
-            .bg(theme.secondary)
-            .border_y_1()
+            .border_b_1()
             .border_color(theme.sidebar_border)
-            // Neighbouring headers share one line.
-            .when(ix > 0, |el| el.mt(px(-1.)))
-            .hover(|el| el.bg(theme.sidebar_accent))
+            .hover(|el| el.bg(theme.list_hover))
             .on_click(cx.listener(move |this, _, _, cx| this.click_project(target.clone(), cx)))
             .child(
                 div()
@@ -294,7 +312,7 @@ impl SuperGitApp {
                     .flex_none()
                     .p_0p5()
                     .rounded_sm()
-                    .hover(|el| el.bg(theme.list_hover))
+                    .hover(|el| el.bg(theme.sidebar_accent))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.toggle_fold(fold_target.clone(), cx);
@@ -325,10 +343,10 @@ impl SuperGitApp {
                     .min_w_0()
                     .pl_1()
                     .truncate()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .child(project_name(root).to_uppercase()),
+                    .child(project_name(root)),
             )
             .when(signal.is_some(), |row| {
                 row.child(self.render_signal_dot("project-signal", signal, root, theme, cx))
@@ -336,9 +354,6 @@ impl SuperGitApp {
             .when_some(count, |row, count| {
                 row.child(
                     div()
-                        .px_1p5()
-                        .rounded_full()
-                        .bg(theme.sidebar)
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(count.to_string()),
@@ -417,25 +432,25 @@ impl SuperGitApp {
         let completed_count = completed_paths.len();
         let fold_root = root.to_path_buf();
         v_flex()
-            .pb_1()
             .children(open)
             .when(completed_count > 0, |list| {
                 list.child(
                     h_flex()
                         .id("completed-group")
-                        .relative()
-                        .pl(px(WORKTREE_INDENT - 2.))
+                        .h(px(WORKTREE_ROW))
+                        .flex_none()
+                        .pl(px(WORKTREE_INDENT))
                         .pr_2()
-                        .h(px(26.))
                         .gap_1()
                         .cursor_pointer()
+                        .border_b_1()
+                        .border_color(theme.sidebar_border)
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .hover(|el| el.bg(theme.sidebar_accent))
+                        .hover(|el| el.bg(theme.list_hover))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_completed_collapsed_in(fold_root.clone(), !collapsed, cx)
                         }))
-                        .child(indent_guide(theme))
                         .child(
                             Icon::new(if collapsed {
                                 IconName::ChevronRight
@@ -514,7 +529,6 @@ impl SuperGitApp {
                     .min_w_0()
                     .truncate()
                     .text_sm()
-                    .when(selected, |el| el.font_weight(FontWeight::SEMIBOLD))
                     .child(info.wt.display_name()),
             )
             .when(info.wt.is_main, |el| el.child(tag("main")))
@@ -566,13 +580,23 @@ impl SuperGitApp {
         let open_root = root.to_path_buf();
         let row = v_flex()
             .id(("worktree", ix))
-            .relative()
+            .min_h(px(WORKTREE_ROW))
+            .justify_center()
             .pl(px(WORKTREE_INDENT))
             .pr_2()
             .py_1()
             .cursor_pointer()
+            .border_b_1()
+            .border_color(theme.sidebar_border)
+            // The selection is a background, as in the agent rail.
             .when(selected, |el| el.bg(theme.sidebar_accent))
-            .hover(|el| el.bg(theme.sidebar_accent))
+            .hover(|el| {
+                el.bg(if selected {
+                    theme.sidebar_accent
+                } else {
+                    theme.list_hover
+                })
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.active_root() == Some(open_root.as_path()) {
                     this.select_worktree(path.clone(), cx);
@@ -580,18 +604,6 @@ impl SuperGitApp {
                     this.open_worktree_in(open_root.clone(), path.clone(), cx);
                 }
             }))
-            .child(indent_guide(theme))
-            .when(selected, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left_0()
-                        .w(px(2.))
-                        .bg(theme.primary),
-                )
-            })
             .child(title)
             .when(!notes.is_empty(), |el| {
                 el.child(
@@ -779,9 +791,16 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// The collapsed sidebar: each project's initials and status, the active
-    /// project's worktrees under it.
-    pub(super) fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The collapsed sidebar, a rail like the agent panel's: squares with a
+    /// line under each, the selection a background, names beside them at
+    /// once. Expand and add a project first, then each project's initials
+    /// and, under the active one, its worktrees'; initials take the color of
+    /// an agent signal, gray otherwise. The app menu last.
+    pub(super) fn render_sidebar_rail(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let roots = self.persisted.projects.roots.clone();
         let mut cells: Vec<AnyElement> = Vec::new();
@@ -789,48 +808,83 @@ impl SuperGitApp {
             let active = self.active_root() == Some(root.as_path());
             let signal = Signal::of_project(self.project_activity(root, cx));
             let name = project_name(root);
-            let tooltip = match &signal {
-                Some(signal) => format!("{name} · {}\n{}", signal.label, short_path(root)),
-                None => format!("{name}\n{}", short_path(root)),
+            let color = match &signal {
+                Some(signal) => attention_color(signal.kind, &theme),
+                None if active => theme.foreground,
+                None => theme.muted_foreground,
             };
-            let dot = rail_dot(signal.as_ref(), &theme);
             let target = root.clone();
-            let cell = v_flex()
-                .id(("rail-project", ix))
-                .w_full()
-                .py_1p5()
-                .gap_1()
-                .items_center()
-                .cursor_pointer()
-                .when(ix > 0, |el| {
-                    el.border_t_1().border_color(theme.sidebar_border)
-                })
-                .hover(|el| el.bg(theme.sidebar_accent))
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            let square = rail_square(("rail-project", ix), theme.sidebar_border)
+                .hover(|el| el.bg(theme.list_hover))
                 .on_click(cx.listener(move |this, _, _, cx| this.click_project(target.clone(), cx)))
                 .child(
                     div()
-                        .size(px(26.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if active {
-                            theme.primary
-                        } else {
-                            theme.sidebar_border
-                        })
-                        .text_xs()
-                        .font_weight(FontWeight::BOLD)
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color)
                         .child(initials(&name)),
+                );
+            cells.push(
+                rail_label(
+                    ("rail-project-label", ix),
+                    name.into(),
+                    self.project_menu(square, root.clone(), cx),
+                    LabelSide::Right,
+                    &theme,
                 )
-                .child(dot);
-            cells.push(self.project_menu(cell, root.clone(), cx));
+                .into_any_element(),
+            );
             if active && !self.persisted.projects.is_folded(root) {
                 cells.extend(self.render_rail_worktrees(&theme, cx));
             }
         }
+        // Expand and add a project top the rail, the app menu at its foot.
+        let (top, bottom) = {
+            let expand = rail_square("expand-sidebar", theme.sidebar_border)
+                .hover(|el| el.bg(theme.list_hover))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_sidebar(&ToggleSidebar, window, cx)
+                }))
+                .child(
+                    Icon::new(IconName::PanelLeftOpen).with_size(gpui_kit::component::Size::Medium),
+                );
+            let add = self
+                .add_project_button(
+                    square_button("add-project-rail", IconName::Plus)
+                        .w_full()
+                        .border_b_1()
+                        .border_color(theme.sidebar_border),
+                    cx,
+                )
+                .into_any_element();
+            let menu = self
+                .app_menu_button(
+                    square_button("app-menu-rail", IconName::Ellipsis)
+                        .w_full()
+                        .border_t_1()
+                        .border_color(theme.sidebar_border),
+                    cx,
+                )
+                .into_any_element();
+            let label = |id: &'static str, text: SharedString, item: AnyElement| {
+                rail_label(id, text, item, LabelSide::Right, &theme).into_any_element()
+            };
+            (
+                vec![
+                    label(
+                        "expand-sidebar-label",
+                        format!("Expand the sidebar ({MOD}-b)").into(),
+                        expand.into_any_element(),
+                    ),
+                    label(
+                        "add-project-rail-label",
+                        format!("Add a project ({MOD}-o)").into(),
+                        add,
+                    ),
+                ],
+                Some(label("app-menu-rail-label", "More actions".into(), menu)),
+            )
+        };
         v_flex()
             .w(px(RAIL_WIDTH))
             .flex_none()
@@ -838,28 +892,34 @@ impl SuperGitApp {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            // Room for the window buttons, which a full-height rail is too
-            // narrow to hold: they overlap the next column's padding.
-            .when(FULL_HEIGHT_PANELS, |rail| {
+            // macOS: too narrow for the window buttons, the rail hides them
+            // (`sync_window_buttons`); they come back while the pointer is
+            // in the window's top-left corner, the expand square and the
+            // buttons' place right of it.
+            .when(window_buttons_shown(window), |rail| {
+                let owner = cx.entity().downgrade();
+                let revealed = self.window_buttons_revealed;
                 rail.child(
-                    TitleBar::new()
-                        .pl(px(0.))
-                        .bg(theme.sidebar)
-                        .border_color(theme.sidebar_border),
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                                let corner = event.position.x < px(RAIL_WIDTH + 76.)
+                                    && event.position.y < px(RAIL_WIDTH);
+                                if phase == DispatchPhase::Bubble && corner != revealed {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.window_buttons_revealed = corner;
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_0(),
                 )
             })
-            .child(
-                h_flex().justify_center().py_1().child(
-                    Button::new("expand-sidebar")
-                        .icon(IconName::PanelLeftOpen)
-                        .xsmall()
-                        .ghost()
-                        .tooltip(format!("Expand the sidebar ({MOD}-b)"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_sidebar(&ToggleSidebar, window, cx)
-                        })),
-                ),
-            )
+            .children(top)
             .child(
                 v_flex()
                     .id("sidebar-rail")
@@ -868,21 +928,14 @@ impl SuperGitApp {
                     .overflow_y_scroll()
                     .children(cells),
             )
-            .child(
-                v_flex()
-                    .items_center()
-                    .py_1()
-                    .gap_1()
-                    .child(self.app_menu_button("app-menu-rail", cx))
-                    .child(self.add_project_button("add-project-rail", cx)),
-            )
+            .children(bottom)
             .into_any_element()
     }
 
     /// "⋯": the window-wide actions that used to sit in the title bar —
     /// conversations needing attention, the switcher, repositories, the
     /// terminal panel, appearance and refresh.
-    fn app_menu_button(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn app_menu_button(&self, button: Button, cx: &mut Context<Self>) -> impl IntoElement {
         let owner = cx.entity().downgrade();
         let attention: Vec<(Kind, usize)> = ATTENTION_ORDER
             .into_iter()
@@ -890,91 +943,86 @@ impl SuperGitApp {
             .filter(|(_, count)| *count > 0)
             .collect();
         let has_repo = self.repo.is_some();
-        Button::new(id)
-            .icon(IconName::Ellipsis)
-            .xsmall()
-            .ghost()
-            .tooltip("More actions")
-            .dropdown_menu(move |mut menu, window, cx| {
-                // Each opens the exact conversation; repeat to cycle.
-                for &(kind, count) in &attention {
-                    let owner = owner.clone();
-                    let label = format!("{count} {}", kind.label());
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_, cx| {
-                            div()
-                                .text_color(attention_color(kind, cx.theme()))
-                                .child(label.clone())
-                        })
-                        .on_click(move |_, window, cx| {
-                            let _ =
-                                owner.update(cx, |this, cx| this.open_attention(kind, window, cx));
-                        }),
-                    );
-                }
-                menu = menu.separator().item(app_item(
-                    &owner,
-                    "Switch Worktree, Conversation or Project…",
-                    Box::new(OpenSwitcher),
-                    |this, window, cx| this.open_switcher(&OpenSwitcher, window, cx),
-                ));
-                menu = menu.separator().item(app_item(
-                    &owner,
-                    "Open Repository…",
-                    Box::new(OpenRepository),
-                    |this, window, cx| this.open_repository(&OpenRepository, window, cx),
-                ));
-                if has_repo {
-                    let clone_owner = owner.clone();
-                    menu = menu
-                        .item(PopupMenuItem::new("Clone Repository…").on_click(
-                            move |_, window, cx| {
-                                let _ = clone_owner
-                                    .update(cx, |this, cx| this.open_clone_form(window, cx));
-                            },
-                        ))
-                        .item(app_item(
-                            &owner,
-                            "Recent Repositories",
-                            Box::new(CloseRepository),
-                            |this, window, cx| this.close_repository(&CloseRepository, window, cx),
-                        ));
-                }
-                if has_repo {
-                    menu = menu.separator().item(app_item(
-                        &owner,
-                        "Toggle Terminal",
-                        Box::new(ToggleTerminal),
-                        |this, window, cx| this.toggle_terminal(&ToggleTerminal, window, cx),
-                    ));
-                }
-                menu.separator()
-                    .submenu("Appearance", window, cx, |mut menu, _, cx| {
-                        let now = crate::appearance::current(cx);
-                        for choice in [
-                            crate::settings::Appearance::System,
-                            crate::settings::Appearance::Light,
-                            crate::settings::Appearance::Dark,
-                        ] {
-                            menu = menu.item(
-                                PopupMenuItem::new(choice.label())
-                                    .checked(now == choice)
-                                    .on_click(move |_, _, cx| crate::appearance::set(choice, cx)),
-                            );
-                        }
-                        menu
+        button.dropdown_menu(move |mut menu, window, cx| {
+            // Each opens the exact conversation; repeat to cycle.
+            for &(kind, count) in &attention {
+                let owner = owner.clone();
+                let label = format!("{count} {}", kind.label());
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, cx| {
+                        div()
+                            .text_color(attention_color(kind, cx.theme()))
+                            .child(label.clone())
                     })
+                    .on_click(move |_, window, cx| {
+                        let _ = owner.update(cx, |this, cx| this.open_attention(kind, window, cx));
+                    }),
+                );
+            }
+            menu = menu.separator().item(app_item(
+                &owner,
+                "Switch Worktree, Conversation or Project…",
+                Box::new(OpenSwitcher),
+                |this, window, cx| this.open_switcher(&OpenSwitcher, window, cx),
+            ));
+            menu = menu.separator().item(app_item(
+                &owner,
+                "Open Repository…",
+                Box::new(OpenRepository),
+                |this, window, cx| this.open_repository(&OpenRepository, window, cx),
+            ));
+            if has_repo {
+                let clone_owner = owner.clone();
+                menu = menu
+                    .item(
+                        PopupMenuItem::new("Clone Repository…").on_click(move |_, window, cx| {
+                            let _ =
+                                clone_owner.update(cx, |this, cx| this.open_clone_form(window, cx));
+                        }),
+                    )
                     .item(app_item(
                         &owner,
-                        "Refresh",
-                        Box::new(Refresh),
-                        |this, window, cx| this.refresh(&Refresh, window, cx),
-                    ))
-            })
+                        "Recent Repositories",
+                        Box::new(CloseRepository),
+                        |this, window, cx| this.close_repository(&CloseRepository, window, cx),
+                    ));
+            }
+            if has_repo {
+                menu = menu.separator().item(app_item(
+                    &owner,
+                    "Toggle Terminal",
+                    Box::new(ToggleTerminal),
+                    |this, window, cx| this.toggle_terminal(&ToggleTerminal, window, cx),
+                ));
+            }
+            menu.separator()
+                .submenu("Appearance", window, cx, |mut menu, _, cx| {
+                    let now = crate::appearance::current(cx);
+                    for choice in [
+                        crate::settings::Appearance::System,
+                        crate::settings::Appearance::Light,
+                        crate::settings::Appearance::Dark,
+                    ] {
+                        menu = menu.item(
+                            PopupMenuItem::new(choice.label())
+                                .checked(now == choice)
+                                .on_click(move |_, _, cx| crate::appearance::set(choice, cx)),
+                        );
+                    }
+                    menu
+                })
+                .item(app_item(
+                    &owner,
+                    "Refresh",
+                    Box::new(Refresh),
+                    |this, window, cx| this.refresh(&Refresh, window, cx),
+                ))
+        })
     }
 
-    /// The active project's worktrees in the rail: initials and agent status
-    /// (the name in the tooltip); completed ones while their group is open.
+    /// The active project's worktrees in the rail: their initials, smaller
+    /// than a project's, in their signal's color (the name beside on hover);
+    /// completed ones while their group is open.
     fn render_rail_worktrees(
         &self,
         theme: &gpui_kit::component::Theme,
@@ -991,40 +1039,32 @@ impl SuperGitApp {
                 let selected = self.selected.as_deref() == Some(info.path());
                 let path = info.wt.path.clone();
                 let name = info.wt.display_name();
-                let initials = initials(&name);
-                let signal = self.worktree_signal(scope, info, cx);
-                let dot = rail_dot(signal.as_ref(), theme);
-                let tooltip = match signal {
-                    Some(signal) => format!("{name} · {}", signal.label),
-                    None => name,
-                };
-                v_flex()
-                    .id(("rail-worktree", ix))
-                    .w_full()
-                    .py_1()
-                    .gap_1()
-                    .items_center()
-                    .cursor_pointer()
-                    .border_l_2()
-                    .border_color(if selected {
-                        theme.primary
-                    } else {
-                        transparent_black()
-                    })
+                let color = self
+                    .worktree_signal(scope, info, cx)
+                    .map_or(theme.muted_foreground, |signal| {
+                        attention_color(signal.kind, theme)
+                    });
+                let square = rail_square(("rail-worktree", ix), theme.sidebar_border)
                     .when(selected, |el| el.bg(theme.sidebar_accent))
-                    .hover(|el| el.bg(theme.sidebar_accent))
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .hover(|el| {
+                        el.bg(if selected {
+                            theme.sidebar_accent
+                        } else {
+                            theme.list_hover
+                        })
+                    })
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.select_worktree(path.clone(), cx)),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(initials),
-                    )
-                    .child(dot)
-                    .into_any_element()
+                    .child(div().text_xs().text_color(color).child(initials(&name)));
+                rail_label(
+                    ("rail-worktree-label", ix),
+                    name.into(),
+                    square,
+                    LabelSide::Right,
+                    theme,
+                )
+                .into_any_element()
             })
             .collect()
     }
@@ -1045,37 +1085,22 @@ fn app_item(
         })
 }
 
-/// A signal's dot in the rail (the cell's click selects, so no hit area).
-fn rail_dot(signal: Option<&Signal>, theme: &gpui_kit::component::Theme) -> AnyElement {
-    div()
-        .size(px(8.))
-        .flex_none()
-        .rounded_full()
-        .bg(signal.map_or(theme.border, |signal| attention_color(signal.kind, theme)))
-        .into_any_element()
+/// macOS outside full screen: the window buttons sit in the panels' first
+/// row, near the window's left edge.
+fn window_buttons_shown(window: &Window) -> bool {
+    FULL_HEIGHT_PANELS && !window.is_fullscreen()
 }
 
 /// A one-line note under a project (loading, an error).
 fn note(text: String, color: Hsla, theme: &gpui_kit::component::Theme) -> AnyElement {
     div()
-        .relative()
         .pl(px(WORKTREE_INDENT))
         .pr_3()
-        .py_1()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.sidebar_border)
         .text_xs()
         .text_color(color)
-        .child(indent_guide(theme))
         .child(text)
         .into_any_element()
-}
-
-/// The tree's vertical line beside a project's worktrees, under its chevron.
-fn indent_guide(theme: &gpui_kit::component::Theme) -> Div {
-    div()
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .left(px(INDENT_GUIDE_X))
-        .w(px(1.))
-        .bg(theme.sidebar_border)
 }

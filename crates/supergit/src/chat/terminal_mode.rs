@@ -10,8 +10,8 @@
 use std::ffi::OsString;
 use std::time::Duration;
 
-use gpui_kit::base::Disableable as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::base::{Disableable as _, Selectable as _};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -421,34 +421,78 @@ impl ChatSession {
             .filter(|t| !t.is_empty() && !is_program_name(t))
     }
 
-    /// `Chat | Terminal` for a new conversation, under the agent choice:
-    /// the view it opens in, and the one New and Resume use from then on
-    /// (the same setting as in Settings).
-    pub(super) fn render_view_choice(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A new conversation's choices, each a segmented control under its
+    /// label: the agent, and the view it opens in (`Chat | Terminal`, the
+    /// same setting as in Settings: New and Resume use it from then on).
+    pub(super) fn render_new_choices(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::AgentView;
-        let current = if self.is_terminal() {
+        let muted = cx.theme().muted_foreground;
+        let provider = self.provider();
+        let view = if self.is_terminal() {
             AgentView::Terminal
         } else {
             AgentView::Chat
         };
-        h_flex()
-            .gap_1()
-            .children([AgentView::Chat, AgentView::Terminal].map(|view| {
-                let active = view == current;
-                Button::new(("view-choice", view as usize))
-                    .label(view.label())
-                    .small()
-                    .when(active, |b| b.secondary())
-                    .when(!active, |b| b.ghost())
-                    .tooltip(match view {
+        let choice = |label: &'static str, group: ButtonGroup| {
+            v_flex()
+                .items_center()
+                .gap_1p5()
+                .child(div().text_xs().text_color(muted).child(label))
+                .child(group)
+        };
+        let agents = ButtonGroup::new("new-agent")
+            .outline()
+            .children(Provider::ALL.map(|agent| {
+                Button::new(("new-agent", agent as usize))
+                    .icon(crate::icons::agent_icon(agent))
+                    .label(agent.label())
+                    .w(px(NEW_SESSION_WIDTH / 2.))
+                    .selected(agent == provider)
+            }))
+            .on_click(cx.listener(|this, clicked: &Vec<usize>, window, cx| {
+                if let Some(&agent) = clicked.first().and_then(|&ix| Provider::ALL.get(ix)) {
+                    this.set_provider(agent, window, cx);
+                    this.focus(window, cx);
+                }
+            }));
+        let views = ButtonGroup::new("new-view")
+            .outline()
+            .children([AgentView::Chat, AgentView::Terminal].map(|choice| {
+                Button::new(("new-view", choice as usize))
+                    .label(choice.label())
+                    .w(px(NEW_SESSION_WIDTH / 2.))
+                    .selected(choice == view)
+                    .tooltip(match choice {
                         AgentView::Chat => "Talk in SuperGIT's chat",
                         AgentView::Terminal => "Use the agent's own terminal UI",
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_view(view, cx);
-                        cx.emit(super::ChatEvent::PickedView(view));
-                    }))
             }))
+            .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
+                let choice = if clicked.first() == Some(&1) {
+                    AgentView::Terminal
+                } else {
+                    AgentView::Chat
+                };
+                this.set_view(choice, cx);
+                cx.emit(super::ChatEvent::PickedView(choice));
+            }));
+        v_flex()
+            .items_center()
+            .gap_3()
+            .child(choice("Agent", agents))
+            .child(choice("View", views))
+    }
+
+    /// Start (or Resume): the one thing to do on a new conversation's
+    /// screen, in either view, as wide as the choices above it.
+    pub(super) fn render_start(&self, label: &'static str, cx: &mut Context<Self>) -> Button {
+        Button::new("start")
+            .label(label)
+            .large()
+            .w(px(NEW_SESSION_WIDTH))
+            .primary()
+            .disabled(self.git_busy)
+            .on_click(cx.listener(|this, _, window, cx| this.start(window, cx)))
     }
 
     /// A terminal conversation's title from its session as the Agents tab
@@ -521,62 +565,29 @@ impl ChatSession {
             // holds the worktree, or the session is open in another process.
             let fresh = self.is_fresh();
             let resume = self.convo.session_id.is_some() && self.has_history();
+            // The panel's header names the agent: here only the choices,
+            // then the one thing to do, a button as wide as they are.
             return v_flex()
                 .size_full()
                 .items_center()
                 .justify_center()
-                .gap_2()
+                .gap_8()
                 .px_6()
                 .text_color(theme.muted_foreground)
+                .when(fresh, |el| el.child(self.render_new_choices(cx)))
                 .child(
-                    h_flex()
-                        .gap_2()
+                    v_flex()
                         .items_center()
-                        .text_lg()
-                        .child(crate::icons::agent_icon(provider).size_5())
-                        .child(format!("{} in a terminal", provider.label())),
+                        .gap_2()
+                        .child(self.render_start(if resume { "Resume" } else { "Start" }, cx))
+                        .when_some(terminal.elsewhere, |el, pid| {
+                            el.child(div().max_w(px(320.)).text_xs().text_center().child(format!(
+                                "Open in another Claude Code process (pid {pid}): \
+                                     resuming here too would have two processes write \
+                                     this session"
+                            )))
+                        }),
                 )
-                .when(fresh, |el| {
-                    el.child(
-                        h_flex()
-                            .gap_1()
-                            .children(Provider::ALL.into_iter().map(|choice| {
-                                let active = choice == provider;
-                                Button::new(("terminal-agent", choice as usize))
-                                    .icon(crate::icons::agent_icon(choice))
-                                    .label(choice.label())
-                                    .small()
-                                    .when(active, |b| b.secondary())
-                                    .when(!active, |b| b.ghost())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_provider(choice, window, cx);
-                                    }))
-                            })),
-                    )
-                })
-                .when(fresh, |el| el.child(self.render_view_choice(cx)))
-                .child(
-                    Button::new("terminal-start")
-                        .label(if resume { "Resume" } else { "Start" })
-                        .small()
-                        .primary()
-                        .disabled(self.git_busy)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.start_terminal(window, cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_center()
-                        .child(format!("Working in {}", self.cwd.display())),
-                )
-                .when_some(terminal.elsewhere, |el, pid| {
-                    el.child(div().text_sm().text_center().child(format!(
-                        "Open in another Claude Code process (pid {pid}): resuming here too \
-                         would have two processes write this session"
-                    )))
-                })
                 .into_any_element();
         };
         let exited = view.read(cx).exit_code();
@@ -627,6 +638,10 @@ fn clean_title(title: &str) -> String {
         .trim()
         .to_string()
 }
+
+/// The width of a new conversation's controls: the choices (two segments
+/// each) and Start line up.
+pub(super) const NEW_SESSION_WIDTH: f32 = 224.;
 
 /// A TUI's own name as its window title ("Claude Code" until Claude names
 /// the session): it says nothing about the conversation.
