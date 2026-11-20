@@ -6,6 +6,7 @@
 mod check_inspection;
 mod details;
 mod job_log;
+mod releases;
 
 use std::ffi::OsStr;
 use std::io::Write as _;
@@ -115,6 +116,7 @@ impl PrState {
 }
 
 pub use job_log::{ActionsJob, JobLog};
+pub use releases::{Release, latest_release};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Checks {

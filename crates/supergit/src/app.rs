@@ -12,6 +12,7 @@ mod sidebar;
 mod staged_commit;
 mod staging;
 mod terminal_panel;
+mod update_check;
 mod worktrees;
 
 mod clone_repository;
@@ -83,7 +84,8 @@ actions!(
         AskAgentNewConversation,
         ToggleKeepWorktree,
         CleanUpWorktree,
-        UpdateBase
+        UpdateBase,
+        CheckForUpdates
     ]
 );
 
@@ -322,6 +324,9 @@ pub struct SuperGitApp {
     avatars_task: Option<Task<()>>,
     /// Other projects' avatars, shown at once when they become active again.
     project_avatars: HashMap<PathBuf, avatars::Avatars>,
+    /// A release newer than this build, from the last update check.
+    update: Option<sg_github::Release>,
+    update_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -513,6 +518,8 @@ impl SuperGitApp {
             avatars_root: None,
             avatars_task: None,
             project_avatars: HashMap::new(),
+            update: None,
+            update_task: None,
             _subscriptions: vec![
                 subscription,
                 switcher_subscription,
@@ -528,6 +535,7 @@ impl SuperGitApp {
         this.focus_handle.focus(window, cx);
         this.start_polling(cx);
         this.load_inactive_projects(cx);
+        this.start_update_checks(cx);
         this
     }
 
@@ -2710,6 +2718,7 @@ impl SuperGitApp {
 
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let menu_bar = crate::menu_bar(cx);
+        let update = self.update_button(cx);
         let indicators = projects::ATTENTION_ORDER.into_iter().filter_map(|kind| {
             let count = self.attention_count(kind, cx);
             (count > 0).then(|| {
@@ -2765,6 +2774,7 @@ impl SuperGitApp {
                         h_flex()
                             .gap_3()
                             .text_xs()
+                            .children(update)
                             .child(
                                 Button::new("open-switcher")
                                     .label("Switch…")
@@ -5355,6 +5365,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::ask_agent_new))
             .on_action(cx.listener(Self::toggle_keep_worktree))
             .on_action(cx.listener(Self::clean_up_worktree))
+            .on_action(cx.listener(Self::check_for_updates))
             .child(self.render_title_bar(window, cx))
             .child(self.render_body(window, cx))
             .child(self.render_status_bar(cx))

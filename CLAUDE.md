@@ -275,6 +275,15 @@ needed). Work on a branch, push it, `gh pr create --fill`, then
 `gh pr merge --auto --merge` — GitHub merges once CI passes and deletes the
 remote branch.
 
+Update checks (`updates.rs`, `app/update_check.rs`): the latest release of
+`Aitem/SuperGIT` (`sg_github::latest_release`: `gh api`, else `curl` against
+the public API) at startup and then at most every 12 hours, restarts
+included (`updates.json` in the support dir); a newer tag than
+`CARGO_PKG_VERSION` shows a title bar button that opens its release page.
+SuperGIT ▸ Check for Updates… checks at once. Screenshot runs stay offline
+unless `SUPERGIT_DEBUG_UPDATE=<version>` (screenshot builds) pretends to run
+that version and checks right away.
+
 App-launch specifics (`main.rs`, `shell_env.rs`, `recent.rs`): a Dock launch
 has cwd `/` and launchd's minimal PATH, so `shell_env` imports the login
 shell's environment (only when `TERM` is unset) before any thread starts, and

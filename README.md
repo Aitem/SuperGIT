@@ -35,7 +35,7 @@
 
 You’ll need **Git**. For GitHub pull requests, install the [GitHub CLI](https://cli.github.com/) and run `gh auth login`. Native chats use your existing [Claude Code](https://code.claude.com/docs/en/quickstart) or [Codex CLI](https://developers.openai.com/codex/cli) installation and sign-in.
 
-Download packages from [GitHub Releases](https://github.com/Aitem/SuperGIT/releases). Choose the Apple Silicon app ZIP on macOS or the matching binary archive on Linux.
+Download packages from [GitHub Releases](https://github.com/Aitem/SuperGIT/releases). Choose the Apple Silicon app ZIP on macOS or the matching binary archive on Linux. SuperGIT looks for a newer release at startup and at most twice a day; when one is out, a button in the title bar opens its release page (**SuperGIT ▸ Check for Updates…** checks right away).
 
 For builds from source, install [Rustup](https://rustup.rs/). The repository pins its Rust toolchain.
 
