@@ -339,6 +339,7 @@ impl SuperGitApp {
             self.chat_projects.remove(path);
             self.review_views.remove(path);
         }
+        self.drop_project_shells(&root);
         self.project_avatars.remove(&root);
         if let Some(snapshot) = self.project_cache.remove(&root) {
             for info in &snapshot.worktrees {
