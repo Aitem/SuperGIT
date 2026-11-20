@@ -148,6 +148,9 @@ pub struct ChatSession {
     expanded: HashSet<usize>,
     /// Runs of tool calls the user unfolded, by their first item.
     open_runs: HashSet<usize>,
+    /// The latest user message has scrolled out above the chat: it sticks
+    /// to the top.
+    sticky_prompt: bool,
     stderr_tail: Vec<String>,
     reader: Option<Task<()>>,
     /// Reading a Claude transcript for the history.
@@ -347,6 +350,15 @@ impl ChatSession {
         });
         let count = convo.items.len();
         let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
+        // Scrolling only redraws the chat when the sticky prompt shows or hides.
+        let sticky = cx.observe(&scroller, |this: &mut Self, _, cx| {
+            if let Some(above) = this.prompt_above(cx)
+                && above != this.sticky_prompt
+            {
+                this.sticky_prompt = above;
+                cx.notify();
+            }
+        });
         let backend = Backend::new(provider, &convo);
         Self {
             git_busy: false,
@@ -373,11 +385,12 @@ impl ChatSession {
             question_forms: HashMap::new(),
             expanded: HashSet::new(),
             open_runs: HashSet::new(),
+            sticky_prompt: false,
             stderr_tail: Vec::new(),
             reader: None,
             transcript_load: None,
             terminal: None,
-            _subscriptions: vec![sub],
+            _subscriptions: vec![sub, sticky],
         }
     }
 
@@ -1087,56 +1100,81 @@ impl ChatSession {
 
     // ---- rendering -------------------------------------------------------
 
-    fn render_latest_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (ix, text) = self
-            .convo
+    /// The latest user message: its row and the prompt (without attached
+    /// diff context).
+    fn latest_prompt(&self) -> Option<(usize, &str)> {
+        self.convo
             .items
             .iter()
             .enumerate()
             .rev()
-            .find_map(|(ix, item)| {
-                if let Item::User { text, .. } = item {
-                    Some((ix, text))
-                } else {
-                    None
-                }
-            })?;
-        if ix + 1 == self.convo.items.len() {
+            .find_map(|(ix, item)| match item {
+                Item::User { text, .. } => Some((
+                    ix,
+                    text.split(crate::agent_context::CONTEXT_MARKER)
+                        .next()
+                        .unwrap_or_default(),
+                )),
+                _ => None,
+            })
+    }
+
+    /// Has the latest user message scrolled out above the chat? `None`
+    /// right after a jump to the end, until the list lays out again.
+    fn prompt_above(&self, cx: &App) -> Option<bool> {
+        let Some((ix, _)) = self.latest_prompt() else {
+            return Some(false);
+        };
+        let scroller = self.scroller.read(cx);
+        let top = scroller.logical_scroll_top().item_ix;
+        (top < scroller.item_count()).then_some(top > ix)
+    }
+
+    /// The latest user message, stuck to the top of the chat while it is
+    /// scrolled out of view, like a message card; a click scrolls back to it.
+    fn render_sticky_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.sticky_prompt {
             return None;
         }
-        let prompt = text
-            .split(crate::agent_context::CONTEXT_MARKER)
-            .next()
-            .unwrap_or_default();
-        let title = sg_agents::chat::short_title(prompt);
+        let (ix, prompt) = self.latest_prompt()?;
+        let line = prompt
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_string();
         let theme = cx.theme().clone();
         Some(
-            h_flex()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .flex_none()
-                .min_w_0()
-                .bg(theme.muted)
-                .border_b_1()
-                .border_color(theme.border)
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                // Level with the message cards (the scroller's 12px + 16px).
+                .px(px(28.))
+                .pt_2()
                 .child(
                     div()
-                        .text_xs()
-                        .flex_none()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Latest prompt"),
-                )
-                .child(div().text_xs().flex_1().min_w_0().truncate().child(title))
-                .child(
-                    Button::new("jump-to-latest-prompt")
-                        .label("Jump")
-                        .xsmall()
-                        .ghost()
+                        .id("sticky-prompt")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.secondary)
+                        .shadow_sm()
+                        .text_sm()
+                        .text_color(theme.secondary_foreground)
+                        .cursor_pointer()
+                        .hover(|el| el.border_color(theme.muted_foreground))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Scroll to this message").build(window, cx)
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.scroller
                                 .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
-                        })),
+                        }))
+                        .child(div().truncate().child(line)),
                 )
                 .into_any_element(),
         )
@@ -1278,18 +1316,19 @@ impl ChatSession {
                 .map(|(question, _)| question.to_string())
                 .unwrap_or_else(|| text.clone())
         };
+        // A card across the chat, left-aligned, its time under it.
         v_flex()
             .px_4()
             .pt(px(12.))
             .pb(px(6.))
-            .items_end()
             .gap_1()
             .child(
                 div()
-                    .max_w(relative(0.88))
                     .px_3()
                     .py_2()
-                    .rounded_lg()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
                     .bg(theme.secondary)
                     .text_color(theme.secondary_foreground)
                     .child(
@@ -1790,6 +1829,10 @@ impl ChatSession {
 
 impl Render for ChatSession {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // New messages move the latest prompt too, not only scrolling.
+        if let Some(above) = self.prompt_above(cx) {
+            self.sticky_prompt = above;
+        }
         if self.is_terminal() {
             return self.render_terminal(cx);
         }
@@ -1828,7 +1871,6 @@ impl Render for ChatSession {
                     )
                 },
             )
-            .children(self.render_latest_prompt(cx))
             .child(if self.convo.items.is_empty() {
                 let provider = self.provider();
                 let fresh = self.is_fresh();
@@ -1884,6 +1926,7 @@ impl Render for ChatSession {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .relative()
                     .child(
                         MessageScroller::new(
                             "chat-messages",
@@ -1896,6 +1939,7 @@ impl Render for ChatSession {
                         // `render_item` spaces rows by kind instead.
                         .with_row_style(StyleRefinement::default().pb(px(0.))),
                     )
+                    .children(self.render_sticky_prompt(cx))
                     .into_any_element()
             })
             .child(self.render_composer(cx))
