@@ -218,6 +218,8 @@ pub struct SuperGitApp {
     rebase_handle: FocusHandle,
     prs_fetched_at: Option<std::time::Instant>,
     focus_handle: FocusHandle,
+    /// The header's repository and worktree names: selectable, `cmd-c`.
+    header_selection: gpui_kit::base::TextSelectionHandle,
     /// macOS, sidebar collapsed: the pointer is in the window's top-left
     /// corner, so the window buttons show (see `sync_window_buttons`).
     window_buttons_revealed: bool,
@@ -408,6 +410,17 @@ impl SuperGitApp {
             async {}
         });
         let release_subscription = cx.on_release(|this, cx| this.persist_workspace(cx));
+        let focus_handle = cx.focus_handle();
+        // A selection in the header focuses the app, so `cmd-c` reaches the
+        // window's copy (not, say, the chat's composer).
+        let header_selection = gpui_kit::base::TextSelectionHandle::new("", cx);
+        header_selection.focus_with(
+            {
+                let focus = focus_handle.clone();
+                move |window, cx| window.focus(&focus, cx)
+            },
+            cx,
+        );
         let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
             let bounds = window.window_bounds().get_bounds();
             this.window_rect = Some(WindowRect {
@@ -442,7 +455,8 @@ impl SuperGitApp {
             rebase_dialog: None,
             rebase_handle: cx.focus_handle(),
             prs_fetched_at: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            header_selection,
             window_buttons_revealed: false,
             window_buttons_at: None,
             window_drag: false,
@@ -1594,6 +1608,8 @@ impl SuperGitApp {
                 .timer(Duration::from_millis(500))
                 .await;
             let _ = window.update(cx, |_, window, cx| {
+                // Plain text projects its copy when painted.
+                window.draw(cx).clear(cx);
                 let text = gpui_kit::base::TextSelection::selected_text(window, cx);
                 eprintln!("SUPERGIT_DEBUG_DRAG selected:\n{text}");
             });
@@ -3059,54 +3075,85 @@ impl SuperGitApp {
             Err(e) => e.clone(),
         };
         let p4 = path.clone();
+        let shown_path = SharedString::from(path.display().to_string());
         let last_session = info.sessions.first().cloned();
+        // "repo / worktree", the repository's part muted.
+        let worktree = info.wt.display_name();
+        let (title, highlights) = match &self.repo {
+            Some(repo) => {
+                let prefix = format!("{} / ", projects::project_name(&repo.root));
+                let muted = HighlightStyle {
+                    color: Some(theme.muted_foreground),
+                    ..Default::default()
+                };
+                let bold = HighlightStyle {
+                    font_weight: Some(FontWeight::SEMIBOLD),
+                    ..Default::default()
+                };
+                let end = prefix.len() + worktree.len();
+                (
+                    format!("{prefix}{worktree}"),
+                    vec![(0..prefix.len(), muted), (prefix.len()..end, bold)],
+                )
+            }
+            None => {
+                let bold = HighlightStyle {
+                    font_weight: Some(FontWeight::SEMIBOLD),
+                    ..Default::default()
+                };
+                (worktree.clone(), vec![(0..worktree.len(), bold)])
+            }
+        };
 
+        // As tall as the side panels' headers: their lines meet.
         h_flex()
+            .h(px(RAIL_WIDTH))
+            .flex_none()
             .px_4()
-            .py_3()
             .gap_4()
             .justify_between()
             .border_b_1()
             .border_color(theme.border)
             .child(
-                v_flex()
+                h_flex()
                     .min_w_0()
-                    .gap_1()
                     .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_lg()
-                                    .font_weight(FontWeight::BOLD)
-                                    .truncate()
-                                    .child(info.wt.display_name()),
-                            )
-                            .when_some(info.wt.branch.clone(), |row, branch| {
-                                row.child(
-                                    Button::new("copy-branch-name")
-                                        .label("Copy")
-                                        .small()
-                                        .ghost()
-                                        .tooltip(format!("Copy branch name: {branch}"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                branch.clone(),
-                                            ));
-                                            this.flash("Copied branch name", false, cx);
-                                        })),
-                                )
-                            }),
-                    )
-                    .child(
+                        // Selectable like any text (drag, double click,
+                        // `cmd-c`); in the window's drag area a press on it
+                        // selects instead of moving the window. Clipped, not
+                        // ellipsized: an ellipsis turns selection off.
                         div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(format!("{}   {status_line}", path.display())),
-                    ),
+                            .id("header-title")
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_base()
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                window.prevent_default()
+                            })
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(shown_path.clone()).build(window, cx)
+                            })
+                            .child(crate::selectable::SelectableLabel::new(
+                                "header-title-text",
+                                self.header_selection.clone(),
+                                title,
+                                highlights,
+                            )),
+                    )
+                    .when(!status_line.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .min_w_0()
+                                // Gives way before the names do.
+                                .flex_shrink(8.)
+                                .ml_2()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(status_line),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -5361,9 +5408,6 @@ impl SuperGitApp {
             .border_color(theme.border)
             .bg(theme.status_bar)
             .text_color(theme.muted_foreground)
-            .when_some(self.repo.as_ref(), |el, repo| {
-                el.child(repo.root.display().to_string())
-            })
             .child(div().flex_1())
             .when(!self.cleanup_results.is_empty(), |bar| {
                 bar.child(
