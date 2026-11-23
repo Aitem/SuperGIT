@@ -24,7 +24,17 @@ use sg_terminal::{
     UnderlineStyle as TermUnderline,
 };
 
-actions!(terminal, [Copy, Paste, SelectAll]);
+actions!(
+    terminal,
+    [
+        Copy,
+        Paste,
+        SelectAll,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize
+    ]
+);
 
 /// The key context terminal views set: `main.rs` binds `Copy`/`Paste` in
 /// it, and gives it the keys other bindings would take (Tab, and Linux's
@@ -137,9 +147,75 @@ pub struct TerminalFont {
 
 impl Global for TerminalFont {}
 
+/// `cmd-+` / `cmd--` step, in points (as in Ghostty), and the range.
+const FONT_STEP: f32 = 1.;
+const FONT_SIZES: std::ops::RangeInclusive<f32> = 6.0..=72.0;
+
+/// The size picked with `cmd-+` / `cmd--`, for every embedded terminal and
+/// across launches (`settings.json`: `terminal_font_size`); `cmd-0` goes
+/// back to Ghostty's (or the theme's).
+struct FontZoom {
+    size: Option<f32>,
+    /// Saves the latest size once the keys settle; held only to be dropped
+    /// (cancelled) by every newer one.
+    _save: Option<Task<()>>,
+}
+
+impl Global for FontZoom {}
+
+/// The terminal font (Ghostty's, looked up in the background) and its
+/// zoom actions; call once at startup.
+pub fn init(cx: &mut App) {
+    let size = crate::settings::load()
+        .terminal_font_size
+        .filter(|size| FONT_SIZES.contains(size));
+    cx.set_global(FontZoom { size, _save: None });
+    cx.on_action(|_: &IncreaseFontSize, cx| zoom(Some(FONT_STEP), cx));
+    cx.on_action(|_: &DecreaseFontSize, cx| zoom(Some(-FONT_STEP), cx));
+    cx.on_action(|_: &ResetFontSize, cx| zoom(None, cx));
+    load_font(cx);
+}
+
+/// The size terminals draw with, in points: the one picked, else Ghostty's,
+/// else the theme's monospace size.
+fn font_size(cx: &App) -> f32 {
+    cx.try_global::<FontZoom>()
+        .and_then(|zoom| zoom.size)
+        .or_else(|| {
+            cx.try_global::<TerminalFont>()
+                .and_then(|font| font.size)
+                .map(f32::from)
+        })
+        .unwrap_or_else(|| f32::from(cx.theme().mono_font_size))
+}
+
+/// Step the size by `step` points, or (`None`) forget the picked size.
+fn zoom(step: Option<f32>, cx: &mut App) {
+    let size =
+        step.map(|step| (font_size(cx) + step).clamp(*FONT_SIZES.start(), *FONT_SIZES.end()));
+    if cx.try_global::<FontZoom>().and_then(|zoom| zoom.size) == size {
+        return;
+    }
+    let save = cx.spawn(async move |cx| {
+        let executor = cx.background_executor().clone();
+        executor.timer(Duration::from_millis(400)).await;
+        executor
+            .spawn(async move {
+                let mut settings = crate::settings::load();
+                settings.terminal_font_size = size;
+                crate::settings::save(&settings);
+            })
+            .await;
+    });
+    cx.set_global(FontZoom {
+        size,
+        _save: Some(save),
+    });
+}
+
 /// Look up the terminal font off the main thread (config files, and the
 /// installed families: Ghostty's list may name fonts this machine lacks).
-pub fn load_font(cx: &mut App) {
+fn load_font(cx: &mut App) {
     cx.set_global(TerminalFont::default());
     let text_system = cx.text_system().clone();
     cx.spawn(async move |cx| {
@@ -253,6 +329,7 @@ impl TerminalView {
             cx.on_blur(&focus, window, |this, _, cx| this.focus_changed(false, cx)),
             cx.observe_global::<gpui_kit::component::Theme>(|this, cx| this.theme_changed(cx)),
             cx.observe_global::<TerminalFont>(|_, cx| cx.notify()),
+            cx.observe_global::<FontZoom>(|_, cx| cx.notify()),
         ];
         Self {
             terminal,
@@ -791,8 +868,7 @@ impl Render for TerminalView {
             .family
             .unwrap_or_else(|| theme.mono_font_family.clone());
         let rem = window.rem_size();
-        let size = chosen.size.unwrap_or(theme.mono_font_size);
-        let font_size = rem * (f32::from(size) / 16.);
+        let font_size = rem * (font_size(cx) / 16.);
         let background = hsla(self.screen.background);
         let selection = theme.selection;
         let focused = self.focus.is_focused(window);
@@ -904,6 +980,10 @@ fn context_menu(menu: PopupMenu, focus: &FocusHandle, selected: bool) -> PopupMe
         .menu("Paste", Box::new(Paste))
         .separator()
         .menu("Select All", Box::new(SelectAll))
+        .separator()
+        .menu("Bigger Text", Box::new(IncreaseFontSize))
+        .menu("Smaller Text", Box::new(DecreaseFontSize))
+        .menu("Default Text Size", Box::new(ResetFontSize))
 }
 
 #[expect(clippy::too_many_arguments, reason = "one paint pass over the grid")]

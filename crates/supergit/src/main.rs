@@ -80,6 +80,11 @@ fn bind_terminal_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("tab", NoAction {}, context),
         KeyBinding::new("shift-tab", NoAction {}, context),
+        // Text size, as in every terminal: `=` is `+` without Shift.
+        KeyBinding::new(shortcut!("="), terminal::IncreaseFontSize, context),
+        KeyBinding::new(shortcut!("+"), terminal::IncreaseFontSize, context),
+        KeyBinding::new(shortcut!("-"), terminal::DecreaseFontSize, context),
+        KeyBinding::new(shortcut!("0"), terminal::ResetFontSize, context),
     ]);
     if cfg!(target_os = "macos") {
         cx.bind_keys([
@@ -181,7 +186,7 @@ fn main() -> Result<()> {
         gpui_kit::init(cx);
         appearance::init(cx);
         chat::init(cx);
-        terminal::load_font(cx);
+        terminal::init(cx);
         let mut notifications = notifications::init(cx);
 
         cx.bind_keys([
@@ -388,7 +393,14 @@ pub(crate) fn menu_bar(cx: &mut App) -> Option<Entity<AppMenuBar>> {
 mod tests {
     #[test]
     fn shortcuts_parse_on_this_platform() {
-        for keys in [shortcut!("q"), shortcut!("shift-b")] {
+        for keys in [
+            shortcut!("q"),
+            shortcut!("shift-b"),
+            shortcut!("="),
+            shortcut!("+"),
+            shortcut!("-"),
+            shortcut!("0"),
+        ] {
             gpui_kit::Keystroke::parse(keys).expect(keys);
         }
         assert!(!shortcut!("q").contains("secondary"));
