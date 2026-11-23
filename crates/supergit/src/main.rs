@@ -16,6 +16,7 @@ mod notifications;
 mod recent;
 #[cfg(feature = "screenshot")]
 mod screenshot;
+mod selectable;
 mod settings;
 mod shell_env;
 mod single_instance;
