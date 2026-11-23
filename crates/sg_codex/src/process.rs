@@ -154,6 +154,9 @@ pub struct SpawnOptions {
     pub resume: Option<String>,
     pub policy: Policy,
     pub model: Option<String>,
+    /// Instructions for a new thread besides Codex's own
+    /// (`developerInstructions`); a resumed thread keeps those it has.
+    pub developer_instructions: Option<String>,
     /// The CLI binary; found with [`install::locate`] by default.
     pub program: Option<PathBuf>,
 }
@@ -609,6 +612,9 @@ impl Driver {
             }
             None => {
                 params["cwd"] = json!(self.opts.cwd);
+                if let Some(instructions) = &self.opts.developer_instructions {
+                    params["developerInstructions"] = json!(instructions);
+                }
                 self.request("thread/start", params);
             }
         }

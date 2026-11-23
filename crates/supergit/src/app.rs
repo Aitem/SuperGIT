@@ -28,7 +28,7 @@ use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffMode,
     DiffSide, DiffState,
 };
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -230,6 +230,8 @@ pub struct SuperGitApp {
     settings_open: bool,
     settings_focus: Option<FocusHandle>,
     settings_handle: FocusHandle,
+    /// Settings: the initial prompt's template, saved when they close.
+    initial_prompt_input: Entity<TextareaState>,
     notified: HashMap<String, u64>,
     pending_notification: Option<notifications::Target>,
     attention_cursor: HashMap<Kind, usize>,
@@ -367,6 +369,19 @@ impl SuperGitApp {
         let changes_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
         let commit_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
         let history_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search commits"));
+        let initial_prompt_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(4, 14)
+                .placeholder("No initial prompt: agents get their own instructions only")
+                .default_value(crate::settings::load().initial_prompt().to_string())
+        });
+        // Its preview follows the text.
+        let initial_prompt_subscription =
+            cx.subscribe(&initial_prompt_input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
         let history_search_subscription = cx.subscribe_in(
             &history_search,
             window,
@@ -464,6 +479,7 @@ impl SuperGitApp {
                 && std::env::var_os("SUPERGIT_DEBUG_SETTINGS").is_some(),
             settings_focus: None,
             settings_handle: cx.focus_handle(),
+            initial_prompt_input,
             notified: HashMap::new(),
             pending_notification: None,
             attention_cursor: HashMap::new(),
@@ -545,6 +561,7 @@ impl SuperGitApp {
                 release_subscription,
                 bounds_subscription,
                 history_search_subscription,
+                initial_prompt_subscription,
             ],
         };
         this._subscriptions.extend(filter_subscriptions);
@@ -1313,12 +1330,16 @@ impl SuperGitApp {
         }
         self.close_rebase_dialog(window, cx);
         self.settings_focus = window.focused(cx);
+        let template = crate::settings::load().initial_prompt().to_string();
+        self.initial_prompt_input
+            .update(cx, |input, cx| input.set_value(template, window, cx));
         self.settings_open = true;
         self.settings_handle.focus(window, cx);
         cx.notify();
     }
 
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_initial_prompt(cx);
         self.settings_open = false;
         if let Some(focus) = self.settings_focus.take() {
             focus.focus(window, cx);
@@ -1344,13 +1365,139 @@ impl SuperGitApp {
         cx.notify();
     }
 
+    /// Where an agent in `info`'s worktree works, for its initial prompt.
+    fn place(repo: &Repo, info: &WorktreeInfo) -> crate::initial_prompt::Place {
+        crate::initial_prompt::Place {
+            worktree: info.wt.path.clone(),
+            branch: info.wt.branch.clone(),
+            repo: repo.root.clone(),
+            linked: !info.wt.is_main,
+        }
+    }
+
+    /// The template as edited: the default is stored as none, so a later
+    /// default reaches it.
+    fn save_initial_prompt(&self, cx: &App) {
+        let text = self.initial_prompt_input.read(cx).value().to_string();
+        let mut settings = crate::settings::load();
+        if settings.initial_prompt() == text {
+            return;
+        }
+        settings.initial_prompt = (text != crate::initial_prompt::DEFAULT).then_some(text);
+        crate::settings::save(&settings);
+    }
+
+    fn set_initial_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.to_string();
+        self.initial_prompt_input
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+        self.save_initial_prompt(cx);
+        cx.notify();
+    }
+
+    fn render_initial_prompt_settings(
+        &self,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let text = self.initial_prompt_input.read(cx).value();
+        // What the selected worktree's agents would get.
+        let preview = self
+            .repo
+            .as_ref()
+            .zip(self.selected_info())
+            .map(|(repo, info)| {
+                let prompt = crate::initial_prompt::render(&text, &Self::place(repo, info));
+                (info.wt.display_name(), prompt)
+            });
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Initial prompt"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("initial-prompt-default")
+                                    .label("Default")
+                                    .small()
+                                    .ghost()
+                                    .disabled(text == crate::initial_prompt::DEFAULT)
+                                    .tooltip("Put back SuperGIT's prompt")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_initial_prompt(
+                                            crate::initial_prompt::DEFAULT,
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                            .child(
+                                Button::new("initial-prompt-none")
+                                    .label("None")
+                                    .small()
+                                    .ghost()
+                                    .disabled(text.is_empty())
+                                    .tooltip("Start agents with their own instructions only")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_initial_prompt("", window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        "Added to the system prompt of every agent SuperGIT starts: \
+                         Claude's appended system prompt, Codex's developer instructions \
+                         (new threads).",
+                    )
+                    .child(
+                        "Placeholders: {worktree}, {branch}, {repo}, {repo_name}. \
+                         {#linked}…{/linked} shows only in a linked worktree, \
+                         {#main}…{/main} only in the main checkout.",
+                    ),
+            )
+            .child(Textarea::new(&self.initial_prompt_input))
+            .when_some(preview, |el, (name, prompt)| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("Preview for {name}")),
+                )
+                .child(
+                    div()
+                        .p_2()
+                        .rounded_md()
+                        .bg(theme.muted.opacity(0.5))
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if prompt.is_empty() {
+                            "Nothing is added.".to_string()
+                        } else {
+                            prompt
+                        }),
+                )
+            })
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = crate::settings::load();
         let theme = cx.theme().clone();
         div().absolute().inset_0().flex().justify_center().items_start().pt(px(80.))
             .bg(gpui_kit::black().opacity(0.35))
             .on_mouse_down(MouseButton::Left,cx.listener(|this,_,window,cx| this.close_settings(window,cx)))
-            .child(v_flex().id("settings-content").max_h(px(650.)).overflow_y_scroll().w(px(560.)).track_focus(&self.settings_handle).max_w_full().p_4().gap_3().rounded_lg().shadow_lg()
+            .child(v_flex().id("settings-content").max_h(relative(0.85)).overflow_y_scroll().w(px(560.)).track_focus(&self.settings_handle).max_w_full().p_4().gap_3().rounded_lg().shadow_lg()
                 .border_1().border_color(theme.border).bg(theme.background)
                 .on_mouse_down(MouseButton::Left,|_,_,cx| cx.stop_propagation())
                 .capture_key_down(cx.listener(|this,event: &KeyDownEvent,window,cx| {
@@ -1377,6 +1524,7 @@ impl SuperGitApp {
                         .child(self.render_agent_view_toggle("settings-agent-view", cx).small()))
                     .child(div().text_sm().text_color(theme.muted_foreground).child(
                         "Terminal runs the agent's own TUI (claude, codex) in the panel, in SuperGIT's colors. Chat is SuperGIT's native view.")))
+                .child(self.render_initial_prompt_settings(&theme, cx))
                 .child(self.render_diff_settings(cx))
                 .child(self.render_cleanup_settings(cx)))
             .into_any_element()
@@ -1452,6 +1600,10 @@ impl SuperGitApp {
             Ok(list) => {
                 self.load_error = None;
                 self.worktrees = list;
+                if let Some(repo) = &self.repo {
+                    let places = self.worktrees.iter().map(|info| Self::place(repo, info));
+                    crate::initial_prompt::Places::set_repo(&repo.root, places, cx);
+                }
             }
             Err(e) => {
                 self.load_error = Some(model::git_error_message(e));
@@ -3145,8 +3297,9 @@ impl SuperGitApp {
                         row.child(
                             div()
                                 .min_w_0()
-                                // Gives way before the names do.
-                                .flex_shrink(8.)
+                                // Gives way, down to nothing, before the
+                                // names do.
+                                .flex_shrink(1000.)
                                 .ml_2()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)

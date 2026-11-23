@@ -109,6 +109,18 @@ pub struct Settings {
     /// The embedded terminal's font size in points, picked with `cmd-+` /
     /// `cmd--`; none: Ghostty's (`cmd-0`).
     pub terminal_font_size: Option<f32>,
+    /// The template of the text added to every agent's system prompt
+    /// (`initial_prompt`); none: the default, empty: no text.
+    pub initial_prompt: Option<String>,
+}
+
+impl Settings {
+    /// The initial prompt's template in effect.
+    pub fn initial_prompt(&self) -> &str {
+        self.initial_prompt
+            .as_deref()
+            .unwrap_or(crate::initial_prompt::DEFAULT)
+    }
 }
 
 fn file() -> Option<PathBuf> {

@@ -54,7 +54,8 @@ docs/ROADMAP.md
 
 Same protocol as the Agent SDKs and the VS Code extension:
 `claude -p --input-format stream-json --output-format stream-json --verbose
---include-partial-messages --permission-prompt-tool stdio [--resume=<id>]`.
+--include-partial-messages --permission-prompt-tool stdio [--resume=<id>]
+[--append-system-prompt <initial prompt>]`.
 - Host → CLI (stdin JSON lines): `control_request {subtype: initialize}` first,
   user turns `{"type":"user","message":{"role":"user","content":…}}`,
   `interrupt`, `set_permission_mode`, and `control_response` to permission
@@ -372,6 +373,16 @@ never commit, push or create worktrees there without asking.
   `gpui-pre-platform/test-support` directly instead.
 - Edition 2024: `impl IntoElement` return types capture `cx`'s lifetime; for
   rows built inside iterator closures return a concrete `Stateful<Div>`.
+- **Initial prompt** (`initial_prompt.rs`, Settings ▸ Initial prompt): a
+  template added to every agent SuperGIT starts — Claude's
+  `--append-system-prompt` (chat and TUI, on every start: a resumed session
+  does not keep it), Codex's `developerInstructions` on `thread/start` / `-c
+  developer_instructions=` in its TUI (new threads only: a thread keeps
+  them). Placeholders `{worktree}` `{branch}` `{repo}` `{repo_name}`,
+  sections `{#linked}…{/linked}` / `{#main}…{/main}`; the default tells the
+  agent it works in a worktree beside the main checkout. A conversation
+  finds its place in the `Places` global, which `apply_worktrees` keeps.
+  `settings.json` `initial_prompt`: absent = the default, `""` = none.
 - **Git calls** go through `sg_git::git()` which sets `GIT_OPTIONAL_LOCKS=0`
   (never fight agents for `index.lock`) and disables prompts. Parse porcelain
   `-z` formats, never human output.

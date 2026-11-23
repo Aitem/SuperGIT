@@ -151,6 +151,7 @@ impl ChatSession {
     /// resumed and recognized), or the existing one.
     fn terminal_spawn(&mut self, cx: &App) -> Spawn {
         let resume = self.convo.session_id.clone().filter(|_| self.has_history());
+        let initial_prompt = crate::initial_prompt::for_worktree(&self.worktree, cx);
         let (program, args) = match self.provider() {
             Provider::Claude => {
                 let mut args: Vec<String> = match resume {
@@ -161,6 +162,10 @@ impl ChatSession {
                         vec!["--session-id".into(), id]
                     }
                 };
+                // Every start: a resumed session does not keep it.
+                if let Some(prompt) = initial_prompt {
+                    args.extend(["--append-system-prompt".into(), prompt]);
+                }
                 args.extend(crate::terminal::theme::claude_args(cx));
                 ("claude".into(), args)
             }
@@ -168,7 +173,23 @@ impl ChatSession {
                 let program = sg_codex::install::locate()
                     .map(|found| found.program)
                     .unwrap_or_else(|_| "codex".into());
-                let args = resume.map_or_else(Vec::new, |id| vec!["resume".into(), id]);
+                let args = match resume {
+                    Some(id) => vec!["resume".into(), id],
+                    // A new thread keeps its instructions. A config
+                    // override; its value a TOML string (JSON's escapes
+                    // are TOML's).
+                    None => initial_prompt
+                        .map(|prompt| {
+                            vec![
+                                "-c".into(),
+                                format!(
+                                    "developer_instructions={}",
+                                    serde_json::Value::from(prompt)
+                                ),
+                            ]
+                        })
+                        .unwrap_or_default(),
+                };
                 (program, args)
             }
         };

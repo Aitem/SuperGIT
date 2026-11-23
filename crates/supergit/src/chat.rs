@@ -760,6 +760,7 @@ impl ChatSession {
             return Ok(p);
         }
         let resume = self.convo.session_id.clone();
+        let initial_prompt = crate::initial_prompt::for_worktree(&self.worktree, cx);
         let mut events = match &mut self.backend {
             Backend::Claude { process, mode, .. } => {
                 let (p, events) = ClaudeProcess::spawn(&SpawnOptions {
@@ -768,6 +769,7 @@ impl ChatSession {
                     permission_mode: Some(*mode),
                     model: self.options.model.clone(),
                     effort: self.options.effort.clone(),
+                    append_system_prompt: initial_prompt,
                     ..Default::default()
                 })?;
                 *process = Some(Arc::new(p));
@@ -780,6 +782,7 @@ impl ChatSession {
                     cwd: self.cwd.clone(),
                     resume,
                     policy: *policy,
+                    developer_instructions: initial_prompt,
                     ..Default::default()
                 });
                 *process = Some(Arc::new(p));
