@@ -3734,15 +3734,10 @@ impl SuperGitApp {
                 "Structural diff by difftastic {version}: only changed syntax is highlighted, reformatting is ignored"
             ),
         };
-        h_flex()
-            .flex_none()
+        toolbar(theme)
             .w_full()
             .min_w_0()
             .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(theme.border)
             .children(layouts)
             .children(
                 (list == FileList::Pull)
@@ -4445,13 +4440,8 @@ impl SuperGitApp {
                 })
                 .collect()
         };
-        let header = h_flex()
-            .flex_none()
+        let header = toolbar(theme)
             .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(theme.border)
             .child(
                 div().flex_1().min_w_0().child(
                     Input::new(&filter).small().cleanable(true).prefix(
@@ -4624,13 +4614,8 @@ impl SuperGitApp {
                             .border_r_1()
                             .border_color(theme.border)
                             .child(
-                                v_flex()
-                                    .flex_none()
-                                    .p_2()
-                                    .gap_1()
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .child(
+                                toolbar(theme).child(
+                                    div().flex_1().min_w_0().child(
                                         Input::new(&self.history_search)
                                             .small()
                                             .cleanable(true)
@@ -4638,19 +4623,22 @@ impl SuperGitApp {
                                                 Icon::new(IconName::Search)
                                                     .small()
                                                     .text_color(theme.muted_foreground),
-                                            ),
-                                    )
-                                    .when(searching, |el| {
-                                        el.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(format!(
-                                                    "{matching_count} of {} loaded commits",
-                                                    commits.len()
-                                                )),
-                                        )
-                                    }),
+                                            )
+                                            // In the field: the bar keeps its height.
+                                            .when(searching, |input| {
+                                                input.suffix(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(theme.muted_foreground)
+                                                        .child(format!(
+                                                            "{matching_count} of {}",
+                                                            commits.len()
+                                                        )),
+                                                )
+                                            }),
+                                    ),
+                                ),
                             )
                             .child(
                                 v_flex()
@@ -5753,6 +5741,21 @@ pub(crate) fn default_provider() -> Provider {
 
 /// Width of a collapsed side panel (sidebar, agent panel).
 const RAIL_WIDTH: f32 = 48.;
+
+/// Height of the bars above the review's columns (commit search, file
+/// filter, diff options): a small field with 8px around it, and the line
+/// under it. Side by side, their lines meet.
+const TOOLBAR_HEIGHT: f32 = 41.;
+
+/// A bar above one of the review's columns, as tall as the others.
+fn toolbar(theme: &gpui_kit::component::Theme) -> Div {
+    h_flex()
+        .flex_none()
+        .h(px(TOOLBAR_HEIGHT))
+        .px_2()
+        .border_b_1()
+        .border_color(theme.border)
+}
 /// An agent-rail item with its label: shown at once on hover, to the item's
 /// left and centered on it (a tooltip waits and sits at the mouse).
 /// A rail's square: as tall as the rail is wide, a line under it, the
