@@ -9,6 +9,7 @@ mod dump;
 mod file_tree;
 mod graph;
 mod icons;
+mod initial_prompt;
 mod launch;
 mod lifecycle;
 mod model;

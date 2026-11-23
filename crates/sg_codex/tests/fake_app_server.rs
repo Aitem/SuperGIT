@@ -132,6 +132,7 @@ impl Session {
             resume: resume.map(String::from),
             policy: Policy::Auto,
             model: None,
+            developer_instructions: Some("You work in a worktree.".into()),
             program: Some(program.to_path_buf()),
         });
         let mut convo = Conversation::new();
@@ -310,6 +311,10 @@ fn approved_command_completes_the_turn() {
     let start = &fake.sent("wt", "thread/start")[0];
     assert_eq!(start["params"]["approvalPolicy"], "on-request");
     assert_eq!(start["params"]["sandbox"], "workspace-write");
+    assert_eq!(
+        start["params"]["developerInstructions"],
+        "You work in a worktree."
+    );
     let turn = &fake.sent("wt", "turn/start")[0];
     assert!(turn["params"].get("collaborationMode").is_none());
     assert_eq!(turn["params"]["threadId"], "th-wt");
@@ -404,6 +409,8 @@ fn crash_reports_and_the_next_turn_resumes_the_thread() {
     let resume = &fake.sent("wt", "thread/resume")[0];
     assert_eq!(resume["params"]["threadId"], "th-wt");
     assert_eq!(resume["params"]["excludeTurns"], true);
+    // The thread keeps the instructions it started with.
+    assert!(resume["params"].get("developerInstructions").is_none());
 }
 
 #[test]

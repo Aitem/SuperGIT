@@ -81,6 +81,9 @@ pub struct SpawnOptions {
     pub permission_mode: Option<PermissionMode>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Added to Claude Code's own system prompt (`--append-system-prompt`),
+    /// on every start: a resumed session does not keep it.
+    pub append_system_prompt: Option<String>,
     /// The CLI binary, `claude` from PATH by default.
     pub program: Option<PathBuf>,
 }
@@ -123,6 +126,9 @@ impl ClaudeProcess {
         }
         if let Some(effort) = &opts.effort {
             cmd.args(["--effort", effort]);
+        }
+        if let Some(prompt) = &opts.append_system_prompt {
+            cmd.args(["--append-system-prompt", prompt]);
         }
         cmd.current_dir(&opts.cwd)
             .env("PWD", &opts.cwd)
