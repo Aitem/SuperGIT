@@ -147,6 +147,12 @@ installed, it is the theme's monospace font (Menlo 13 on macOS). The files
 are read once at startup, off the main thread; Ghostty's colors and theme
 are not used (the terminal keeps the app's colors).
 
+`cmd-=` (or `cmd-+`), `cmd--` and `cmd-0` (`ctrl-` on Linux) inside a
+terminal, or Bigger Text / Smaller Text / Default Text Size in its
+right-click menu, change the text size of every embedded terminal by 1 pt
+(6–72 pt). The size picked is kept in `settings.json`
+(`terminal_font_size`); `cmd-0` forgets it and goes back to Ghostty's.
+
 ## Status and attention
 
 Claude Code asks `OSC 7501 ; ?` (the program-status protocol). libghostty

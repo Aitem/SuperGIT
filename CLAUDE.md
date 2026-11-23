@@ -166,7 +166,9 @@ Design notes: docs/EMBEDDED_TERMINAL.md.
   mouse encoder); Shift still selects.
 - Font: Ghostty's `font-family` / `font-size` (`sg_terminal::config` reads
   its config files at startup; `terminal::TerminalFont` global), else the
-  theme's mono font. Colors stay the app's.
+  theme's mono font. Colors stay the app's. `cmd-=`/`cmd-+`, `cmd--`,
+  `cmd-0` in the `Terminal` context (and its right-click menu) step the
+  size of every terminal by 1 pt (6–72), saved as `terminal_font_size`.
 - Terminal panel (`app/terminal_panel.rs`): `cmd-j` / View ▸ Toggle
   Terminal / the status bar's Terminal button / the sidebar's "⋯" menu show
   the user's shell under the review, one per worktree in its folder; shells

@@ -106,6 +106,9 @@ pub struct Settings {
     /// The chat's text box height in pixels, dragged by the composer's top
     /// edge; none: it grows with the text.
     pub composer_height: Option<f32>,
+    /// The embedded terminal's font size in points, picked with `cmd-+` /
+    /// `cmd--`; none: Ghostty's (`cmd-0`).
+    pub terminal_font_size: Option<f32>,
 }
 
 fn file() -> Option<PathBuf> {
