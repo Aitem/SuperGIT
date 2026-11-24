@@ -79,7 +79,6 @@ impl SuperGitApp {
     pub fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         let projects = &mut self.persisted.projects;
         projects.collapsed = !projects.collapsed;
-        self.window_buttons_revealed = false;
         self.queue_persist(cx);
         cx.notify();
     }
@@ -198,18 +197,43 @@ impl SuperGitApp {
                 .border_l_1()
                 .border_color(theme.sidebar_border)
         };
-        let header = h_flex()
-            .size_full()
+        // The app's name, only where all of it fits: in less room it wraps
+        // onto a second line, out of sight, rather than being cut short.
+        let name = div()
+            .flex_1()
             .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .flex()
+            .flex_wrap()
+            // Only an item after a line's first one can wrap.
+            .child(div().flex_none().h_full())
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
+                h_flex()
+                    .flex_none()
+                    .h_full()
+                    .pr_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("SuperGIT"),
-            )
+            );
+        // As tall as the rails are wide, like the agent panel's header: their
+        // lines meet. On macOS the sidebar reaches the window's top edge: the
+        // window buttons sit at the row's left, and the row moves the window
+        // as a title bar does. Not gpui-component's `TitleBar`, which is
+        // never narrower than its content: in a narrow sidebar it pushed the
+        // squares out, over the review's header.
+        let header = h_flex()
+            .h(px(RAIL_WIDTH))
+            .flex_none()
+            .pl(px(if window_buttons_shown(window) {
+                WINDOW_BUTTONS_INSET
+            } else {
+                12.
+            }))
+            .border_b_1()
+            .border_color(theme.sidebar_border)
+            .child(name)
             .child(self.add_project_button(
                 square("add-project", IconName::Plus).tooltip(format!("Add a project ({MOD}-o)")),
                 cx,
@@ -225,27 +249,7 @@ impl SuperGitApp {
                         this.toggle_sidebar(&ToggleSidebar, window, cx)
                     })),
             );
-        // As tall as the rails are wide, like the agent panel's header: their
-        // lines meet. On macOS the sidebar reaches the window's top edge and
-        // this is the title bar (window buttons, dragging, double click).
-        let header = if FULL_HEIGHT_PANELS {
-            TitleBar::new()
-                .h(px(RAIL_WIDTH))
-                .when(window.is_fullscreen(), |bar| bar.pl(px(0.)))
-                .bg(theme.sidebar)
-                .border_color(theme.sidebar_border)
-                .child(header)
-                .into_any_element()
-        } else {
-            h_flex()
-                .h(px(RAIL_WIDTH))
-                .flex_none()
-                .pl_3()
-                .border_b_1()
-                .border_color(theme.sidebar_border)
-                .child(header)
-                .into_any_element()
-        };
+        let header = self.window_drag_area(header, cx);
         v_flex()
             .w_full()
             .min_w_0()
@@ -869,13 +873,23 @@ impl SuperGitApp {
             let label = |id: &'static str, text: SharedString, item: AnyElement| {
                 rail_label(id, text, item, LabelSide::Right, &theme).into_any_element()
             };
+            // macOS: the window buttons sit right of this square (the rail is
+            // too narrow for them), so its label opens past them.
+            let expand = rail_label(
+                "expand-sidebar-label",
+                format!("Expand the sidebar ({MOD}-b)").into(),
+                expand,
+                if self.window_buttons_beside_rail(window) {
+                    LabelSide::RightPastWindowButtons
+                } else {
+                    LabelSide::Right
+                },
+                &theme,
+            )
+            .into_any_element();
             (
                 vec![
-                    label(
-                        "expand-sidebar-label",
-                        format!("Expand the sidebar ({MOD}-b)").into(),
-                        expand.into_any_element(),
-                    ),
+                    expand,
                     label(
                         "add-project-rail-label",
                         format!("Add a project ({MOD}-o)").into(),
@@ -892,33 +906,6 @@ impl SuperGitApp {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            // macOS: too narrow for the window buttons, the rail hides them
-            // (`sync_window_buttons`); they come back while the pointer is
-            // in the window's top-left corner, the expand square and the
-            // buttons' place right of it.
-            .when(window_buttons_shown(window), |rail| {
-                let owner = cx.entity().downgrade();
-                let revealed = self.window_buttons_revealed;
-                rail.child(
-                    canvas(
-                        |_, _, _| {},
-                        move |_, _, window, _| {
-                            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                                let corner = event.position.x < px(RAIL_WIDTH + 76.)
-                                    && event.position.y < px(RAIL_WIDTH);
-                                if phase == DispatchPhase::Bubble && corner != revealed {
-                                    let _ = owner.update(cx, |this, cx| {
-                                        this.window_buttons_revealed = corner;
-                                        cx.notify();
-                                    });
-                                }
-                            });
-                        },
-                    )
-                    .absolute()
-                    .size_0(),
-                )
-            })
             .children(top)
             .child(
                 v_flex()

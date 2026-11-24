@@ -220,9 +220,6 @@ pub struct SuperGitApp {
     focus_handle: FocusHandle,
     /// The header's repository and worktree names: selectable, `cmd-c`.
     header_selection: gpui_kit::base::TextSelectionHandle,
-    /// macOS, sidebar collapsed: the pointer is in the window's top-left
-    /// corner, so the window buttons show (see `sync_window_buttons`).
-    window_buttons_revealed: bool,
     /// Where the window buttons were last put (`None`: not yet).
     window_buttons_at: Option<Point<Pixels>>,
     /// A press on the header that may become a window drag.
@@ -472,7 +469,6 @@ impl SuperGitApp {
             prs_fetched_at: None,
             focus_handle,
             header_selection,
-            window_buttons_revealed: false,
             window_buttons_at: None,
             window_drag: false,
             settings_open: cfg!(feature = "screenshot")
@@ -2996,29 +2992,46 @@ impl SuperGitApp {
 
     // ---- rendering -------------------------------------------------------
 
-    /// A title bar across the window: outside macOS (menus, window buttons),
-    /// and on macOS only while there is no sidebar to hold the window
-    /// buttons. `title`: show the app's name (the sidebar shows it
-    /// otherwise). Its actions live in the sidebar's "⋯" menu.
-    /// macOS: the window buttons sit in the sidebar's header. With the
-    /// sidebar collapsed there is no room for them: they hide past the
-    /// window's edge and show right of the expand square while the pointer
-    /// is in that corner (as in Arc). Applied only when the place changes.
+    /// macOS, outside full screen, with the sidebar collapsed: its rail is
+    /// too narrow for the window buttons, so they sit beside it, at the
+    /// start of the main column's first row.
+    fn window_buttons_beside_rail(&self, window: &Window) -> bool {
+        FULL_HEIGHT_PANELS
+            && !window.is_fullscreen()
+            && self.projects_visible()
+            && self.persisted.projects.collapsed
+    }
+
+    /// macOS: the window buttons sit at the left of the window's first row:
+    /// in the sidebar's header, or with the sidebar collapsed in the main
+    /// column's, just past the rail. Applied only when the place changes.
     fn sync_window_buttons(&mut self, window: &Window) {
         if !FULL_HEIGHT_PANELS {
             return;
         }
-        let collapsed =
-            self.projects_visible() && self.persisted.projects.collapsed && !window.is_fullscreen();
-        let at = match (collapsed, self.window_buttons_revealed) {
-            (false, _) => window_buttons_home(),
-            (true, true) => point(px(RAIL_WIDTH + 12.), window_buttons_home().y),
-            (true, false) => point(px(-200.), window_buttons_home().y),
+        let home = window_buttons_home();
+        let at = if self.window_buttons_beside_rail(window) {
+            point(home.x + px(RAIL_WIDTH), home.y)
+        } else {
+            home
         };
         if self.window_buttons_at != Some(at) {
             self.window_buttons_at = Some(at);
             window.set_traffic_light_position(at);
         }
+    }
+
+    /// The main column's first row where it has no header of its own (no
+    /// worktree, the welcome screen) while the window buttons sit there
+    /// (`window_buttons_beside_rail`): empty, it keeps their place and moves
+    /// the window as a header does.
+    fn render_window_buttons_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let row = div()
+            .h(px(RAIL_WIDTH))
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().border);
+        self.window_drag_area(row, cx)
     }
 
     /// macOS full-height layout: dragging the row moves the window and a
@@ -3055,6 +3068,10 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    /// A title bar across the window: outside macOS (menus, window buttons),
+    /// and on macOS only while there is no sidebar to hold the window
+    /// buttons. `title`: show the app's name (the sidebar shows it
+    /// otherwise). Its actions live in the sidebar's "⋯" menu.
     fn render_title_bar(
         &self,
         title: bool,
@@ -3083,21 +3100,36 @@ impl SuperGitApp {
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        // macOS, the sidebar collapsed: the window buttons sit at the start
+        // of this column's first row.
+        let window_buttons = self.window_buttons_beside_rail(window);
         let Some(info) = self.selected_info().cloned() else {
-            if let Some(error) = &self.load_error {
-                return self.render_data_notice("Worktrees unavailable", Some(error), false, cx);
+            let body = if let Some(error) = &self.load_error {
+                self.render_data_notice("Worktrees unavailable", Some(error), false, cx)
+            } else {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.muted_foreground)
+                    .child(if self.worktrees.is_empty() {
+                        "Loading worktrees…"
+                    } else {
+                        "Select a worktree"
+                    })
+                    .into_any_element()
+            };
+            if !window_buttons {
+                return body;
             }
-            return div()
+            // No worktree, no header: an empty row in its place.
+            return v_flex()
                 .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.muted_foreground)
-                .child(if self.worktrees.is_empty() {
-                    "Loading worktrees…"
-                } else {
-                    "Select a worktree"
-                })
+                .min_w_0()
+                .h_full()
+                .child(self.render_window_buttons_row(cx))
+                .child(body)
                 .into_any_element();
         };
 
@@ -3165,7 +3197,9 @@ impl SuperGitApp {
         };
         let _ = window;
 
-        let header = self.render_header(&info, &theme, cx).into_any_element();
+        let header = self
+            .render_header(&info, window_buttons, &theme, cx)
+            .into_any_element();
         let header = self.window_drag_area(header, cx);
         v_flex()
             .flex_1()
@@ -3200,9 +3234,12 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    /// The worktree's header. `window_buttons`: they sit at its start
+    /// (macOS, the sidebar collapsed), so it begins past them.
     fn render_header(
         &self,
         info: &WorktreeInfo,
+        window_buttons: bool,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -3262,6 +3299,7 @@ impl SuperGitApp {
             .h(px(RAIL_WIDTH))
             .flex_none()
             .px_4()
+            .when(window_buttons, |row| row.pl(px(WINDOW_BUTTONS_INSET)))
             .gap_4()
             .justify_between()
             .border_b_1()
@@ -5407,9 +5445,13 @@ impl SuperGitApp {
         // The status bar stays under the center column, so the side panels
         // and their splitters reach the window's bottom edge.
         if self.repo.is_none() {
+            let row = self
+                .window_buttons_beside_rail(window)
+                .then(|| self.render_window_buttons_row(cx));
             return v_flex()
                 .size_full()
                 .min_w_0()
+                .children(row)
                 .child(self.render_welcome(cx))
                 .child(self.render_status_bar(cx))
                 .into_any_element();
@@ -5797,6 +5839,9 @@ enum LabelSide {
     Left,
     /// The collapsed sidebar, at the left edge.
     Right,
+    /// The collapsed sidebar's expand square while the window buttons sit
+    /// beside it (macOS): to the right too, past them.
+    RightPastWindowButtons,
 }
 
 fn rail_label(
@@ -5810,7 +5855,7 @@ fn rail_label(
     gpui_kit::base::HoverCard::new(id)
         .anchor(match side {
             LabelSide::Left => Anchor::RightCenter,
-            LabelSide::Right => Anchor::LeftCenter,
+            LabelSide::Right | LabelSide::RightPastWindowButtons => Anchor::LeftCenter,
         })
         .open_delay(Duration::ZERO)
         .close_delay(Duration::ZERO)
@@ -5823,6 +5868,7 @@ fn rail_label(
                 .map(|label| match side {
                     LabelSide::Left => label.pr_1p5(),
                     LabelSide::Right => label.pl_1p5(),
+                    LabelSide::RightPastWindowButtons => label.pl(px(WINDOW_BUTTONS_INSET)),
                 })
                 .child(
                     div()
@@ -5845,8 +5891,13 @@ fn rail_label(
 /// buttons sit in the sidebar. Elsewhere a title bar keeps the menus and
 /// window buttons above everything.
 const FULL_HEIGHT_PANELS: bool = cfg!(target_os = "macos");
-/// The expanded sidebar's width range.
-const SIDEBAR_MIN: f32 = 220.;
+/// The room kept at the left of a panel's first row for the window buttons
+/// (macOS), which sit at `window_buttons_home`: as much as gpui-component's
+/// title bar keeps for them.
+const WINDOW_BUTTONS_INSET: f32 = 80.;
+/// The expanded sidebar's width range. At its narrowest the header still
+/// holds its three squares beside the window buttons.
+const SIDEBAR_MIN: f32 = WINDOW_BUTTONS_INSET + 3. * RAIL_WIDTH;
 const SIDEBAR_MAX: f32 = 520.;
 
 /// Two letters for a worktree in the collapsed list: the first letters of
