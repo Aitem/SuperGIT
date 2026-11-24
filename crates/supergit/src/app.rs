@@ -859,6 +859,20 @@ impl SuperGitApp {
     }
 
     /// Flat paths or a folder tree in the Changes tab (remembered per repository).
+    fn set_history_scope(&mut self, scope: model::history::HistoryScope, cx: &mut Context<Self>) {
+        let Some(repo) = &self.repo else { return };
+        self.persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default()
+            .history_scope = scope;
+        self.queue_persist(cx);
+        // A walk of the other scope may be under way: this one replaces it.
+        self.history_task = None;
+        self.reload_history(cx);
+        cx.notify();
+    }
+
     fn set_changes_tree(&mut self, tree: bool, cx: &mut Context<Self>) {
         let Some(repo) = &self.repo else { return };
         self.persisted
@@ -2034,13 +2048,14 @@ impl SuperGitApp {
             Some(model::HistorySource::new(&repo.common_dir, status))
         });
         let previous = self.history.clone();
+        let scope = self.repository_view().history_scope;
         self.history_generation += 1;
         let generation = self.history_generation;
         self.history_task = Some(cx.spawn(async move |this, cx| {
             let selected = path.clone();
             let history = cx
                 .background_executor()
-                .spawn(async move { previous.load(&path, source.as_ref(), limit) })
+                .spawn(async move { previous.load_in(&path, source.as_ref(), limit, scope) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if generation == this.history_generation
@@ -4401,6 +4416,36 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    /// Every branch, or this one with what it forked from muted.
+    fn history_scope_buttons(&self, cx: &mut Context<Self>) -> [Button; 2] {
+        use model::history::HistoryScope;
+        let current = self.repository_view().history_scope;
+        [
+            (
+                HistoryScope::All,
+                "history-all",
+                IconName::GitGraph,
+                "Every branch and tag",
+            ),
+            (
+                HistoryScope::Branch,
+                "history-branch",
+                IconName::GitCommitVertical,
+                "This branch only; commits before its fork point muted",
+            ),
+        ]
+        .map(|(scope, id, icon, tooltip)| {
+            Button::new(id)
+                .icon(icon)
+                .small()
+                .ghost()
+                .selected(current == scope)
+                .toggled(current == scope)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_history_scope(scope, cx)))
+        })
+    }
+
     fn render_history(
         &self,
         width: f32,
@@ -4479,6 +4524,7 @@ impl SuperGitApp {
             .map(|parent| parent.merge_base.clone());
         let summary = fork.map(|fork| self.render_fork_summary(fork, theme, cx));
         let matching_count = matches.len();
+        let scope_buttons = self.history_scope_buttons(cx);
         let mut graph = graph.into_iter();
         let rows = matches.into_iter().enumerate().map(|(ix, c)| {
             let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
@@ -4486,6 +4532,7 @@ impl SuperGitApp {
             let avatar = self.avatars.get(&c.email.to_ascii_lowercase()).cloned();
             let badges = ref_badges(("commit-refs", ix), &c.refs, base.as_deref(), 3, theme);
             let fork_point = fork_point.as_deref() == Some(c.sha.as_str());
+            let muted = self.history.before_fork.contains(&c.sha);
             commit_row(
                 ix,
                 c,
@@ -4493,7 +4540,7 @@ impl SuperGitApp {
                 avatar,
                 badges,
                 badge_room,
-                fork_point,
+                (fork_point, muted),
                 selected,
                 theme,
             )
@@ -4519,31 +4566,34 @@ impl SuperGitApp {
                             .size_full()
                             .min_w_0()
                             .child(
-                                toolbar(theme).child(
-                                    div().flex_1().min_w_0().child(
-                                        Input::new(&self.history_search)
-                                            .small()
-                                            .cleanable(true)
-                                            .prefix(
-                                                Icon::new(IconName::Search)
-                                                    .small()
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                            // In the field: the bar keeps its height.
-                                            .when(searching, |input| {
-                                                input.suffix(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_xs()
-                                                        .text_color(theme.muted_foreground)
-                                                        .child(format!(
-                                                            "{matching_count} of {}",
-                                                            commits.len()
-                                                        )),
+                                toolbar(theme)
+                                    .child(
+                                        div().flex_1().min_w_0().child(
+                                            Input::new(&self.history_search)
+                                                .small()
+                                                .cleanable(true)
+                                                .prefix(
+                                                    Icon::new(IconName::Search)
+                                                        .small()
+                                                        .text_color(theme.muted_foreground),
                                                 )
-                                            }),
-                                    ),
-                                ),
+                                                // In the field: the bar keeps its height.
+                                                .when(searching, |input| {
+                                                    input.suffix(
+                                                        div()
+                                                            .flex_none()
+                                                            .text_xs()
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(format!(
+                                                                "{matching_count} of {}",
+                                                                commits.len()
+                                                            )),
+                                                    )
+                                                }),
+                                        ),
+                                    )
+                                    .gap_1()
+                                    .children(scope_buttons),
                             )
                             .child(
                                 v_flex()
@@ -6320,7 +6370,8 @@ fn commit_row(
     avatar: Option<PathBuf>,
     badges: Vec<AnyElement>,
     badge_room: f32,
-    fork_point: bool,
+    // The fork point; a commit before it, which this branch did not make.
+    (fork_point, muted): (bool, bool),
     selected: bool,
     theme: &gpui_kit::component::Theme,
 ) -> Stateful<Div> {
@@ -6332,6 +6383,7 @@ fn commit_row(
         .gap_2()
         .text_sm()
         .cursor_pointer()
+        .when(muted && !selected, |el| el.opacity(0.45))
         .when(selected, |el| el.bg(theme.list_active))
         .hover(|el| el.bg(theme.list_hover))
         .when_some(graph, |el, (graph, lanes)| {
