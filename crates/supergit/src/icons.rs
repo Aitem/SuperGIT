@@ -70,7 +70,10 @@ gpui_kit::assets::icon_assets!(
         ArrowDownToLine,
         ArrowUpFromLine,
         GitBranch,
-        Trash
+        Trash,
+        // The History tab's scope.
+        GitGraph,
+        GitCommitVertical
     ]
 );
 
@@ -142,6 +145,8 @@ mod tests {
             IconName::ArrowUpFromLine,
             IconName::GitBranch,
             IconName::Trash,
+            IconName::GitGraph,
+            IconName::GitCommitVertical,
         ] {
             let path = icon.path();
             assert!(

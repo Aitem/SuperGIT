@@ -105,6 +105,8 @@ pub struct RepositoryView {
     /// File lists (Changes, and a commit's files in History) show a folder
     /// tree instead of flat paths.
     pub changes_tree: bool,
+    /// What the History tab lists: every branch, or this one.
+    pub history_scope: crate::model::history::HistoryScope,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,6 +136,7 @@ impl Default for RepositoryView {
             chat_open: true,
             terminal_height: 280.,
             changes_tree: false,
+            history_scope: Default::default(),
         }
     }
 }
