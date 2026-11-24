@@ -346,6 +346,7 @@ impl SuperGitApp {
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
                     .child(project_name(root)),
             )
             .when(signal.is_some(), |row| {
@@ -468,7 +469,7 @@ impl SuperGitApp {
                         .when(scope.active, |header| {
                             header.child(
                                 Button::new("preview-completed-cleanup")
-                                    .label("Clean up…")
+                                    .label("Clean up")
                                     .tooltip(
                                         "Clean up completed worktrees and their local branches",
                                     )
@@ -643,7 +644,29 @@ impl SuperGitApp {
             let keep_path = context_path.clone();
             let cleanup_owner = owner.clone();
             let cleanup_path = context_path.clone();
+            let editor_owner = owner.clone();
+            let editor_path = context_path.clone();
+            let reveal_owner = owner.clone();
+            let reveal_path = context_path.clone();
             menu.item(
+                PopupMenuItem::new("Open in Editor").on_click(move |_, _, cx| {
+                    let result = launch::open_in_editor(&editor_path);
+                    let _ = editor_owner
+                        .update(cx, |this, cx| this.report(result, "Opened in editor", cx));
+                }),
+            )
+            .item(
+                PopupMenuItem::new(format!("Reveal in {}", launch::FILE_MANAGER)).on_click(
+                    move |_, _, cx| {
+                        let result = launch::reveal_in_finder(&reveal_path);
+                        let _ = reveal_owner.update(cx, |this, cx| {
+                            this.report(result, &format!("Opened in {}", launch::FILE_MANAGER), cx)
+                        });
+                    },
+                ),
+            )
+            .separator()
+            .item(
                 PopupMenuItem::new("Keep active")
                     .checked(kept)
                     .on_click(move |_, _, cx| {
@@ -724,7 +747,9 @@ impl SuperGitApp {
         } else {
             signal.label
         };
-        let cell = cell.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+        let cell = cell
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .tooltip_show_delay(crate::TOOLTIP_DELAY);
         let Some((worktree, conversation, provider)) = signal.open else {
             return cell.into_any_element();
         };
@@ -779,7 +804,7 @@ impl SuperGitApp {
                     )
                     .child(
                         Button::new("create-from-issue")
-                            .label("From issue…")
+                            .label("From issue")
                             .small()
                             .outline()
                             .disabled(self.action_task.is_some() || self.cleanup_task.is_some())

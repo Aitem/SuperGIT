@@ -91,7 +91,7 @@ impl SuperGitApp {
             .is_some_and(|range| range.side() == range.end_side() && range.start() == range.end());
         Some(
             Button::new("add-pr-line-comment")
-                .label("Comment…")
+                .label("Comment")
                 .xsmall()
                 .ghost()
                 .tooltip("Select one line number to start a review comment")

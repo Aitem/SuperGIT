@@ -1283,6 +1283,7 @@ impl ChatSession {
                         .tooltip(|window, cx| {
                             Tooltip::new("Scroll to this message").build(window, cx)
                         })
+                        .tooltip_show_delay(crate::TOOLTIP_DELAY)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.scroller
                                 .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));

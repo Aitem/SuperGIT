@@ -37,6 +37,11 @@ use gpui_kit::*;
 
 actions!(supergit, [Quit]);
 
+/// How long the pointer rests on something before its tooltip shows: the
+/// components' default (`TooltipDefaults`), and set on every element
+/// tooltip, whose own default is shorter.
+pub const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A keystroke with the primary modifier, as a `'static` keymap string:
 /// `shortcut!("shift-b")` is `cmd-shift-b` on macOS, `ctrl-shift-b` elsewhere.
 /// (`KeyBinding::new` cannot resolve gpui's `secondary-`.)
@@ -185,6 +190,9 @@ fn main() -> Result<()> {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        gpui_kit::base::TooltipDefaults::new()
+            .with_show_delay(TOOLTIP_DELAY)
+            .install(cx);
         appearance::init(cx);
         chat::init(cx);
         terminal::init(cx);

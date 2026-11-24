@@ -139,7 +139,7 @@ impl SuperGitApp {
             .as_ref()
             .is_ok_and(|status| status.branch.is_some() && status.head_oid.is_some());
         Button::new("publish-worktree-pr")
-            .label("New draft PR…")
+            .label("New draft PR")
             .small()
             .outline()
             .tooltip(if ready {
