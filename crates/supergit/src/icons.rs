@@ -76,7 +76,10 @@ gpui_kit::assets::icon_assets!(
         CircleQuestionMark,
         Diff,
         Clock,
-        House
+        House,
+        // The History tab's scope.
+        GitGraph,
+        GitCommitVertical
     ]
 );
 
@@ -154,6 +157,9 @@ mod tests {
             IconName::ArrowDown,
             IconName::Clock,
             IconName::House,
+            // The History tab's scope.
+            IconName::GitGraph,
+            IconName::GitCommitVertical,
         ] {
             let path = icon.path();
             assert!(
