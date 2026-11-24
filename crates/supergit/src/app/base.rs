@@ -660,12 +660,15 @@ impl SuperGitApp {
             .into_any_element()
     }
 
+    /// The new worktree dialog's base: the branch new branches start from,
+    /// updating it, and what is known of its upstream.
     pub(super) fn render_creation_base(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let info = self.creation_base.value();
         let branch = info
             .and_then(|info| info.branch.as_deref())
             .unwrap_or("Choose base");
+        let current = info.and_then(|info| info.branch.clone());
         let options = info.map(|info| info.branches.clone()).unwrap_or_default();
         let owner = cx.entity();
         let disabled = self.action_task.is_some() || self.cleanup_task.is_some();
@@ -695,28 +698,30 @@ impl SuperGitApp {
             .gap_1()
             .child(
                 h_flex()
-                    .justify_between()
-                    .gap_1()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().child("Base"))
                     .child(
                         Button::new("choose-creation-base")
                             .small()
-                            .ghost()
-                            .flex_1()
-                            .min_w_0()
-                            .label(format!("Base: {branch} ▾"))
-                            .tooltip(format!("New branches start from {branch}"))
+                            .outline()
+                            .label(format!("{branch} ▾"))
+                            .tooltip("The branch a new branch starts from")
                             .disabled(disabled || options.is_empty())
                             .dropdown_menu(move |mut menu, _, _| {
+                                menu = menu.scrollable(true).max_h(px(320.));
                                 for branch in &options {
                                     let branch = branch.clone();
                                     let owner = owner.clone();
-                                    menu = menu.item(PopupMenuItem::new(branch.clone()).on_click(
-                                        move |_, _, cx| {
-                                            owner.update(cx, |this, cx| {
-                                                this.choose_creation_base(branch.clone(), cx)
-                                            });
-                                        },
-                                    ));
+                                    menu = menu.item(
+                                        PopupMenuItem::new(branch.clone())
+                                            .checked(current.as_ref() == Some(&branch))
+                                            .on_click(move |_, _, cx| {
+                                                owner.update(cx, |this, cx| {
+                                                    this.choose_creation_base(branch.clone(), cx)
+                                                });
+                                            }),
+                                    );
                                 }
                                 menu
                             }),
@@ -727,7 +732,7 @@ impl SuperGitApp {
                             .ghost()
                             .label("Update")
                             .tooltip(format!(
-                                "Update {branch}: fetch its upstream, then fast-forward only"
+                                "Fetch the upstream of {branch} and fast-forward it"
                             ))
                             .disabled(
                                 disabled

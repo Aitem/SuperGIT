@@ -285,7 +285,6 @@ pub struct SuperGitApp {
     details_generation: u64,
     commit_generation: u64,
 
-    branch_input: Entity<InputState>,
     git_editor: edit::GitEditor,
     /// Filters the Changes tab's file list by path.
     staged_commit: Option<staged_commit::StagedCommit>,
@@ -348,8 +347,6 @@ impl SuperGitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let branch_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("new branch → worktree"));
         let switcher_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Branch, PR number, conversation or project…")
         });
@@ -360,15 +357,6 @@ impl SuperGitApp {
                 InputEvent::Change => this.filter_switcher(cx),
                 InputEvent::PressEnter { .. } => this.accept_switcher(window, cx),
                 _ => {}
-            },
-        );
-        let subscription = cx.subscribe_in(
-            &branch_input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.create_worktree(window, cx);
-                }
             },
         );
         let changes_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
@@ -525,7 +513,6 @@ impl SuperGitApp {
             commit_details: None,
             details_generation: 0,
             commit_generation: 0,
-            branch_input,
             git_editor: Default::default(),
             staged_commit: None,
             staged_commit_handle: cx.focus_handle(),
@@ -562,7 +549,6 @@ impl SuperGitApp {
             update_job: None,
             update_job_task: None,
             _subscriptions: vec![
-                subscription,
                 switcher_subscription,
                 appearance_subscription,
                 quit_subscription,
@@ -2905,61 +2891,6 @@ impl SuperGitApp {
         }));
     }
 
-    fn create_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let branch = self.branch_input.read(cx).value().trim().to_string();
-        if branch.is_empty() {
-            self.flash("Type a branch name first", true, cx);
-            return;
-        }
-        if branch.contains(char::is_whitespace) {
-            self.flash("Branch names cannot contain spaces", true, cx);
-            return;
-        }
-        let Some(repo) = self.repo.clone() else {
-            return;
-        };
-        let path = model::default_worktree_path(&repo, &branch);
-        let root = repo.root.clone();
-        let target = path.clone();
-        let base = self
-            .creation_base
-            .value()
-            .filter(|_| self.creation_base.error().is_none())
-            .map(|info| info.creation_ref().map_err(|error| error.to_string()))
-            .unwrap_or_else(|| {
-                Err("Base is unavailable. Refresh or choose a local branch first".into())
-            });
-        self.branch_input
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.run_git_action(
-            format!("Creating worktree {branch}"),
-            Some(path),
-            move || {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                // Existing branches keep their own history; new ones use the visible base.
-                let exists = sg_git::git(
-                    &root,
-                    [
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/heads/{branch}"),
-                    ],
-                )
-                .is_ok();
-                if exists {
-                    sg_git::add_worktree(&root, &target, None, Some(&branch))
-                } else {
-                    let base = base.map_err(anyhow::Error::msg)?;
-                    sg_git::add_worktree(&root, &target, Some(&branch), Some(&base))
-                }
-            },
-            cx,
-        );
-    }
-
     fn checkout_pr(&mut self, pr: &PullRequest, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.pr_worktree(pr) {
             self.select_worktree(path, cx);
@@ -4445,11 +4376,10 @@ impl SuperGitApp {
                     .on_click(cx.listener(move |this, _, _, cx| this.set_changes_tree(as_tree, cx)))
                 }),
             );
+        // No line of its own at the right: the resize handle draws it.
         v_flex()
             .size_full()
             .min_w_0()
-            .border_r_1()
-            .border_color(theme.border)
             .child(header)
             .child(
                 v_flex()
@@ -4583,11 +4513,11 @@ impl SuperGitApp {
                     .size_range(px(160.)..px((width - 180.).clamp(160., 800.)))
                     .fixed()
                     .child(
+                        // No line of its own at the right: the resize
+                        // handle draws it.
                         v_flex()
                             .size_full()
                             .min_w_0()
-                            .border_r_1()
-                            .border_color(theme.border)
                             .child(
                                 toolbar(theme).child(
                                     div().flex_1().min_w_0().child(
@@ -5116,10 +5046,10 @@ impl SuperGitApp {
     }
 
     /// The agent rail at the window's right edge, beside the agent panel or
-    /// in its place: the button that collapses or expands the panel, New,
-    /// and one mark per conversation of the selected worktree (the agent's
-    /// mark, in its own colors while the agent works, gray otherwise; the
-    /// selected one on a background). Hovered, an item shows its label at
+    /// in its place: the button that collapses or expands the panel, one
+    /// mark per conversation of the selected worktree (the agent's mark, in
+    /// its own colors while the agent works, gray otherwise; the selected
+    /// one on a background), then New under them. Hovered, an item shows its label at
     /// once to its left. Clicking a mark opens its conversation; its context
     /// menu closes it. Every item is a square as wide as the rail, easy to
     /// hit, with a line under it.
@@ -5229,20 +5159,21 @@ impl SuperGitApp {
                 LabelSide::Left,
                 &theme,
             ))
-            .child(rail_label(
-                "rail-new-label",
-                format!("New conversation ({MOD}-n)").into(),
-                new,
-                LabelSide::Left,
-                &theme,
-            ))
             .child(
                 v_flex()
                     .id("chat-rail")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(cells),
+                    .children(cells)
+                    // New ends the list, under the conversations.
+                    .child(rail_label(
+                        "rail-new-label",
+                        format!("New conversation ({MOD}-n)").into(),
+                        new,
+                        LabelSide::Left,
+                        &theme,
+                    )),
             )
             .into_any_element()
     }
@@ -5281,8 +5212,7 @@ impl SuperGitApp {
             .min_w_0()
             .flex_none()
             .h_full()
-            .border_l_1()
-            .border_color(theme.border)
+            // The resize handle at its left draws the line there.
             .child(
                 // As tall as the rail is wide: its first square sits beside.
                 h_flex()
@@ -5887,22 +5817,25 @@ fn pr_color(state: PrState, theme: &gpui_kit::component::Theme) -> Hsla {
 }
 
 fn pr_badge(pr: &PullRequest, theme: &gpui_kit::component::Theme) -> impl IntoElement {
+    // Its checks: failed, still running, all passed. Running ones are muted:
+    // yellow is the agents' "needs you".
     let checks = if pr.checks.failed > 0 {
-        Some(("✗", theme.danger))
+        Some((IconName::Close, theme.danger))
     } else if pr.checks.pending > 0 {
-        Some(("●", theme.warning))
+        Some((IconName::Clock, theme.muted_foreground))
     } else if pr.checks.total() > 0 {
-        Some(("✓", theme.success))
+        Some((IconName::Check, theme.success))
     } else {
         None
     };
     h_flex()
+        .flex_none()
         .gap_1()
         .text_xs()
         .text_color(pr_color(pr.state, theme))
         .child(format!("#{}", pr.number))
-        .when_some(checks, |el, (sym, color)| {
-            el.child(div().text_color(color).child(sym))
+        .when_some(checks, |el, (icon, color)| {
+            el.child(Icon::new(icon).xsmall().text_color(color))
         })
 }
 

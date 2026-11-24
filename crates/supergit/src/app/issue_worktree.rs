@@ -1,4 +1,6 @@
-//! Create a worktree from a selected commit or a GitHub issue and pinned base.
+//! Create a worktree: on a branch from the project's base ("+" on a
+//! project), from a GitHub issue and that base, from a selected commit, or
+//! from a fork's pull request.
 
 use sg_github::{Issue, IssueReference};
 
@@ -6,6 +8,9 @@ use super::projects::project_name;
 use super::*;
 
 enum Source {
+    /// A new branch from the base the dialog shows; a branch that exists is
+    /// checked out as it is.
+    Branch,
     Issue {
         base_branch: String,
     },
@@ -39,27 +44,72 @@ impl WorktreeDialog {
 }
 
 impl SuperGitApp {
-    pub(super) fn open_issue_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.active_root().map(Path::to_path_buf) else {
+    /// "+" on a project: a worktree on a branch of the user's choice.
+    /// Worktrees are created in the active project, so another one opens
+    /// first; the dialog shows its base as it loads.
+    pub(super) fn open_new_worktree(
+        &mut self,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.worktree_dialog.is_some() {
+            return;
+        }
+        if self.git_operation_running() {
+            self.flash("Wait for the running Git operation first", true, cx);
+            return;
+        }
+        if self.active_root() != Some(root.as_path()) {
+            self.persisted.projects.set_folded(&root, false);
+            self.switch_project(root.clone(), cx);
+            // Refused (and said why), or the folder is no repository now.
+            if self.active_root() != Some(root.as_path()) {
+                return;
+            }
+        }
+        self.open_worktree_dialog(root, String::new(), Source::Branch, window, cx);
+    }
+
+    /// "From issue" in the new worktree dialog: the same project and base,
+    /// a GitHub issue names the branch and drafts the first message.
+    fn worktree_dialog_from_issue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let blocked = self.git_operation_running();
+        let Some(dialog) = &mut self.worktree_dialog else {
             return;
         };
-        let Some(base) = self
+        if dialog.creating || dialog.lookup.is_some() {
+            return;
+        }
+        let root = dialog.root.clone();
+        let base = match self
             .creation_base
             .value()
             .filter(|base| base.root == root && self.creation_base.error().is_none())
-        else {
-            self.flash(
-                "Wait for the base branch to load, or refresh the project",
-                true,
-                cx,
-            );
-            return;
+        {
+            _ if blocked => Err("Wait for the running Git operation first"),
+            None => Err("Wait for the base branch to load, or refresh the project"),
+            Some(base) => match (base.branch.clone(), base.tip.clone()) {
+                (Some(branch), Some(tip)) => Ok((branch, tip)),
+                _ => Err("Choose an existing local base branch first"),
+            },
         };
-        let (Some(base_branch), Some(base_tip)) = (base.branch.clone(), base.tip.clone()) else {
-            self.flash("Choose an existing local base branch first", true, cx);
-            return;
+        let (base_branch, base_tip) = match base {
+            Ok(base) => base,
+            Err(error) => {
+                dialog.error = Some(error.into());
+                cx.notify();
+                return;
+            }
         };
+        let previous_focus = self
+            .worktree_dialog
+            .take()
+            .and_then(|dialog| dialog.previous_focus);
         self.open_worktree_dialog(root, base_tip, Source::Issue { base_branch }, window, cx);
+        if let Some(dialog) = &mut self.worktree_dialog {
+            dialog.previous_focus = previous_focus;
+        }
     }
 
     pub(super) fn open_commit_worktree(
@@ -122,7 +172,9 @@ impl SuperGitApp {
         }
         let placeholder = match source {
             Source::Issue { .. } => "#42 or a GitHub issue URL",
-            Source::Commit { .. } | Source::ForkPull { .. } => "feature/new-branch",
+            Source::Branch | Source::Commit { .. } | Source::ForkPull { .. } => {
+                "feature/new-branch"
+            }
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         if let Source::ForkPull { number, .. } = &source {
@@ -229,6 +281,15 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) {
         let busy = self.git_operation_running();
+        // A new branch starts from the base the dialog shows.
+        let base = self
+            .creation_base
+            .value()
+            .filter(|_| self.creation_base.error().is_none())
+            .map(|info| info.creation_ref().map_err(|error| error.to_string()))
+            .unwrap_or_else(|| {
+                Err("Base is unavailable. Refresh or choose a local branch first".into())
+            });
         let Some((repo, dialog)) = self.repo.as_ref().zip(self.worktree_dialog.as_mut()) else {
             return;
         };
@@ -252,13 +313,29 @@ impl SuperGitApp {
         let root = dialog.root.clone();
         let tip = dialog.base_tip.clone();
         let input = dialog.input.clone();
+        let from_base = matches!(dialog.source, Source::Branch).then_some(base);
+        let done = match (&dialog.source, &issue) {
+            (_, Some(issue)) => format!("Created a worktree for issue #{}", issue.number),
+            (Source::ForkPull { number, .. }, None) => {
+                format!("Created a review worktree for PR #{number}")
+            }
+            (Source::Commit { .. }, None) => "Created a worktree from the selected commit".into(),
+            (Source::Branch | Source::Issue { .. }, None) => {
+                format!("Created a worktree for {branch}")
+            }
+        };
         dialog.creating = true;
         self.action_task = Some(cx.spawn_in(window, async move |this, cx| {
             let target = path.clone();
             let request = root.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { create_at_tip(&request, &target, &branch, &tip, pull) })
+                .spawn(async move {
+                    match from_base {
+                        Some(base) => create_from_base(&request, &target, &branch, base),
+                        None => create_at_tip(&request, &target, &branch, &tip, pull),
+                    }
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.action_task = None;
@@ -288,17 +365,7 @@ impl SuperGitApp {
                                 }
                             }
                         }
-                        let message = issue
-                            .map(|issue| format!("Created a worktree for issue #{}", issue.number))
-                            .or_else(|| {
-                                pull_number.map(|number| {
-                                    format!("Created a review worktree for PR #{number}")
-                                })
-                            })
-                            .unwrap_or_else(|| {
-                                "Created a worktree from the selected commit".into()
-                            });
-                        this.flash(message, false, cx);
+                        this.flash(done, false, cx);
                         this.start_polling(cx);
                     }
                     Err(error) => {
@@ -325,21 +392,31 @@ impl SuperGitApp {
         };
         let theme = cx.theme().clone();
         let busy = dialog.lookup.is_some() || dialog.creating;
+        // Updating the base, for one: creating waits for it.
+        let blocked = self.git_operation_running();
+        let branch_mode = matches!(dialog.source, Source::Branch);
         let base_tip = &dialog.base_tip[..dialog.base_tip.len().min(8)];
         let (title, origin) = match &dialog.source {
+            Source::Branch => ("New worktree", None),
             Source::Issue { base_branch } => (
                 "Worktree from issue",
-                format!("Base {base_branch} at {base_tip}"),
+                Some(format!("Base {base_branch} at {base_tip}")),
             ),
-            Source::Commit { subject } => {
-                ("Worktree from commit", format!("{base_tip} · {subject}"))
-            }
+            Source::Commit { subject } => (
+                "Worktree from commit",
+                Some(format!("{base_tip} · {subject}")),
+            ),
             Source::ForkPull {
                 number, subject, ..
             } => (
                 "Review fork pull request",
-                format!("#{number} · {subject} · {base_tip}"),
+                Some(format!("#{number} · {subject} · {base_tip}")),
             ),
+        };
+        let project = project_name(&dialog.root);
+        let origin = match origin {
+            Some(origin) => format!("{project} · {origin}"),
+            None => project,
         };
         let action = if dialog.creating {
             "Creating worktree…"
@@ -388,7 +465,7 @@ impl SuperGitApp {
                         div()
                             .text_sm()
                             .text_color(theme.muted_foreground)
-                            .child(format!("{} · {origin}", project_name(&dialog.root),)),
+                            .child(origin),
                     )
                     .when_some(dialog.issue.as_ref(), |panel, issue| {
                         panel.child(
@@ -421,20 +498,40 @@ impl SuperGitApp {
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(div().text_sm().child(if dialog.ready_to_create() {
+                            .child(div().text_sm().child(if branch_mode {
+                                "Branch"
+                            } else if dialog.ready_to_create() {
                                 "New branch"
                             } else {
                                 "Issue number or URL"
                             }))
                             .child(Input::new(&dialog.input).disabled(busy)),
                     )
+                    .when(branch_mode, |panel| {
+                        panel.child(self.render_creation_base(cx))
+                    })
                     .when_some(dialog.error.clone(), |panel, error| {
                         panel.child(div().text_sm().text_color(theme.danger).child(error))
                     })
                     .child(
                         h_flex()
-                            .justify_end()
                             .gap_2()
+                            .when(branch_mode, |row| {
+                                row.child(
+                                    Button::new("worktree-from-issue")
+                                        .label("From issue")
+                                        .small()
+                                        .ghost()
+                                        .tooltip(
+                                            "Name the branch after a GitHub issue and draft it for an agent",
+                                        )
+                                        .disabled(busy || blocked)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.worktree_dialog_from_issue(window, cx);
+                                        })),
+                                )
+                            })
+                            .child(div().flex_1())
                             .child(
                                 Button::new("cancel-issue-worktree")
                                     .label("Cancel")
@@ -450,7 +547,7 @@ impl SuperGitApp {
                                     .label(action)
                                     .small()
                                     .primary()
-                                    .disabled(busy)
+                                    .disabled(busy || blocked)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_worktree_dialog(window, cx);
                                     })),
@@ -484,12 +581,7 @@ fn create_at_tip(
     tip: &str,
     pull: Option<(u64, String)>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !branch.is_empty() && !branch.starts_with('-'),
-        "Enter a valid new branch name"
-    );
-    sg_git::git(root, ["check-ref-format", &format!("refs/heads/{branch}")])
-        .map_err(|_| anyhow::anyhow!("Invalid Git branch name '{branch}'"))?;
+    check_branch_name(root, branch)?;
     if let Some((number, repository)) = pull {
         let remote = github_fetch_url(root, &repository)?;
         sg_git::require_pull_commit(root, remote.as_deref(), number, tip)?;
@@ -498,6 +590,47 @@ fn create_at_tip(
         std::fs::create_dir_all(parent)?;
     }
     sg_git::add_worktree(root, path, Some(branch), Some(tip))
+}
+
+fn check_branch_name(root: &Path, branch: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!branch.is_empty(), "Type a branch name first");
+    anyhow::ensure!(
+        !branch.starts_with('-'),
+        "Invalid Git branch name '{branch}'"
+    );
+    sg_git::git(root, ["check-ref-format", &format!("refs/heads/{branch}")])
+        .map_err(|_| anyhow::anyhow!("Invalid Git branch name '{branch}'"))?;
+    Ok(())
+}
+
+/// A worktree on `branch`: a branch that exists keeps its own history, a new
+/// one starts from `base`.
+fn create_from_base(
+    root: &Path,
+    path: &Path,
+    branch: &str,
+    base: Result<String, String>,
+) -> anyhow::Result<()> {
+    check_branch_name(root, branch)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let exists = sg_git::git(
+        root,
+        [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok();
+    if exists {
+        sg_git::add_worktree(root, path, None, Some(branch))
+    } else {
+        let base = base.map_err(anyhow::Error::msg)?;
+        sg_git::add_worktree(root, path, Some(branch), Some(&base))
+    }
 }
 
 fn issue_branch(issue: &Issue) -> String {
@@ -534,7 +667,77 @@ fn issue_draft(issue: &Issue) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Issue, agent_context, issue_branch, issue_draft};
+    use super::{Issue, agent_context, create_from_base, issue_branch, issue_draft};
+    use std::path::{Path, PathBuf};
+
+    /// A temporary folder, removed with everything in it.
+    struct Sandbox(PathBuf);
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args([
+                "-c",
+                "user.name=SuperGIT",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn head(dir: &Path, rev: &str) -> String {
+        sg_git::git(dir, ["rev-parse", rev]).unwrap()
+    }
+
+    #[test]
+    fn new_worktree_starts_a_branch_from_the_base_or_checks_one_out_as_it_is() {
+        let sandbox = Sandbox(
+            std::env::temp_dir().join(format!("supergit_new_worktree_{}", std::process::id())),
+        );
+        let repo = sandbox.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        git(&repo, &["branch", "existing"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "second"]);
+
+        let fresh = sandbox.0.join("fresh");
+        create_from_base(&repo, &fresh, "feature/fresh", Ok("main".into())).unwrap();
+        assert_eq!(head(&fresh, "HEAD"), head(&repo, "main"));
+
+        // The base is not needed (nor applied) for a branch that exists.
+        let kept = sandbox.0.join("kept");
+        create_from_base(&repo, &kept, "existing", Err("no base".into())).unwrap();
+        assert_eq!(head(&kept, "HEAD"), head(&repo, "existing"));
+        assert_ne!(head(&kept, "HEAD"), head(&repo, "main"));
+
+        let missing = sandbox.0.join("missing");
+        let error = create_from_base(&repo, &missing, "new", Err("no base".into())).unwrap_err();
+        assert_eq!(error.to_string(), "no base");
+        for bad in ["", "two words", "-x"] {
+            assert!(create_from_base(&repo, &missing, bad, Ok("main".into())).is_err());
+        }
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn issue_title_produces_editable_branch_and_unicode_safe_context() {

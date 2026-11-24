@@ -70,7 +70,13 @@ gpui_kit::assets::icon_assets!(
         ArrowDownToLine,
         ArrowUpFromLine,
         GitBranch,
-        Trash
+        Trash,
+        // The sidebar's rows: a question's signal, changed files, running
+        // checks, the main checkout.
+        CircleQuestionMark,
+        Diff,
+        Clock,
+        House
     ]
 );
 
@@ -142,6 +148,12 @@ mod tests {
             IconName::ArrowUpFromLine,
             IconName::GitBranch,
             IconName::Trash,
+            // The sidebar's rows: signals, counts, checks, the main checkout.
+            IconName::CircleQuestionMark,
+            IconName::Diff,
+            IconName::ArrowDown,
+            IconName::Clock,
+            IconName::House,
         ] {
             let path = icon.path();
             assert!(
