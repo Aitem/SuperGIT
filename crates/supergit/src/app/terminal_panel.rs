@@ -238,11 +238,10 @@ impl SuperGitApp {
     ) -> AnyElement {
         let theme = cx.theme().clone();
         let kill = path.to_path_buf();
+        // The resize handle above draws the line there.
         v_flex()
             .size_full()
             .min_h_0()
-            .border_t_1()
-            .border_color(theme.border)
             .child(
                 h_flex()
                     .flex_none()

@@ -3,21 +3,29 @@
 //! another project's come from its last snapshot, and a click on one of them
 //! opens that project at that worktree.
 
-use super::projects::{ATTENTION_ORDER, Activity, project_name, short_path};
+use super::projects::{ATTENTION_ORDER, Activity, project_name};
 use super::*;
 use gpui_kit::component::menu::DropdownMenu as _;
 
-/// How far worktree rows sit under their project's name: level with the
-/// project's icon.
+/// How far worktree rows sit under their project: past its chevron, so
+/// their status dots start level with its name.
 const WORKTREE_INDENT: f32 = 32.;
-/// Rows of the tree, a line under each as in the agent rail: projects a
-/// little taller than their worktrees.
+/// The square a project's chevron is pressed in.
+const FOLD_BUTTON: f32 = 24.;
+/// The place of a row's mark, before its name: a dot, or an agent's signal.
+const SIGNAL_CELL: f32 = 16.;
+/// Rows of the tree: a project's is taller than its worktrees'. A line only
+/// between projects, so the rows of one read as a block.
 const PROJECT_ROW: f32 = 40.;
-const WORKTREE_ROW: f32 = 36.;
+const WORKTREE_ROW: f32 = 32.;
+/// Where rows end, from the sidebar's right edge: a project's "+" icon, and
+/// under it the marks of its worktrees.
+const ROW_END: f32 = 16.;
 
-/// What a status dot shows: the most urgent agent signal of a worktree or a
-/// project, in the title bar's colors (needs approval, failed, unread,
-/// running).
+/// The most urgent agent signal of a worktree or a project (needs approval,
+/// needs an answer, failed, unread, running), shown before the name: a blue
+/// dot while agents only work, an icon of its own in its color when one
+/// wants the user.
 struct Signal {
     kind: Kind,
     /// Hover text: which agent, in which state.
@@ -256,8 +264,7 @@ impl SuperGitApp {
             .h_full()
             .flex_none()
             .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
+            // No line of its own at the right: the resize handle draws it.
             .child(header)
             .child(
                 v_flex()
@@ -268,9 +275,6 @@ impl SuperGitApp {
                     .overflow_y_scroll()
                     .children(tree),
             )
-            .when(self.repo.is_some(), |el| {
-                el.child(self.render_worktree_creation(cx))
-            })
             .into_any_element()
     }
 
@@ -289,32 +293,29 @@ impl SuperGitApp {
         } else {
             self.snapshot_scope(root)
         };
-        let count = if active {
-            (!self.worktrees.is_empty()).then_some(self.worktrees.len())
-        } else {
-            snapshot.as_ref().map(|(_, worktrees)| worktrees.len())
-        };
         let signal = Signal::of_project(self.project_activity(root, cx));
-        let tooltip = short_path(root);
         let target = root.to_path_buf();
         let fold_target = root.to_path_buf();
+        let add_target = root.to_path_buf();
         let row = h_flex()
             .id("project")
             .h(px(PROJECT_ROW))
             .flex_none()
             .pl_2()
-            .pr_3()
+            // The "+" square is wider than its 16px icon, which ends at ROW_END.
+            .pr(px(ROW_END - (FOLD_BUTTON - 16.) / 2.))
             .gap_1()
             .cursor_pointer()
-            .border_b_1()
-            .border_color(theme.sidebar_border)
             .hover(|el| el.bg(theme.list_hover))
             .on_click(cx.listener(move |this, _, _, cx| this.click_project(target.clone(), cx)))
             .child(
                 div()
                     .id("project-fold")
                     .flex_none()
-                    .p_0p5()
+                    .size(px(FOLD_BUTTON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_sm()
                     .hover(|el| el.bg(theme.sidebar_accent))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -327,43 +328,46 @@ impl SuperGitApp {
                         } else {
                             IconName::ChevronDown
                         })
-                        .small()
+                        .with_size(gpui_kit::component::Size::Medium)
                         .text_color(theme.muted_foreground),
                     ),
             )
             .child(
-                Icon::new(IconName::FolderGit2)
-                    .small()
-                    .text_color(if active {
-                        theme.primary
-                    } else {
-                        theme.muted_foreground
-                    }),
-            )
-            .child(
                 div()
-                    .id("project-name")
                     .flex_1()
                     .min_w_0()
-                    .pl_1()
                     .truncate()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
                     .child(project_name(root)),
             )
             .when(signal.is_some(), |row| {
-                row.child(self.render_signal_dot("project-signal", signal, root, theme, cx))
+                row.child(self.render_signal("project-signal", signal, root, theme, cx))
             })
-            .when_some(count, |row, count| {
-                row.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(count.to_string()),
-                )
-            });
+            .child(
+                div()
+                    .id("project-new-worktree")
+                    .flex_none()
+                    .size(px(FOLD_BUTTON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .hover(|el| el.bg(theme.sidebar_accent))
+                    .tooltip(|window, cx| {
+                        Tooltip::new("New worktree in this project").build(window, cx)
+                    })
+                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_new_worktree(add_target.clone(), window, cx);
+                    }))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .with_size(gpui_kit::component::Size::Medium)
+                            .text_color(theme.muted_foreground),
+                    ),
+            );
         let row = self.project_menu(row, root.to_path_buf(), cx);
 
         let children = if folded {
@@ -377,11 +381,14 @@ impl SuperGitApp {
                 Some(error) => (error.to_string(), theme.danger),
                 None => ("Loading…".to_string(), theme.muted_foreground),
             };
-            Some(note(text, color, theme))
+            Some(note(text, color))
         };
         // Element ids repeat across projects; the node keeps them apart.
         v_flex()
             .id(("project-node", ix))
+            .when(ix > 0, |node| {
+                node.border_t_1().border_color(theme.sidebar_border)
+            })
             .child(row)
             .children(children)
             .into_any_element()
@@ -395,7 +402,7 @@ impl SuperGitApp {
     ) -> AnyElement {
         if let Some(error) = &self.load_error {
             return v_flex()
-                .child(note(error.clone(), theme.danger, theme))
+                .child(note(error.clone(), theme.danger))
                 .child(self.render_worktree_group(
                     root,
                     self.active_scope(),
@@ -406,7 +413,7 @@ impl SuperGitApp {
                 .into_any_element();
         }
         if self.worktrees.is_empty() {
-            return note("Loading…".into(), theme.muted_foreground, theme);
+            return note("Loading…".into(), theme.muted_foreground);
         }
         self.render_worktree_group(root, self.active_scope(), &self.worktrees, theme, cx)
     }
@@ -428,10 +435,11 @@ impl SuperGitApp {
             if self.completed_in(scope, info, cx) {
                 completed_paths.push(info.wt.path.clone());
                 if !collapsed {
-                    completed.push(self.render_worktree_row(ix, info, scope, root, theme, cx));
+                    completed
+                        .push(self.render_worktree_row(ix, info, true, scope, root, theme, cx));
                 }
             } else {
-                open.push(self.render_worktree_row(ix, info, scope, root, theme, cx));
+                open.push(self.render_worktree_row(ix, info, false, scope, root, theme, cx));
             }
         }
         let completed_count = completed_paths.len();
@@ -445,11 +453,9 @@ impl SuperGitApp {
                         .h(px(WORKTREE_ROW))
                         .flex_none()
                         .pl(px(WORKTREE_INDENT))
-                        .pr_2()
+                        .pr(px(ROW_END))
                         .gap_1()
                         .cursor_pointer()
-                        .border_b_1()
-                        .border_color(theme.sidebar_border)
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .hover(|el| el.bg(theme.list_hover))
@@ -457,13 +463,22 @@ impl SuperGitApp {
                             this.set_completed_collapsed_in(fold_root.clone(), !collapsed, cx)
                         }))
                         .child(
-                            Icon::new(if collapsed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .xsmall()
-                            .text_color(theme.muted_foreground),
+                            // In the signals' place: the label starts level
+                            // with the worktrees' names.
+                            div()
+                                .flex_none()
+                                .w(px(SIGNAL_CELL))
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    Icon::new(if collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .small()
+                                    .text_color(theme.muted_foreground),
+                                ),
                         )
                         .child(
                             div()
@@ -475,10 +490,10 @@ impl SuperGitApp {
                                 Button::new("preview-completed-cleanup")
                                     .label("Clean up")
                                     .tooltip(
-                                        "Clean up completed worktrees and their local branches",
+                                        "Preview removing these worktrees and their local branches",
                                     )
                                     .xsmall()
-                                    .ghost()
+                                    .outline()
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
                                         this.open_cleanup_preview(
@@ -497,11 +512,18 @@ impl SuperGitApp {
 
     /// One line per worktree: agent status, name, then what differs (tags,
     /// changed files, commits ahead/behind, its pull request). A second line
-    /// only for a running operation or an error.
+    /// only for a running operation or an error. `completed`: a row of the
+    /// Completed group, a step deeper than the group's label and its name
+    /// muted (the selected one keeps its color).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a row of the tree: its place, its worktree and the project around it"
+    )]
     fn render_worktree_row(
         &self,
         ix: usize,
         info: &WorktreeInfo,
+        completed: bool,
         scope: Scope<'_>,
         root: &Path,
         theme: &gpui_kit::component::Theme,
@@ -524,50 +546,77 @@ impl SuperGitApp {
                 .text_color(theme.muted_foreground)
                 .child(text)
         };
+        // A count behind its icon, muted: colors are for the agents' signals.
+        let count = |icon: IconName, count: String| {
+            h_flex()
+                .flex_none()
+                .gap_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
+                .child(count)
+        };
+        // "feat/agent-rail": what stands before the last slash says what kind
+        // of work it is and repeats from row to row, so it is muted; the
+        // name after it tells worktrees apart.
+        let name = info.wt.display_name();
+        let prefix = name.rfind('/').map_or(0, |slash| slash + 1);
+        let muted = HighlightStyle {
+            color: Some(theme.muted_foreground),
+            ..Default::default()
+        };
+        let name =
+            StyledText::new(name).with_highlights((prefix > 0).then_some((0..prefix, muted)));
 
         let title = h_flex()
             .gap_1()
-            .child(self.render_signal_dot("signal", signal, root, theme, cx))
+            .child(self.render_signal("signal", signal, root, theme, cx))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_sm()
-                    .child(info.wt.display_name()),
+                    .when(completed && !selected, |el| {
+                        el.text_color(theme.muted_foreground)
+                    })
+                    .child(name),
             )
-            .when(info.wt.is_main, |el| el.child(tag("main")))
-            .when(kept, |el| el.child(tag("kept")))
-            .when(changed > 0, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .child(format!("±{changed}")),
-                )
-            })
-            .when(ahead > 0, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("↑{ahead}")),
-                )
-            })
-            .when(behind > 0, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("↓{behind}")),
-                )
-            })
-            .when_some(pr, |el, pr| {
-                el.child(div().flex_none().child(pr_badge(pr, theme)))
-            });
+            .child(
+                // Only what differs: the main checkout, a kept worktree,
+                // changed files, commits ahead and behind, the pull request.
+                h_flex()
+                    .flex_none()
+                    .pl_1()
+                    .gap_1p5()
+                    .when(info.wt.is_main, |el| {
+                        el.child(
+                            div()
+                                .id("main-checkout")
+                                .flex_none()
+                                .child(
+                                    Icon::new(IconName::House)
+                                        .xsmall()
+                                        .text_color(theme.muted_foreground),
+                                )
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("The repository's main checkout").build(window, cx)
+                                })
+                                .tooltip_show_delay(crate::TOOLTIP_DELAY),
+                        )
+                    })
+                    .when(kept, |el| el.child(tag("kept")))
+                    .when(changed > 0, |el| {
+                        el.child(count(IconName::Diff, changed.to_string()))
+                    })
+                    .when(ahead > 0, |el| {
+                        el.child(count(IconName::ArrowUp, ahead.to_string()))
+                    })
+                    .when(behind > 0, |el| {
+                        el.child(count(IconName::ArrowDown, behind.to_string()))
+                    })
+                    .when_some(pr, |el, pr| el.child(pr_badge(pr, theme))),
+            );
 
         let mut notes: Vec<AnyElement> = Vec::new();
         if info.status.is_err() {
@@ -587,12 +636,14 @@ impl SuperGitApp {
             .id(("worktree", ix))
             .min_h(px(WORKTREE_ROW))
             .justify_center()
-            .pl(px(WORKTREE_INDENT))
-            .pr_2()
+            .pl(px(if completed {
+                WORKTREE_INDENT + SIGNAL_CELL
+            } else {
+                WORKTREE_INDENT
+            }))
+            .pr(px(ROW_END))
             .py_1()
             .cursor_pointer()
-            .border_b_1()
-            .border_color(theme.sidebar_border)
             // The selection is a background, as in the agent rail.
             .when(selected, |el| el.bg(theme.sidebar_accent))
             .hover(|el| {
@@ -720,10 +771,11 @@ impl SuperGitApp {
             .min_by_key(Signal::urgency)
     }
 
-    /// The dot before a worktree's name (and in a project's header): gray
-    /// when quiet, otherwise the signal's color with its label on hover; a
-    /// click opens the conversation behind it.
-    fn render_signal_dot(
+    /// The mark before a worktree's name (and in a project's header). Every
+    /// worktree has one: a gray dot when quiet, a blue one while its agent
+    /// works, and an icon in the signal's color when the agent wants the user
+    /// (its label on hover; a click opens the conversation behind it).
+    fn render_signal(
         &self,
         id: impl Into<ElementId>,
         signal: Option<Signal>,
@@ -731,21 +783,26 @@ impl SuperGitApp {
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let color = signal
-            .as_ref()
-            .map_or(theme.border, |signal| attention_color(signal.kind, theme));
-        let cell = div()
-            .id(id)
-            .size(px(16.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .child(div().size(px(8.)).rounded_full().bg(color));
-        let Some(signal) = signal else {
-            return cell.into_any_element();
+        let dot = |color: Hsla| div().size(px(8.)).rounded_full().bg(color);
+        let cell = || {
+            div()
+                .size(px(SIGNAL_CELL))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
         };
+        let Some(signal) = signal else {
+            return cell().child(dot(theme.border)).into_any_element();
+        };
+        let color = attention_color(signal.kind, theme);
+        let cell = cell()
+            .id(id)
+            .rounded_sm()
+            .map(|cell| match signal_icon(signal.kind) {
+                Some(icon) => cell.child(Icon::new(icon).small().text_color(color)),
+                None => cell.child(dot(color)),
+            });
         let tooltip = if signal.open.is_some() {
             format!("{} · click to open", signal.label)
         } else {
@@ -774,57 +831,11 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// New worktrees go to the active project.
-    fn render_worktree_creation(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let project = self.active_root().map(project_name).unwrap_or_default();
-        v_flex()
-            .p_2()
-            .gap_2()
-            .border_t_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(format!("NEW WORKTREE · {project}")),
-            )
-            .child(self.render_creation_base(cx))
-            .child(Input::new(&self.branch_input).small())
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("create-worktree")
-                            .flex_1()
-                            .label("Create worktree")
-                            .small()
-                            .primary()
-                            .disabled(self.action_task.is_some() || self.cleanup_task.is_some())
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.create_worktree(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("create-from-issue")
-                            .label("From issue")
-                            .small()
-                            .outline()
-                            .disabled(self.action_task.is_some() || self.cleanup_task.is_some())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_issue_worktree(window, cx)
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
     /// The collapsed sidebar, a rail like the agent panel's: squares with a
     /// line under each, the selection a background, names beside them at
-    /// once. Expand and add a project first, then each project's initials
-    /// and, under the active one, its worktrees'; initials take the color of
-    /// an agent signal, gray otherwise. The app menu last.
+    /// once. Expand first, then each project's initials and, under the
+    /// active one, its worktrees' (initials take the color of an agent
+    /// signal, gray otherwise), then Add a project. The app menu last.
     pub(super) fn render_sidebar_rail(
         &self,
         window: &Window,
@@ -867,8 +878,9 @@ impl SuperGitApp {
                 cells.extend(self.render_rail_worktrees(&theme, cx));
             }
         }
-        // Expand and add a project top the rail, the app menu at its foot.
-        let (top, bottom) = {
+        // Expand tops the rail, the app menu sits at its foot; adding a
+        // project ends the list, under the projects.
+        let (expand, add, menu) = {
             let expand = rail_square("expand-sidebar", theme.sidebar_border)
                 .hover(|el| el.bg(theme.list_hover))
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -913,17 +925,16 @@ impl SuperGitApp {
             )
             .into_any_element();
             (
-                vec![
-                    expand,
-                    label(
-                        "add-project-rail-label",
-                        format!("Add a project ({MOD}-o)").into(),
-                        add,
-                    ),
-                ],
-                Some(label("app-menu-rail-label", "More actions".into(), menu)),
+                expand,
+                label(
+                    "add-project-rail-label",
+                    format!("Add a project ({MOD}-o)").into(),
+                    add,
+                ),
+                label("app-menu-rail-label", "More actions".into(), menu),
             )
         };
+        cells.push(add);
         v_flex()
             .w(px(RAIL_WIDTH))
             .flex_none()
@@ -931,7 +942,7 @@ impl SuperGitApp {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .children(top)
+            .child(expand)
             .child(
                 v_flex()
                     .id("sidebar-rail")
@@ -940,7 +951,7 @@ impl SuperGitApp {
                     .overflow_y_scroll()
                     .children(cells),
             )
-            .children(bottom)
+            .child(menu)
             .into_any_element()
     }
 
@@ -1082,6 +1093,18 @@ impl SuperGitApp {
     }
 }
 
+/// The icon of a signal that wants the user, so that those states read apart
+/// without their colors; an agent that only works is a dot.
+fn signal_icon(kind: Kind) -> Option<IconName> {
+    match kind {
+        Kind::Approval => Some(IconName::TriangleAlert),
+        Kind::Question => Some(IconName::CircleQuestionMark),
+        Kind::Completed => Some(IconName::Check),
+        Kind::Failed => Some(IconName::CircleX),
+        Kind::Running | Kind::Idle => None,
+    }
+}
+
 /// An item of the "⋯" menu: runs on the app and shows the action's shortcut.
 fn app_item(
     owner: &WeakEntity<SuperGitApp>,
@@ -1104,13 +1127,11 @@ fn window_buttons_shown(window: &Window) -> bool {
 }
 
 /// A one-line note under a project (loading, an error).
-fn note(text: String, color: Hsla, theme: &gpui_kit::component::Theme) -> AnyElement {
+fn note(text: String, color: Hsla) -> AnyElement {
     div()
         .pl(px(WORKTREE_INDENT))
         .pr_3()
         .py_2()
-        .border_b_1()
-        .border_color(theme.sidebar_border)
         .text_xs()
         .text_color(color)
         .child(text)

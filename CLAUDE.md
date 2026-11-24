@@ -411,6 +411,10 @@ never commit, push or create worktrees there without asking.
   `IconName` (lucide) draws nothing until it is listed in
   `icons::ExtraIcons` (and in the `icons_used_by_the_app_are_embedded`
   test).
+- **Panel lines**: a resizable split draws the line between its panels
+  itself (gpui-component's resize handle, in the first pixel of the panel
+  after it). A panel beside a handle draws no border on that side, or the
+  line doubles; rails and fixed-width panels draw their own.
 - **Initial prompt** (`initial_prompt.rs`, Settings ▸ Initial prompt): a
   template added to every agent SuperGIT starts — Claude's
   `--append-system-prompt` (chat and TUI, on every start: a resumed session

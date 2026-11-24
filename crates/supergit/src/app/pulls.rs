@@ -1839,11 +1839,10 @@ impl SuperGitApp {
                     .into_any_element(),
             )
         };
+        // No line of its own at the right: the resize handle draws it.
         v_flex()
             .size_full()
             .min_w_0()
-            .border_r_1()
-            .border_color(theme.border)
             .child(header)
             .when_some(self.prs_error.clone(), |el, error| {
                 el.child(
