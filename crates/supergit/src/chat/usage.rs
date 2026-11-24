@@ -71,6 +71,7 @@ impl ChatSession {
                 })
                 .child(label)
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .tooltip_show_delay(crate::TOOLTIP_DELAY)
                 .into_any_element(),
         )
     }

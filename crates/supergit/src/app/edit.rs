@@ -15,7 +15,9 @@ pub(super) struct GitEditor {
 }
 
 impl SuperGitApp {
-    pub(super) fn render_sync(
+    /// The header's actions on the worktree's branch: fetch, pull, push,
+    /// rebase, and for a linked worktree, delete.
+    pub(super) fn render_branch_actions(
         &self,
         info: &WorktreeInfo,
         cx: &mut Context<Self>,
@@ -27,32 +29,30 @@ impl SuperGitApp {
             || self.cleanup_task.is_some()
             || self.base_update_paths.contains(&path)
             || self.cleanup_paths.contains(&path);
+        let action = |id: &'static str, icon: IconName, label: &'static str| {
+            Button::new(id).icon(icon).label(label).small().ghost()
+        };
         let fetch_path = path.clone();
         let pull_path = path.clone();
         h_flex()
             .gap_1()
+            .flex_none()
             .child(
-                Button::new("worktree-fetch")
-                    .label("Fetch")
-                    .small()
-                    .ghost()
+                action("worktree-fetch", IconName::RefreshCw, "Fetch")
                     .disabled(info.wt.is_bare || blocked)
-                    .tooltip("Fetch remote refs from all remotes")
+                    .tooltip("Download new commits from all remotes; your files stay as they are")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let path = fetch_path.clone();
                         this.run_git_action("Fetch".into(), None, move || sg_git::fetch(&path), cx);
                     })),
             )
             .child(
-                Button::new("worktree-pull")
-                    .label("Pull")
-                    .small()
-                    .ghost()
+                action("worktree-pull", IconName::ArrowDownToLine, "Pull")
                     .disabled(blocked || !has_upstream || branch.is_none())
                     .tooltip(if has_upstream {
-                        "Pull upstream (fast-forward only)"
+                        "Fast-forward this branch to its upstream"
                     } else {
-                        "Configure an upstream before pulling"
+                        "No upstream yet: publish the branch with Push"
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(branch) = branch.clone() {
@@ -67,16 +67,30 @@ impl SuperGitApp {
                     })),
             )
             .child(
-                Button::new("worktree-rebase")
-                    .label("Rebase…")
-                    .small()
-                    .ghost()
+                action("worktree-push", IconName::ArrowUpFromLine, "Push")
+                    .disabled(self.git_operation_running())
+                    .tooltip("Publish this branch to a remote, with a preview")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_sync_dialog(window, cx))),
+            )
+            .child(
+                action("worktree-rebase", IconName::GitBranch, "Rebase")
                     .disabled(blocked || info.wt.branch.is_none())
-                    .tooltip("Choose a branch and preview the rebase")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_rebase_dialog(path.clone(), window, cx)
+                    .tooltip("Replay this branch's commits onto another branch")
+                    .on_click(cx.listener({
+                        let path = path.clone();
+                        move |this, _, window, cx| this.open_rebase_dialog(path.clone(), window, cx)
                     })),
             )
+            .when(!info.wt.is_main, |el| {
+                el.child(
+                    action("worktree-delete", IconName::Trash, "Delete")
+                        .disabled(blocked)
+                        .tooltip("Remove this worktree and its local branch, after a check")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.clean_up_worktree(&CleanUpWorktree, window, cx)
+                        })),
+                )
+            })
     }
 
     pub(super) fn reset_edit_selection(&mut self) {
@@ -657,7 +671,7 @@ impl SuperGitApp {
             .border_color(cx.theme().border)
             .child(
                 Button::new("preview-squash")
-                    .label(format!("Squash last {count} commits…"))
+                    .label(format!("Squash last {count} commits"))
                     .small()
                     .ghost()
                     .on_click(cx.listener(move |this, _, window, cx| {

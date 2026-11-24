@@ -235,7 +235,7 @@ impl SuperGitApp {
                             )
                             .child(
                                 Button::new("choose-clone-parent")
-                                    .label("Choose parent folder…")
+                                    .label("Choose parent folder")
                                     .outline()
                                     .disabled(form.running || form.choosing_folder)
                                     .on_click(

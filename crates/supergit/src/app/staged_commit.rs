@@ -29,7 +29,7 @@ impl SuperGitApp {
         }
         Some(
             Button::new("commit-staged")
-                .label(format!("Commit staged · {}…", status.staged_count()))
+                .label(format!("Commit staged · {}", status.staged_count()))
                 .xsmall()
                 .outline()
                 .disabled(

@@ -219,6 +219,7 @@ pub(super) fn time_footer(
                     .id(SharedString::from(format!("time-{kind}-{ix}")))
                     .opacity(0.8)
                     .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
                     .child(short),
             )
         })

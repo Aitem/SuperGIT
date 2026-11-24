@@ -65,7 +65,12 @@ gpui_kit::assets::icon_assets!(
         FileDiff,
         ChevronsUpDown,
         FolderGit2,
-        Circle
+        Circle,
+        // The header's branch actions.
+        ArrowDownToLine,
+        ArrowUpFromLine,
+        GitBranch,
+        Trash
     ]
 );
 
@@ -131,6 +136,12 @@ mod tests {
             IconName::TriangleAlert,
             IconName::Map,
             IconName::Copy,
+            // The header's branch actions.
+            IconName::RefreshCw,
+            IconName::ArrowDownToLine,
+            IconName::ArrowUpFromLine,
+            IconName::GitBranch,
+            IconName::Trash,
         ] {
             let path = icon.path();
             assert!(

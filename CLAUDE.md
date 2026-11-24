@@ -381,6 +381,20 @@ never commit, push or create worktrees there without asking.
   `gpui-pre-platform/test-support` directly instead.
 - Edition 2024: `impl IntoElement` return types capture `cx`'s lifetime; for
   rows built inside iterator closures return a concrete `Stateful<Div>`.
+- **Buttons**: every button has a tooltip (shown on hover and while it is
+  held) that says what it does: one short phrase that does not repeat the
+  button's label ("Fetch" → "Download new commits from all remotes", not
+  "Fetch: …"). When its action has a keyboard shortcut, the tooltip always
+  names it too, written with `MOD` — e.g. `format!("New conversation in
+  this worktree ({MOD}-n)")`. Tooltips show after `TOOLTIP_DELAY` (1 s,
+  main.rs): components take it from `TooltipDefaults`; an element's own
+  `.tooltip(…)` needs `.tooltip_show_delay(crate::TOOLTIP_DELAY)`.
+  Button labels carry no trailing "…", even when they open a dialog;
+  menu items keep it (the macOS convention).
+- **Icons**: gpui-kit embeds only its default icon set; any other
+  `IconName` (lucide) draws nothing until it is listed in
+  `icons::ExtraIcons` (and in the `icons_used_by_the_app_are_embedded`
+  test).
 - **Initial prompt** (`initial_prompt.rs`, Settings ▸ Initial prompt): a
   template added to every agent SuperGIT starts — Claude's
   `--append-system-prompt` (chat and TUI, on every start: a resumed session

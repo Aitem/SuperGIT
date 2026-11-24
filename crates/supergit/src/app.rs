@@ -3207,14 +3207,6 @@ impl SuperGitApp {
             .h_full()
             .child(header)
             .child(
-                h_flex()
-                    .px_3()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(self.render_sync(&info, cx)),
-            )
-            .child(
                 TabBar::new("main-tabs")
                     .underline()
                     .px_2()
@@ -3263,9 +3255,7 @@ impl SuperGitApp {
             }
             Err(e) => e.clone(),
         };
-        let p4 = path.clone();
         let shown_path = SharedString::from(path.display().to_string());
-        let last_session = info.sessions.first().cloned();
         // "repo / worktree", the repository's part muted.
         let worktree = info.wt.display_name();
         let (title, highlights) = match &self.repo {
@@ -3324,6 +3314,7 @@ impl SuperGitApp {
                             .tooltip(move |window, cx| {
                                 Tooltip::new(shown_path.clone()).build(window, cx)
                             })
+                            .tooltip_show_delay(crate::TOOLTIP_DELAY)
                             .child(crate::selectable::SelectableLabel::new(
                                 "header-title-text",
                                 self.header_selection.clone(),
@@ -3346,74 +3337,7 @@ impl SuperGitApp {
                         )
                     }),
             )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .flex_none()
-                    .child(
-                        Button::new("claude-new")
-                            .icon(crate::icons::agent_icon(default_provider()))
-                            .label(format!("New {}", default_provider().label()))
-                            .small()
-                            .primary()
-                            .tooltip(format!("New conversation in this worktree ({MOD}-n); pick the agent before the first message"))
-                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
-                    )
-                    .when_some(last_session, |el, session| {
-                        el.child(
-                            Button::new("claude-resume")
-                                .label("Resume last")
-                                .small()
-                                .tooltip(format!(
-                                    "Continue {} “{}” in the agent panel",
-                                    session.provider.label(),
-                                    session.title
-                                ))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_session_chat(session.clone(), window, cx)
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("editor")
-                            .label("Editor")
-                            .small()
-                            .ghost()
-                            .tooltip("Open in VS Code (or $SUPERGIT_EDITOR)")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let r = launch::open_in_editor(&p4);
-                                this.report(r, "Opened in editor", cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("finder")
-                            .label(launch::FILE_MANAGER)
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener({
-                                let path = path.clone();
-                                move |this, _, _, cx| {
-                                    let r = launch::reveal_in_finder(&path);
-                                    this.report(r, &format!("Opened in {}", launch::FILE_MANAGER), cx);
-                                }
-                            })),
-                    )
-                    .child(Button::new("sync-worktree").label("Sync…").small().ghost()
-                        .disabled(self.git_operation_running())
-                        .on_click(cx.listener(|this, _, window, cx| this.open_sync_dialog(window, cx))))
-                    .when(!info.wt.is_main, |el| {
-                        el.child(
-                            Button::new("clean-up-worktree")
-                                .label("Clean up…")
-                                .small()
-                                .ghost()
-                                .tooltip("Remove this worktree and safely delete its local branch")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.clean_up_worktree(&CleanUpWorktree, window, cx)
-                                })),
-                        )
-                    }),
-            )
+            .child(self.render_branch_actions(info, cx))
     }
 
     /// Inline feedback keeps errors actionable without a modal or a focus change.
@@ -4190,7 +4114,7 @@ impl SuperGitApp {
             )
             .child(
                 Button::new("worktree-stashes")
-                    .label("Stashes…")
+                    .label("Stashes")
                     .xsmall()
                     .ghost()
                     .disabled(self.git_operation_running())
@@ -4967,7 +4891,7 @@ impl SuperGitApp {
                     )
                     .child(
                         Button::new("worktree-from-commit")
-                            .label("New worktree…")
+                            .label("New worktree")
                             .xsmall()
                             .ghost()
                             .tooltip("Create a branch and worktree at this commit")
@@ -4988,7 +4912,7 @@ impl SuperGitApp {
                     .when(!commit.is_merge(), |el| {
                         el.child(
                             Button::new("cherry-pick-history")
-                                .label("Cherry-pick…")
+                                .label("Cherry-pick")
                                 .xsmall()
                                 .ghost()
                                 .tooltip("Apply this commit to the selected worktree’s branch")
@@ -5552,7 +5476,7 @@ impl SuperGitApp {
                         .gap_2()
                         .child(
                             Button::new("welcome-open")
-                                .label("Open Repository…")
+                                .label("Open Repository")
                                 .primary()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_repository(&OpenRepository, window, cx)
@@ -5560,7 +5484,7 @@ impl SuperGitApp {
                         )
                         .child(
                             Button::new("welcome-clone")
-                                .label("Clone Repository…")
+                                .label("Clone Repository")
                                 .outline()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_clone_form(window, cx)
@@ -6307,6 +6231,7 @@ fn author_avatar(
         .rounded_full()
         .overflow_hidden()
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .tooltip_show_delay(crate::TOOLTIP_DELAY)
         .map(|el| match avatar {
             Some(path) => el.child(img(path).size_full().rounded_full()),
             None => el
@@ -6427,6 +6352,7 @@ fn ref_badges(
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .tooltip_show_delay(crate::TOOLTIP_DELAY)
                 .child(format!("+{}", overflow.len()))
                 .into_any_element(),
         );
