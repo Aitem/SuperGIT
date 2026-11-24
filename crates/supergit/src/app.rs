@@ -6375,17 +6375,14 @@ fn commit_row(
     selected: bool,
     theme: &gpui_kit::component::Theme,
 ) -> Stateful<Div> {
-    h_flex()
-        .id(("commit", ix))
-        .h(px(COMMIT_ROW_HEIGHT))
-        .pl_2()
-        .pr_3()
+    // The row draws the selection and the hover; its content fades when
+    // muted, selected or not.
+    let content = h_flex()
+        .flex_1()
+        .min_w_0()
+        .h_full()
         .gap_2()
-        .text_sm()
-        .cursor_pointer()
-        .when(muted && !selected, |el| el.opacity(0.45))
-        .when(selected, |el| el.bg(theme.list_active))
-        .hover(|el| el.bg(theme.list_hover))
+        .when(muted, |el| el.opacity(0.45))
         .when_some(graph, |el, (graph, lanes)| {
             el.child(commit_graph(graph, lanes, c.is_merge(), theme))
         })
@@ -6428,7 +6425,17 @@ fn commit_row(
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(relative_time(c.time)),
-        )
+        );
+    h_flex()
+        .id(("commit", ix))
+        .h(px(COMMIT_ROW_HEIGHT))
+        .pl_2()
+        .pr_3()
+        .text_sm()
+        .cursor_pointer()
+        .when(selected, |el| el.bg(theme.list_active))
+        .hover(|el| el.bg(theme.list_hover))
+        .child(content)
 }
 
 fn session_row(ix: usize, s: &Session, theme: &gpui_kit::component::Theme) -> Stateful<Div> {
