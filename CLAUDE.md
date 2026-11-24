@@ -13,6 +13,14 @@ Platform differences stay behind small seams; keep both working:
   `KeyBinding::new` (panics at startup).
 - Menus: `cx.set_menus` on macOS; elsewhere `set_app_menus` copies them into
   gpui-component's `AppMenuBar`, drawn in the title bar (`menu_bar`).
+- Window chrome: on macOS the side panels reach the window's top edge
+  (`FULL_HEIGHT_PANELS`) and the window buttons sit in the first row: the
+  sidebar's header, or beside its rail when it is collapsed
+  (`sync_window_buttons`). A row they sit in starts `WINDOW_BUTTONS_INSET`
+  further right and moves the window through `window_drag_area`. Elsewhere,
+  and on macOS without a sidebar, a `TitleBar` row spans the window. Keep
+  gpui-component's `TitleBar` out of columns: it is never narrower than its
+  content and spills over the neighbours.
 - `launch.rs`: AppleScript/`open` on macOS; Linux terminals by binary,
   `xdg-open`, editor CLIs on `PATH`. `launch::FILE_MANAGER` labels Finder.
 - Paths: `settings::support_dir()` (`~/.config/supergit` on Linux) and
