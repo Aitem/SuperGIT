@@ -4522,7 +4522,6 @@ impl SuperGitApp {
         let fork_point = fork
             .and_then(|fork| fork.parent.as_ref())
             .map(|parent| parent.merge_base.clone());
-        let summary = fork.map(|fork| self.render_fork_summary(fork, theme, cx));
         let matching_count = matches.len();
         let scope_buttons = self.history_scope_buttons(cx);
         let mut graph = graph.into_iter();
@@ -4645,7 +4644,6 @@ impl SuperGitApp {
         v_flex()
             .size_full()
             .children(notice)
-            .children(summary)
             .child(self.render_squash(commits, cx))
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
@@ -4661,68 +4659,6 @@ impl SuperGitApp {
         self.selected_fork()
             .map(|fork| fork.base.clone())
             .or_else(|| self.details.suggested_base.clone())
-    }
-
-    /// Above the graph: how far the branch is from the base, and where it
-    /// forked (click the sha to show that commit).
-    fn render_fork_summary(
-        &self,
-        fork: &sg_git::Fork,
-        theme: &gpui_kit::component::Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let branch = self
-            .selected_info()
-            .and_then(|info| info.wt.branch.clone())
-            .unwrap_or_else(|| "HEAD".into());
-        let muted = theme.muted_foreground;
-        h_flex()
-            .flex_none()
-            .px_3()
-            .py_1()
-            .gap_2()
-            .items_center()
-            .text_xs()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(theme.primary)
-                    .text_color(theme.primary_foreground)
-                    .child(format!("➜ {branch}")),
-            )
-            .child(div().child(format!("{} ahead", fork.commits)))
-            .child(div().text_color(muted).child("·"))
-            .child(
-                div()
-                    .when(fork.behind > 0, |el| el.text_color(theme.warning))
-                    .child(format!("{} behind {}", fork.behind, fork.base)),
-            )
-            .when_some(fork.parent.clone(), |el, parent| {
-                let sha = parent.merge_base.clone();
-                el.child(div().text_color(muted).child("·"))
-                    .child(
-                        div()
-                            .text_color(muted)
-                            .child(format!("forked from {} at", parent.name)),
-                    )
-                    .child(
-                        Button::new("fork-point")
-                            .label(sha[..sha.len().min(8)].to_string())
-                            .xsmall()
-                            .ghost()
-                            .tooltip(format!(
-                                "Where {branch} left {}: the nearest branch sharing its history. Click to show this commit",
-                                parent.name
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_commit(sha.clone(), cx)
-                            })),
-                    )
-            })
-            .into_any_element()
     }
 
     /// The selected commit: its files (filter, flat or tree) beside its diff,
