@@ -198,6 +198,13 @@ impl CodexProcess {
     /// caller's thread. Failures arrive as events (an error response, then
     /// [`ProcessEvent::Exited`]).
     pub fn spawn(opts: &SpawnOptions) -> (Self, UnboundedReceiver<ProcessEvent>) {
+        Self::spawn_driver(opts, None)
+    }
+
+    pub(crate) fn spawn_driver(
+        opts: &SpawnOptions,
+        side_parent: Option<String>,
+    ) -> (Self, UnboundedReceiver<ProcessEvent>) {
         let (events, rx) = unbounded();
         let (inbox, inputs) = mpsc::channel();
         let child = Arc::new(Mutex::new(None));
@@ -205,6 +212,7 @@ impl CodexProcess {
         let policy = Arc::new(Mutex::new(opts.policy));
         let driver = Driver {
             opts: opts.clone(),
+            side_parent,
             events,
             inbox: inbox.clone(),
             child: child.clone(),
@@ -346,6 +354,7 @@ fn request_id_value(text: &str) -> Value {
 }
 
 struct Driver {
+    side_parent: Option<String>,
     opts: SpawnOptions,
     events: UnboundedSender<ProcessEvent>,
     inbox: Sender<Input>,
@@ -565,11 +574,25 @@ impl Driver {
                     self.open_thread();
                 }
             }
-            "thread/start" | "thread/resume" if !fatal => {
+            "thread/start" | "thread/resume" | "thread/fork" if !fatal => {
                 self.thread_id = result
                     .and_then(|r| r.pointer("/thread/id"))
                     .and_then(Value::as_str)
                     .map(String::from);
+                if let Some(parent) = &self.side_parent
+                    && (self.thread_id.as_ref().is_none_or(|id| id == parent)
+                        || result
+                            .and_then(|r| r.pointer("/thread/ephemeral"))
+                            .and_then(Value::as_bool)
+                            != Some(true))
+                {
+                    self.emit_error(
+                        "thread/fork",
+                        "Codex did not return a temporary side thread",
+                    );
+                    self.stop();
+                    return;
+                }
                 self.thread_settings = result.and_then(ThreadSettings::read);
                 self.ready = self.thread_id.is_some();
                 self.start_next_turn();
@@ -590,7 +613,9 @@ impl Driver {
                 }
             }
             // Without a session nothing else can work.
-            "initialize" | "account/read" | "thread/start" | "thread/resume" => self.stop(),
+            "initialize" | "account/read" | "thread/start" | "thread/resume" | "thread/fork" => {
+                self.stop()
+            }
             _ => {}
         }
     }
@@ -603,6 +628,17 @@ impl Driver {
         });
         if let Some(model) = &self.opts.model {
             params["model"] = json!(model);
+        }
+        if let Some(parent) = &self.side_parent {
+            params["threadId"] = json!(parent);
+            params["ephemeral"] = json!(true);
+            params["excludeTurns"] = json!(true);
+            params["approvalPolicy"] = json!("never");
+            params["developerInstructions"] = json!(
+                "Answer the side question using the inherited conversation as reference. Do not continue earlier tasks, call tools, or change the workspace."
+            );
+            self.request("thread/fork", params);
+            return;
         }
         match self.opts.resume.clone() {
             Some(id) => {
@@ -635,6 +671,9 @@ impl Driver {
                 "approvalPolicy": policy.approval_policy(),
                 "sandboxPolicy": policy.sandbox_policy(),
             });
+            if self.side_parent.is_some() {
+                params["approvalPolicy"] = json!("never");
+            }
             if let Some(mode) = prompt.mode {
                 let model = prompt.options.model.as_deref().or_else(|| {
                     self.thread_settings

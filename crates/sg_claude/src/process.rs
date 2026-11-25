@@ -184,6 +184,15 @@ impl ClaudeProcess {
         }))
     }
 
+    /// A tool-free question against the live context, outside the turn queue.
+    pub fn ask_side_question(&self, question: &str) -> Result<String> {
+        self.control_request(json!({ "subtype": "side_question", "question": question }))
+    }
+
+    pub fn cancel_side_question(&self, id: &str) -> Result<()> {
+        self.write(&json!({ "type": "control_cancel_request", "request_id": id }))
+    }
+
     /// Answer a `can_use_tool` request.
     pub fn allow(
         &self,

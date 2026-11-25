@@ -28,6 +28,7 @@
 | **Prepare a commit** | Compare staged and unstaged changes, stage files or hunks, and mark conflicts as resolved. Save or apply stashes, commit staged changes, amend, or squash. |
 | **Find and reuse past commits** | Search History, load older commits, and cherry-pick onto the current branch. |
 | **Work with Claude Code or Codex** | Send a file or hunk to an agent, pick the model and reasoning effort, and answer approval prompts in chat. In Codex, switch between Default and Plan and see how much of the context window is in use. |
+| **Ask about work in progress** | Type `/btw <question>` in an existing native agent chat. The [side answer](assets/media/side-question.png) appears above the composer while the main task continues. |
 | **Sync a branch** | Fetch remote refs, pull its upstream by fast-forward, or preview a rebase onto a local branch. |
 | **Review a GitHub PR** | Read the conversation, commits, checks, and diff. Comment on lines, reply in review threads, and mark files as viewed. Check out a PR from a fork in its own worktree or merge a PR from the app. |
 
