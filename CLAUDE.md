@@ -411,6 +411,13 @@ never commit, push or create worktrees there without asking.
   `IconName` (lucide) draws nothing until it is listed in
   `icons::ExtraIcons` (and in the `icons_used_by_the_app_are_embedded`
   test).
+- **Review layout**: under the worktree's header, the commit tree (search,
+  scope, graph) sits left of the review pane when shown — History in the
+  pane's bar, `cmd-h`, `RepositoryView::history_open`. The pane's bar
+  (`TOOLBAR_HEIGHT`, beside the tree's search bar) holds that toggle and
+  the Changes / Agents / Pull requests tabs; a commit picked in the tree
+  shows in the pane (`MainTab::History`), and history loads whenever the
+  tree or a commit is on screen.
 - **Panel lines**: a resizable split draws the line between its panels
   itself (gpui-component's resize handle, in the first pixel of the panel
   after it). A panel beside a handle draws no border on that side, or the

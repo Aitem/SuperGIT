@@ -107,6 +107,8 @@ pub struct RepositoryView {
     pub changes_tree: bool,
     /// What the History tab lists: every branch, or this one.
     pub history_scope: crate::model::history::HistoryScope,
+    /// The commit tree shows beside the review (`cmd-h`).
+    pub history_open: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +139,7 @@ impl Default for RepositoryView {
             terminal_height: 280.,
             changes_tree: false,
             history_scope: Default::default(),
+            history_open: true,
         }
     }
 }
