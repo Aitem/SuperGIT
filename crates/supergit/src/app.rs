@@ -1508,12 +1508,19 @@ impl SuperGitApp {
                 }))
                 .child(h_flex().justify_between().child(div().text_lg().font_weight(FontWeight::BOLD).child("Settings"))
                     .child(Button::new("close-settings").label("Done").small().ghost()
+                        .tooltip("Close settings (Esc)")
                         .on_click(cx.listener(|this,_,window,cx| this.close_settings(window,cx)))))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Background notifications"))
                 .children([(true,"Approvals and questions",settings.notify_approvals),(false,"Completion and failures",settings.notify_completions)]
                     .into_iter().map(|(approval,label,enabled)| h_flex().justify_between().child(label)
                         .child(Button::new(if approval {"notify-approval"} else {"notify-completion"})
                             .label(if enabled {"On"} else {"Off"}).small().ghost()
+                            .tooltip(match (approval, enabled) {
+                                (true, true) => "Stop notifying when an agent needs approval or an answer",
+                                (true, false) => "Notify when an agent needs approval or an answer",
+                                (false, true) => "Stop notifying when an agent finishes or fails",
+                                (false, false) => "Notify when an agent finishes or fails",
+                            })
                             .on_click(cx.listener(move |this,_,_,cx| this.toggle_notification(approval,cx))))))
                 .child(div().text_sm().text_color(theme.muted_foreground).child(
                     if cfg!(target_os = "macos") {
@@ -3135,7 +3142,6 @@ impl SuperGitApp {
         let pane = v_flex()
             .size_full()
             .min_w_0()
-            .child(self.render_review_tabs(&info, &theme, cx))
             .child(div().flex_1().min_h_0().child(content));
         let body = if history_open {
             let max = history_tree_max(main_width);
@@ -3165,14 +3171,15 @@ impl SuperGitApp {
             .min_w_0()
             .h_full()
             .child(header)
+            // Across the review: its buttons stay put when the tree shows.
+            .child(self.render_review_tabs(&info, &theme, cx))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
 
-    /// Above the review pane, as tall as the tree's search bar: History
-    /// shows or hides the commit tree; Changes, Agents and Pull requests
-    /// pick what the pane shows (a commit picked in the tree shows there
-    /// too).
+    /// Under the header, across the review: History shows or hides the
+    /// commit tree; Changes, Agents and Pull requests pick what the pane
+    /// beside it shows (a commit picked in the tree shows there too).
     fn render_review_tabs(
         &self,
         info: &WorktreeInfo,
@@ -3222,27 +3229,38 @@ impl SuperGitApp {
             ),
         ]
         .map(|(tab, id, label, tooltip)| {
-            Button::new(id)
-                .label(label)
-                .small()
-                .ghost()
-                .selected(self.tab == tab)
-                .tooltip(tooltip)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+            // Room for a count of three digits: a count that grows doesn't
+            // push the tabs after it.
+            let width = match tab {
+                MainTab::Changes => 7.5,
+                MainTab::Sessions => 6.5,
+                _ => 9.,
+            };
+            div().flex_none().min_w(rems(width)).child(
+                Button::new(id)
+                    .label(label)
+                    .small()
+                    .ghost()
+                    .selected(self.tab == tab)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx))),
+            )
         });
         toolbar(theme)
             .gap_1()
             .child(
-                Button::new("toggle-history")
-                    .icon(IconName::PanelLeft)
-                    .label(history)
-                    .small()
-                    .ghost()
-                    .selected(self.repository_view().history_open)
-                    .tooltip(format!("Show or hide the commit tree ({MOD}-h)"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_history(&ToggleHistory, window, cx)
-                    })),
+                div().flex_none().min_w(rems(8.)).child(
+                    Button::new("toggle-history")
+                        .icon(IconName::PanelLeft)
+                        .label(history)
+                        .small()
+                        .ghost()
+                        .selected(self.repository_view().history_open)
+                        .tooltip(format!("Show or hide the commit tree ({MOD}-shift-h)"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_history(&ToggleHistory, window, cx)
+                        })),
+                ),
             )
             .child(div().flex_none().w_px().h(px(16.)).mx_1().bg(theme.border))
             .children(tabs)
@@ -3257,7 +3275,7 @@ impl SuperGitApp {
         }
     }
 
-    /// Shows or hides the commit tree beside the review (`cmd-h`).
+    /// Shows or hides the commit tree beside the review (`cmd-shift-h`).
     fn toggle_history(&mut self, _: &ToggleHistory, _: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = &self.repo else { return };
         let view = self
@@ -3300,7 +3318,9 @@ impl SuperGitApp {
             }
             Err(e) => e.clone(),
         };
-        let shown_path = SharedString::from(path.display().to_string());
+        // The title may be clipped: its tooltip has the whole name and the path.
+        let shown_path =
+            SharedString::from(format!("{}\n{}", info.wt.display_name(), path.display()));
         // "repo / worktree", the repository's part muted.
         let worktree = info.wt.display_name();
         let (title, highlights) = match &self.repo {
@@ -3418,6 +3438,11 @@ impl SuperGitApp {
                         .label("Retry")
                         .small()
                         .ghost()
+                        .tooltip(if retry_commit {
+                            "Load this commit's diff again"
+                        } else {
+                            "Read the repository from Git again"
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if retry_commit {
                                 if let Some(sha) = this.selected_commit.clone() {
@@ -3715,22 +3740,29 @@ impl SuperGitApp {
     fn render_diff_toolbar(&self, list: FileList, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let key = list as usize;
+        // Icons, like the file list's view toggles beside them: a narrow
+        // diff keeps all its controls.
         let layouts = [
             (
                 DiffLayout::Unified,
                 IconName::Rows2,
-                "Unified",
+                "Unified diff: removed and added lines in one column",
                 "diff-unified",
             ),
-            (DiffLayout::Split, IconName::Columns2, "Split", "diff-split"),
+            (
+                DiffLayout::Split,
+                IconName::Columns2,
+                "Split diff: the old and new versions side by side",
+                "diff-split",
+            ),
         ]
-        .map(|(layout, icon, label, id)| {
+        .map(|(layout, icon, tooltip, id)| {
             Button::new((id, key))
                 .icon(icon)
-                .label(label)
                 .xsmall()
                 .ghost()
                 .selected(self.diff_layout == layout)
+                .tooltip(tooltip)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_diff_layout(layout, cx)))
         });
         let available = self.difft_available();
@@ -3758,7 +3790,6 @@ impl SuperGitApp {
             .child(
                 Button::new(("diff-difftastic", key))
                     .icon(IconName::FileDiff)
-                    .label("Difftastic")
                     .xsmall()
                     .ghost()
                     .selected(self.difftastic_active())
@@ -4016,6 +4047,7 @@ impl SuperGitApp {
                                 .small()
                                 .ghost()
                                 .selected(self.diff_layout == layout)
+                                .tooltip(layout_tooltip(layout))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.set_diff_layout(layout, cx)
                                 }))
@@ -4037,6 +4069,16 @@ impl SuperGitApp {
                             .small()
                             .ghost()
                             .disabled(!available)
+                            .tooltip(match &self.difft_version {
+                                None => "Still looking for difftastic",
+                                Some(None) => {
+                                    "difftastic is not installed: brew install difftastic"
+                                }
+                                Some(Some(_)) if self.difftastic => "Go back to line-by-line diffs",
+                                Some(Some(_)) => {
+                                    "Highlight only changed syntax and ignore reformatting"
+                                }
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let on = !this.difftastic;
                                 this.set_difftastic(on, cx);
@@ -4132,16 +4174,32 @@ impl SuperGitApp {
             .py_1()
             .children(
                 [
-                    (ChangeScope::All, "compare-uncommitted", "Uncommitted"),
-                    (ChangeScope::Staged, "compare-staged", "Staged"),
-                    (ChangeScope::Unstaged, "compare-unstaged", "Unstaged"),
+                    (
+                        ChangeScope::All,
+                        "compare-uncommitted",
+                        "Uncommitted",
+                        "Show everything not committed yet: staged, unstaged, untracked",
+                    ),
+                    (
+                        ChangeScope::Staged,
+                        "compare-staged",
+                        "Staged",
+                        "Show only what the next commit will contain",
+                    ),
+                    (
+                        ChangeScope::Unstaged,
+                        "compare-unstaged",
+                        "Unstaged",
+                        "Show only changes not staged yet, untracked files included",
+                    ),
                 ]
-                .map(|(scope, id, label)| {
+                .map(|(scope, id, label, tooltip)| {
                     Button::new(id)
                         .label(label)
                         .xsmall()
                         .ghost()
                         .selected(base.is_none() && self.change_scope() == scope)
+                        .tooltip(tooltip)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.change_comparison(false, None, scope, cx)
                         }))
@@ -4153,6 +4211,7 @@ impl SuperGitApp {
                     .xsmall()
                     .ghost()
                     .selected(base.is_some())
+                    .tooltip("Show all work since the branch left its base, uncommitted included")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.change_comparison(true, None, ChangeScope::All, cx)
                     })),
@@ -4163,6 +4222,11 @@ impl SuperGitApp {
                     .xsmall()
                     .ghost()
                     .disabled(self.git_operation_running())
+                    .tooltip(if self.git_operation_running() {
+                        "Wait for the running Git operation to finish"
+                    } else {
+                        "Set this worktree's changes aside, or bring back saved ones"
+                    })
                     .on_click(cx.listener(|this, _, window, cx| this.open_stashes(window, cx))),
             );
         if let Some(base) = base {
@@ -4200,6 +4264,7 @@ impl SuperGitApp {
                         .label("Compare")
                         .xsmall()
                         .ghost()
+                        .tooltip("Diff against the merge base with the branch typed here (Return)")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let base = input.read(cx).value().trim().to_string();
                             this.change_comparison(true, Some(base), ChangeScope::All, cx);
@@ -4212,6 +4277,11 @@ impl SuperGitApp {
                 .xsmall()
                 .ghost()
                 .disabled(self.git_operation_running())
+                .tooltip(if self.git_operation_running() {
+                    "Wait for the running Git operation to finish"
+                } else {
+                    "Check this worktree for a cherry-pick in progress"
+                })
                 .on_click(
                     cx.listener(|this, _, window, cx| this.open_cherry_pick(None, window, cx)),
                 ),
@@ -4937,6 +5007,7 @@ impl SuperGitApp {
                                 })),
                         )
                     })
+                    .children(self.squash_button(cx))
                     .child(div().flex_1())
                     .child(format!("{files} file{}", if files == 1 { "" } else { "s" }))
                     .child(
@@ -4990,26 +5061,31 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if info.sessions.is_empty() {
+            // Padded, and the buttons wrap: a narrow pane keeps them whole.
             return v_flex()
                 .size_full()
                 .items_center()
                 .justify_center()
                 .gap_2()
+                .p_4()
+                .text_center()
                 .text_color(theme.muted_foreground)
                 .child("No agent sessions in this worktree yet")
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .children(Provider::ALL.into_iter().map(|provider| {
-                            Button::new(("agent-new-empty", provider as usize))
-                                .icon(crate::icons::agent_icon(provider))
-                                .label(format!("Start {} here", provider.label()))
-                                .when(provider == default_provider(), |b| b.primary())
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.new_chat_with(provider, window, cx)
-                                }))
-                        })),
-                )
+                .child(h_flex().flex_wrap().justify_center().gap_2().children(
+                    Provider::ALL.into_iter().map(|provider| {
+                        Button::new(("agent-new-empty", provider as usize))
+                            .icon(crate::icons::agent_icon(provider))
+                            .label(format!("Start {} here", provider.label()))
+                            .when(provider == default_provider(), |b| b.primary())
+                            .tooltip(format!(
+                                "Open a new conversation in the {} panel",
+                                provider.label()
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.new_chat_with(provider, window, cx)
+                            }))
+                    }),
+                ))
                 .into_any_element();
         }
         // Open follows the panel's Chat | Terminal switch; with Chat, Terminal
@@ -5493,6 +5569,7 @@ impl SuperGitApp {
                             Button::new("welcome-open")
                                 .label("Open Repository")
                                 .primary()
+                                .tooltip(format!("Choose a folder with a Git repository ({MOD}-o)"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_repository(&OpenRepository, window, cx)
                                 })),
@@ -5501,6 +5578,7 @@ impl SuperGitApp {
                             Button::new("welcome-clone")
                                 .label("Clone Repository")
                                 .outline()
+                                .tooltip("Download a repository from a URL into a new folder")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_clone_form(window, cx)
                                 })),
@@ -5538,6 +5616,7 @@ impl SuperGitApp {
                         .label("Cleanup details")
                         .xsmall()
                         .ghost()
+                        .tooltip("Show what the last worktree cleanup did, and what failed")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.cleanup_results_open = true;
                             this.cleanup_handle.focus(window, cx);
@@ -5632,6 +5711,14 @@ impl Render for SuperGitApp {
             .when(self.staged_commit.is_some(), |el| {
                 el.child(self.render_staged_commit(cx))
             })
+    }
+}
+
+/// What a Unified / Split button does (diff toolbars and Settings).
+fn layout_tooltip(layout: DiffLayout) -> &'static str {
+    match layout {
+        DiffLayout::Unified => "Show removed and added lines in one column",
+        DiffLayout::Split => "Show the old and new versions side by side",
     }
 }
 
@@ -6328,8 +6415,18 @@ fn ref_badges(
     let mut badges: Vec<AnyElement> = groups
         .into_iter()
         .take(max)
-        .map(|(label, remotes)| {
+        .enumerate()
+        .map(|(ix, (label, remotes))| {
+            // Badges clip where the row runs out: the tooltip has the name.
+            let full: SharedString = if remotes.is_empty() {
+                label.name.clone().into()
+            } else {
+                format!("{} · {}", label.name, remotes.join(", ")).into()
+            };
             let badge = h_flex()
+                .id(SharedString::from(format!("{}-{}-{ix}", id.0, id.1)))
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                .tooltip_show_delay(crate::TOOLTIP_DELAY)
                 .flex_none()
                 .gap_0p5()
                 .px_1()

@@ -1,7 +1,7 @@
 //! Light / dark / system appearance. The choice is an app-wide global, saved
 //! to settings, and in `System` mode the theme follows macOS live.
 
-use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
 use gpui_kit::*;
 
 use crate::settings::{self, Appearance};
@@ -58,6 +58,27 @@ fn apply(appearance: Appearance, window: Option<&mut Window>, cx: &mut App) {
         Appearance::System => Theme::sync_system_appearance(window, cx),
         Appearance::Light => Theme::change(ThemeMode::Light, None, cx),
         Appearance::Dark => Theme::change(ThemeMode::Dark, None, cx),
+    }
+    // A mode change loads the theme's own colors: patch them after it.
+    Theme::update(cx, |theme| {
+        let dark = theme.mode.is_dark();
+        readable_status_colors(&mut theme.colors, dark);
+    });
+}
+
+/// Status colors readable as text and on filled buttons (WCAG AA, 4.5:1).
+/// gpui-kit's light ones are made for fills and fail as text ("+4", "fork
+/// point", errors): Tailwind's 700/600 shades instead. Its dark ones are
+/// light, so white on a filled danger or success button fails: the
+/// button's text takes the background's color.
+pub fn readable_status_colors(colors: &mut ThemeColor, dark: bool) {
+    if dark {
+        colors.danger_foreground = colors.background;
+        colors.success_foreground = colors.background;
+    } else {
+        colors.success = rgb(0x15803d).into();
+        colors.danger = rgb(0xdc2626).into();
+        colors.warning = rgb(0xb45309).into();
     }
 }
 

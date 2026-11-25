@@ -353,6 +353,7 @@ impl SuperGitApp {
                                     .label("Refresh viewed state")
                                     .xsmall()
                                     .ghost()
+                                    .tooltip("Reload which files you marked as viewed on GitHub")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pulls.file_review.loaded = None;
                                         this.pulls.file_review.mutation_error = None;

@@ -565,6 +565,8 @@ impl SuperGitApp {
             color: Some(theme.muted_foreground),
             ..Default::default()
         };
+        // A long name truncates: the tooltip has it whole, and the folder.
+        let full_name: SharedString = format!("{name}\n{}", info.wt.path.display()).into();
         let name =
             StyledText::new(name).with_highlights((prefix > 0).then_some((0..prefix, muted)));
 
@@ -573,6 +575,7 @@ impl SuperGitApp {
             .child(self.render_signal("signal", signal, root, theme, cx))
             .child(
                 div()
+                    .id(("worktree-name", ix))
                     .flex_1()
                     .min_w_0()
                     .truncate()
@@ -580,6 +583,8 @@ impl SuperGitApp {
                     .when(completed && !selected, |el| {
                         el.text_color(theme.muted_foreground)
                     })
+                    .tooltip(move |window, cx| Tooltip::new(full_name.clone()).build(window, cx))
+                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
                     .child(name),
             )
             .child(

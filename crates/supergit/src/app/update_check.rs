@@ -307,6 +307,11 @@ impl SuperGitApp {
                         .xsmall()
                         .ghost()
                         .loading(true)
+                        .tooltip(if *install {
+                            "Replaces this copy of SuperGIT when done; nothing restarts yet"
+                        } else {
+                            "Saves the package to your Downloads folder, then shows it"
+                        })
                         .into_any_element(),
                 );
             }

@@ -397,6 +397,13 @@ never commit, push or create worktrees there without asking.
   `gpui-pre-platform/test-support` directly instead.
 - Edition 2024: `impl IntoElement` return types capture `cx`'s lifetime; for
   rows built inside iterator closures return a concrete `Stateful<Div>`.
+- **UI work**: the `ui-design` skill (`.claude/skills/ui-design/SKILL.md`)
+  holds the rules and a review checklist — nothing jumps, top-down
+  hierarchy, shortcuts, WCAG AA contrast, empty/loading/error states — with
+  links to Apple's and GNOME's HIG and WCAG. Load it before changing the
+  UI. `contrast::tests` checks the theme's color pairs against AA as the
+  app shows them (`appearance::readable_status_colors` patches gpui-kit's
+  status colors; the known gaps are listed in the test).
 - **Buttons**: every button has a tooltip (shown on hover and while it is
   held) that says what it does: one short phrase that does not repeat the
   button's label ("Fetch" → "Download new commits from all remotes", not
@@ -411,13 +418,14 @@ never commit, push or create worktrees there without asking.
   `IconName` (lucide) draws nothing until it is listed in
   `icons::ExtraIcons` (and in the `icons_used_by_the_app_are_embedded`
   test).
-- **Review layout**: under the worktree's header, the commit tree (search,
-  scope, graph) sits left of the review pane when shown — History in the
-  pane's bar, `cmd-h`, `RepositoryView::history_open`. The pane's bar
-  (`TOOLBAR_HEIGHT`, beside the tree's search bar) holds that toggle and
-  the Changes / Agents / Pull requests tabs; a commit picked in the tree
-  shows in the pane (`MainTab::History`), and history loads whenever the
-  tree or a commit is on screen.
+- **Review layout**: under the worktree's header, a bar across the review
+  holds History — a toggle for the commit tree (`cmd-shift-h`,
+  `RepositoryView::history_open`) — and the Changes / Agents / Pull
+  requests tabs; it stays put whether the tree shows or not. Below it the
+  commit tree (search, scope, graph) sits left of the review pane when
+  shown; a commit picked in the tree shows in the pane
+  (`MainTab::History`), and history loads whenever the tree or a commit
+  is on screen.
 - **Panel lines**: a resizable split draws the line between its panels
   itself (gpui-component's resize handle, in the first pixel of the panel
   after it). A panel beside a handle draws no border on that side, or the

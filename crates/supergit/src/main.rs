@@ -4,6 +4,8 @@ mod appearance;
 mod attention;
 mod avatars;
 mod chat;
+#[cfg(test)]
+mod contrast;
 mod difft_view;
 mod dump;
 mod file_tree;
@@ -36,7 +38,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::*;
 
-actions!(supergit, [Quit]);
+actions!(supergit, [Quit, Hide, HideOthers, ShowAll, Minimize]);
 
 /// How long the pointer rests on something before its tooltip shows: the
 /// components' default (`TooltipDefaults`), and set on every element
@@ -109,7 +111,6 @@ fn bind_terminal_keys(cx: &mut App) {
         cx.bind_keys(
             [
                 "ctrl-c", "ctrl-v", "ctrl-r", "ctrl-o", "ctrl-l", "ctrl-b", "ctrl-n", "ctrl-p",
-                "ctrl-h",
             ]
             .map(|keys| KeyBinding::new(keys, NoAction {}, context)),
         );
@@ -208,7 +209,7 @@ fn main() -> Result<()> {
             KeyBinding::new(shortcut!("l"), app::ToggleClaude, None),
             KeyBinding::new(shortcut!("b"), app::ToggleSidebar, None),
             KeyBinding::new(shortcut!("j"), app::ToggleTerminal, None),
-            KeyBinding::new(shortcut!("h"), app::ToggleHistory, None),
+            KeyBinding::new(shortcut!("shift-h"), app::ToggleHistory, None),
             KeyBinding::new(shortcut!("n"), app::NewClaudeChat, None),
             KeyBinding::new(shortcut!("p"), app::OpenSwitcher, None),
             KeyBinding::new(shortcut!(","), app::OpenSettings, None),
@@ -217,8 +218,24 @@ fn main() -> Result<()> {
             KeyBinding::new("down", app::SwitcherNext, Some("Switcher")),
             KeyBinding::new("escape", app::CloseSwitcher, Some("Switcher")),
         ]);
+        if cfg!(target_os = "macos") {
+            cx.bind_keys([
+                KeyBinding::new("cmd-h", Hide, None),
+                KeyBinding::new("alt-cmd-h", HideOthers, None),
+                KeyBinding::new("cmd-m", Minimize, None),
+            ]);
+        }
         bind_terminal_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        // The standard macOS window and app commands (⌘H, ⌥⌘H, ⌘M).
+        cx.on_action(|_: &Hide, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+        cx.on_action(|_: &Minimize, cx| {
+            if let Some(window) = cx.active_window() {
+                let _ = window.update(cx, |_, window, _| window.minimize_window());
+            }
+        });
         set_app_menus(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -321,61 +338,73 @@ fn main() -> Result<()> {
 
 /// The menu bar. Rebuilt when a checkmark changes (appearance).
 pub(crate) fn set_app_menus(cx: &mut App) {
-    cx.set_menus([
-        Menu::new("SuperGIT").items(
-            [
-                MenuItem::action("Settings…", app::OpenSettings),
-                MenuItem::action("Check for Updates…", app::CheckForUpdates),
+    cx.set_menus(
+        [
+            Menu::new("SuperGIT").items(
+                [
+                    MenuItem::action("Settings…", app::OpenSettings),
+                    MenuItem::action("Check for Updates…", app::CheckForUpdates),
+                    MenuItem::separator(),
+                ]
+                .into_iter()
+                // Only macOS has a Services menu.
+                .chain(
+                    cfg!(target_os = "macos")
+                        .then(|| {
+                            [
+                                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                                MenuItem::separator(),
+                                MenuItem::action("Hide SuperGIT", Hide),
+                                MenuItem::action("Hide Others", HideOthers),
+                                MenuItem::action("Show All", ShowAll),
+                                MenuItem::separator(),
+                            ]
+                        })
+                        .into_iter()
+                        .flatten(),
+                )
+                .chain([MenuItem::action("Quit SuperGIT", Quit)])
+                .collect::<Vec<_>>(),
+            ),
+            Menu::new("File").items([
+                MenuItem::action("Open Repository as Project…", app::OpenRepository),
+                MenuItem::action("Recent Repositories", app::CloseRepository),
                 MenuItem::separator(),
-            ]
-            .into_iter()
-            // Only macOS has a Services menu.
-            .chain(
-                cfg!(target_os = "macos")
-                    .then(|| {
-                        [
-                            MenuItem::os_submenu("Services", SystemMenuType::Services),
-                            MenuItem::separator(),
-                        ]
-                    })
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain([MenuItem::action("Quit SuperGIT", Quit)])
-            .collect::<Vec<_>>(),
-        ),
-        Menu::new("File").items([
-            MenuItem::action("Open Repository as Project…", app::OpenRepository),
-            MenuItem::action("Recent Repositories", app::CloseRepository),
-            MenuItem::separator(),
-            MenuItem::action("Refresh", app::Refresh),
-        ]),
-        Menu::new("View").items([
-            MenuItem::action("Ask Agent About Diff Selection", app::AskAgent),
-            MenuItem::action(
-                "Ask Agent in New Conversation",
-                app::AskAgentNewConversation,
-            ),
-            MenuItem::separator(),
-            MenuItem::action(
-                "Switch Worktree, Conversation or Project…",
-                app::OpenSwitcher,
-            ),
-            MenuItem::separator(),
-            MenuItem::action("Toggle Sidebar", app::ToggleSidebar),
-            MenuItem::action("Toggle Agent Panel", app::ToggleClaude),
-            MenuItem::action("Toggle Terminal", app::ToggleTerminal),
-            MenuItem::action("Toggle History", app::ToggleHistory),
-            MenuItem::action("New Agent Conversation", app::NewClaudeChat),
-            MenuItem::separator(),
-            MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),
-        ]),
-        Menu::new("Worktree").items([
-            MenuItem::action("Toggle Keep Active", app::ToggleKeepWorktree),
-            MenuItem::action("Clean Up Worktree…", app::CleanUpWorktree),
-            MenuItem::action("Update Worktree Base", app::UpdateBase),
-        ]),
-    ]);
+                MenuItem::action("Refresh", app::Refresh),
+            ]),
+            Menu::new("View").items([
+                MenuItem::action("Ask Agent About Diff Selection", app::AskAgent),
+                MenuItem::action(
+                    "Ask Agent in New Conversation",
+                    app::AskAgentNewConversation,
+                ),
+                MenuItem::separator(),
+                MenuItem::action(
+                    "Switch Worktree, Conversation or Project…",
+                    app::OpenSwitcher,
+                ),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Sidebar", app::ToggleSidebar),
+                MenuItem::action("Toggle Agent Panel", app::ToggleClaude),
+                MenuItem::action("Toggle Terminal", app::ToggleTerminal),
+                MenuItem::action("Toggle History", app::ToggleHistory),
+                MenuItem::action("New Agent Conversation", app::NewClaudeChat),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),
+            ]),
+            Menu::new("Worktree").items([
+                MenuItem::action("Toggle Keep Active", app::ToggleKeepWorktree),
+                MenuItem::action("Clean Up Worktree…", app::CleanUpWorktree),
+                MenuItem::action("Update Worktree Base", app::UpdateBase),
+            ]),
+        ]
+        .into_iter()
+        .chain(
+            cfg!(target_os = "macos")
+                .then(|| Menu::new("Window").items([MenuItem::action("Minimize", Minimize)])),
+        )
+        .collect::<Vec<_>>(),
+    );
     // Linux and Windows have no global menu bar: the window draws the same
     // menus itself (`menu_bar`).
     if !cfg!(target_os = "macos") {

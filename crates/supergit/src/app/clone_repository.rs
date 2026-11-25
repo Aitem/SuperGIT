@@ -178,6 +178,19 @@ impl SuperGitApp {
             && !form.choosing_folder
             && target.is_some()
             && !self.git_operation_running();
+        let start_tooltip = if form.running {
+            "The repository is downloading"
+        } else if form.choosing_folder {
+            "Finish choosing the parent folder first"
+        } else if form.parent.is_none() {
+            "Choose a parent folder first"
+        } else if target.is_none() {
+            "Enter a repository URL or path and a valid folder name"
+        } else if self.git_operation_running() {
+            "Wait for the running Git operation to finish"
+        } else {
+            "Download the repository into the folder shown above, then open it"
+        };
         div()
             .absolute()
             .inset_0()
@@ -238,6 +251,11 @@ impl SuperGitApp {
                                     .label("Choose parent folder")
                                     .outline()
                                     .disabled(form.running || form.choosing_folder)
+                                    .tooltip(if form.running {
+                                        "Wait for the clone to finish"
+                                    } else {
+                                        "Pick the folder the clone is created in"
+                                    })
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.choose_clone_parent(cx)),
                                     ),
@@ -276,6 +294,11 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(form.running)
+                                    .tooltip(if form.running {
+                                        "Wait for the clone to finish"
+                                    } else {
+                                        "Close without cloning (Esc)"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_clone_form(window, cx)
                                     })),
@@ -286,6 +309,7 @@ impl SuperGitApp {
                                     .small()
                                     .primary()
                                     .disabled(!can_start)
+                                    .tooltip(start_tooltip)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_clone(window, cx)
                                     })),

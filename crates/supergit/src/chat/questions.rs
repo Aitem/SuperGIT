@@ -318,6 +318,11 @@ impl ChatSession {
                         .small()
                         .primary()
                         .disabled(!ready)
+                        .tooltip(if ready {
+                            format!("Send your choices to {agent}")
+                        } else {
+                            "Answer every question first".to_string()
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.answer_question_request(&submit_id, cx)
                         })),

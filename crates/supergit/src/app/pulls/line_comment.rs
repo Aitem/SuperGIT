@@ -337,6 +337,11 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(posting)
+                                    .tooltip(if posting {
+                                        "Wait until GitHub has the comment"
+                                    } else {
+                                        "Close without posting (Esc)"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_line_comment(window, cx)
                                     })),
@@ -351,6 +356,13 @@ impl SuperGitApp {
                                     .small()
                                     .primary()
                                     .disabled(posting || empty)
+                                    .tooltip(if posting {
+                                        "Sending the comment to GitHub"
+                                    } else if empty {
+                                        "Write the comment first"
+                                    } else {
+                                        "Publish it on this line of the pull request on GitHub"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_line_comment(window, cx)
                                     })),

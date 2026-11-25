@@ -215,6 +215,39 @@ impl SuperGitApp {
                 .is_some_and(|submodule| submodule.modified || submodule.untracked)
         });
         let apply_ready = status.is_clean() && !status.is_unborn() && dialog.selected.is_some();
+        let wait = if dialog.loading.is_some() {
+            "Wait for the stashes to load"
+        } else if dialog.snapshot.error().is_some() {
+            "Refresh: the worktree could not be read"
+        } else if self.selected.as_ref() != Some(&dialog.path) {
+            "Select this worktree again to use its stashes"
+        } else {
+            "Wait for the running Git operation to finish"
+        };
+        let save_tooltip = if busy {
+            wait
+        } else if status.is_unborn() {
+            "Nothing to stash before the first commit"
+        } else if status.conflicted_count() > 0 {
+            "Resolve the conflicts first"
+        } else if !save_ready && untracked > 0 && !dialog.include_untracked {
+            "Only untracked files changed: include them to stash them"
+        } else if !save_ready {
+            "No changes to stash"
+        } else {
+            "Move the changes into a new stash, out of the worktree"
+        };
+        let apply_tooltip = if busy {
+            wait
+        } else if !status.is_clean() {
+            "Save or commit this worktree's changes first"
+        } else if status.is_unborn() {
+            "Make a first commit before applying a stash"
+        } else if dialog.selected.is_none() {
+            "Select a stash in the list"
+        } else {
+            "Restore the changes and what was staged; the stash stays in the list"
+        };
         let rows = snapshot.entries.iter().enumerate().map(|(ix, stash)| {
             let oid = stash.oid.clone();
             let active = dialog.selected.as_ref() == Some(&oid);
@@ -316,6 +349,7 @@ impl SuperGitApp {
                                     .small()
                                     .primary()
                                     .disabled(busy || !save_ready)
+                                    .tooltip(save_tooltip)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.run_stash_action(true, cx)
                                     })),
@@ -362,6 +396,7 @@ impl SuperGitApp {
                                         .small()
                                         .outline()
                                         .disabled(busy || !apply_ready)
+                                        .tooltip(apply_tooltip)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.run_stash_action(false, cx)
                                         })),
@@ -461,6 +496,13 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(dialog.running || dialog.loading.is_some())
+                                    .tooltip(if dialog.running {
+                                        "Wait for the stash operation to finish"
+                                    } else if dialog.loading.is_some() {
+                                        "The stashes are loading"
+                                    } else {
+                                        "Read the worktree's status and stashes again"
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| this.load_stashes(cx))),
                             )
                             .child(
@@ -469,6 +511,11 @@ impl SuperGitApp {
                                     .small()
                                     .outline()
                                     .disabled(dialog.running)
+                                    .tooltip(if dialog.running {
+                                        "Wait for the stash operation to finish"
+                                    } else {
+                                        "Back to the review (Esc)"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_stashes(window, cx)
                                     })),

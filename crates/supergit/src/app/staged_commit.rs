@@ -27,16 +27,20 @@ impl SuperGitApp {
         {
             return None;
         }
+        let blocked = self.action_task.is_some()
+            || self.cleanup_task.is_some()
+            || self.base_update_paths.contains(path);
         Some(
             Button::new("commit-staged")
                 .label(format!("Commit staged · {}", status.staged_count()))
                 .xsmall()
                 .outline()
-                .disabled(
-                    self.action_task.is_some()
-                        || self.cleanup_task.is_some()
-                        || self.base_update_paths.contains(path),
-                )
+                .disabled(blocked)
+                .tooltip(if blocked {
+                    "Wait for the running Git operation to finish"
+                } else {
+                    "Preview the staged changes and record them with a message"
+                })
                 .on_click(cx.listener(|this, _, window, cx| this.open_staged_commit(window, cx))),
         )
     }
@@ -198,6 +202,19 @@ impl SuperGitApp {
             && dialog.error.is_none()
             && dialog.preview.value().is_some()
             && !dialog.message.read(cx).value().trim().is_empty();
+        let commit_tooltip = if dialog.submitting {
+            "Wait for the commit to finish"
+        } else if self.selected.as_ref() != Some(&dialog.path) {
+            "Select this worktree again to commit here"
+        } else if dialog.error.is_some() || dialog.preview.error().is_some() {
+            "Reload the preview to try again"
+        } else if dialog.preview.value().is_none() {
+            "Wait for the preview to load"
+        } else if dialog.message.read(cx).value().trim().is_empty() {
+            "Write a commit message first"
+        } else {
+            "Record exactly the staged changes shown above as a new commit"
+        };
         let preview = if let Some(snapshot) = dialog.preview.value() {
             let branch = snapshot.branch().unwrap_or("Detached HEAD");
             let head = snapshot
@@ -307,6 +324,13 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(dialog.submitting || dialog.loading.is_some())
+                                    .tooltip(if dialog.submitting {
+                                        "Wait for the commit to finish"
+                                    } else if dialog.loading.is_some() {
+                                        "The staged changes are loading"
+                                    } else {
+                                        "Read the staged changes again"
+                                    })
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.reload_staged_commit(cx)),
                                     ),
@@ -318,6 +342,11 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(dialog.submitting)
+                                    .tooltip(if dialog.submitting {
+                                        "Wait for the commit to finish"
+                                    } else {
+                                        "Close without committing (Esc)"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_staged_commit(window, cx)
                                     })),
@@ -325,13 +354,14 @@ impl SuperGitApp {
                             .child(
                                 Button::new("confirm-staged-commit")
                                     .label(if dialog.submitting {
-                                        "Committing…"
+                                        "Committing"
                                     } else {
                                         "Commit"
                                     })
                                     .small()
                                     .primary()
                                     .disabled(!can_commit)
+                                    .tooltip(commit_tooltip)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_staged_commit(window, cx)
                                     })),

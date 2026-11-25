@@ -176,6 +176,7 @@ impl SuperGitApp {
             .child(div().font_weight(FontWeight::SEMIBOLD).child("Worktree cleanup · this repository"))
             .child(h_flex().justify_between().child("After a PR merges")
                 .child(Button::new("auto-cleanup").small().ghost().label(if view.auto_cleanup {"On"} else {"Off"})
+                    .tooltip(if view.auto_cleanup {"Stop removing worktrees on their own after their PR merges"} else {"Remove a worktree and its local branch once its PR merges"})
                     .on_click(cx.listener(|this,_,_,cx| this.toggle_auto_cleanup(cx)))))
             .child(div().text_sm().text_color(theme.muted_foreground).child(
                 "Only PRs observed open in this app session qualify. Selected, dirty, busy, kept, protected or unread work stays. Squash and rebase merges need manual review."))
@@ -185,6 +186,7 @@ impl SuperGitApp {
                     let protected = view.protected_branches.contains(&branch);
                     h_flex().justify_between().gap_2().child(div().truncate().child(branch.clone()))
                         .child(Button::new(("cleanup-protection",ix)).small().ghost().label(if protected {"Protected"} else {"Protect"})
+                            .tooltip(if protected {"Let cleanup delete this branch again"} else {"Keep cleanup from ever deleting this branch"})
                             .on_click(cx.listener(move |this,_,_,cx| this.toggle_cleanup_protection(&branch,cx))))
                 })))
             .child(self.render_pending_cleanup(cx)).into_any_element()
@@ -527,6 +529,11 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(self.cleanup_task.is_some())
+                                    .tooltip(if self.cleanup_task.is_some() {
+                                        "Wait for the running cleanup to finish"
+                                    } else {
+                                        "Try deleting this local branch again; no worktree is touched"
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.retry_cleanup_branch(retry.clone(), cx)
                                     })),
@@ -537,6 +544,11 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(self.cleanup_task.is_some())
+                                    .tooltip(if self.cleanup_task.is_some() {
+                                        "Wait for the running cleanup to finish"
+                                    } else {
+                                        "Leave this local branch in place and drop it from the list"
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.keep_cleanup_branch(keep.clone(), cx)
                                     })),
@@ -620,6 +632,7 @@ impl SuperGitApp {
                             .label("Done")
                             .small()
                             .ghost()
+                            .tooltip("Close these results (Esc)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_cleanup_results(window, cx)
                             })),
@@ -882,11 +895,13 @@ impl SuperGitApp {
                             .label("Cancel")
                             .small()
                             .ghost()
+                            .tooltip("Close without removing anything (Esc)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_cleanup_preview(window, cx)
                             })))
                         .child(Button::new("confirm-worktree-cleanup").label("Clean up").small().danger()
                             .disabled(preview.targets.is_empty() || preview.targets.iter().any(|target| target.reason.is_some() || target.plan.is_none()))
+                            .tooltip(if preview.targets.is_empty() {"Nothing to clean up"} else if preview.targets.iter().any(|target| target.reason.is_some() || target.plan.is_none()) {"A listed worktree must stay: see the reason under it"} else {"Remove the listed folders and delete their local branches"})
                             .on_click(cx.listener(|this,_,window,cx| this.confirm_cleanup(window,cx))))),
             )
             .into_any_element()

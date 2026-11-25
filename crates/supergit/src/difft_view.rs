@@ -801,6 +801,11 @@ fn render_header(file: usize, p: &Presentation, cx: &App) -> AnyElement {
                 } else {
                     IconName::ChevronDown
                 })
+                .tooltip(if collapsed {
+                    "Show this file's changes"
+                } else {
+                    "Fold this file's changes away"
+                })
                 .on_click(move |_, _, cx| {
                     let _ = view.update(cx, |view, cx| view.toggle_file(file, cx));
                 }),
@@ -876,6 +881,7 @@ fn render_gap(
                     "{count} unchanged line{}",
                     if count == 1 { "" } else { "s" }
                 ))
+                .tooltip("Unfold the part of the file hidden here")
                 .on_click(move |_, _, cx| {
                     let _ = view.update(cx, |view, cx| view.expand(file, rows.clone(), cx));
                 }),
