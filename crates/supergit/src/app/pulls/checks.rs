@@ -223,6 +223,7 @@ impl SuperGitApp {
                                 .label("Copy diagnostics")
                                 .xsmall()
                                 .ghost()
+                                .tooltip("Put the summary, failed steps and annotations on the clipboard")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
                                     this.flash("Copied check diagnostics", false, cx);
@@ -235,6 +236,11 @@ impl SuperGitApp {
                             .xsmall()
                             .ghost()
                             .disabled(open.details.is_loading())
+                            .tooltip(if open.details.is_loading() {
+                                "The check details are still loading"
+                            } else {
+                                "Load this check's details from GitHub again"
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.fetch_check_inspection(id.clone(), cx);
                             })),
@@ -412,6 +418,13 @@ impl SuperGitApp {
                             .xsmall()
                             .outline()
                             .disabled(loading)
+                            .tooltip(if loading {
+                                "Downloading the failed steps' output from GitHub Actions"
+                            } else if log.is_some() {
+                                "Download the failed steps' output again"
+                            } else {
+                                "Show the end of the failed steps' output from GitHub Actions"
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.fetch_failed_log(&id, job.clone(), cx)
                             })),
@@ -434,6 +447,7 @@ impl SuperGitApp {
                                 .label("Copy shown log")
                                 .xsmall()
                                 .ghost()
+                                .tooltip("Put the log text below on the clipboard")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                                     this.flash("Copied Actions log", false, cx);

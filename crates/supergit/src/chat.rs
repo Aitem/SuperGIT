@@ -1448,10 +1448,13 @@ impl ChatSession {
         let long = prompt.lines().count() > look::PROMPT_LINES || prompt.chars().count() > 1200;
         let expanded = self.expanded.contains(&ix);
         let toggle = match (attached.is_some(), long, expanded) {
-            (true, _, false) => Some("Show diff context"),
-            (true, _, true) => Some("Hide diff context"),
-            (false, true, false) => Some("Show more"),
-            (false, true, true) => Some("Show less"),
+            (true, _, false) => Some((
+                "Show diff context",
+                "Show the diff lines attached to this message",
+            )),
+            (true, _, true) => Some(("Hide diff context", "Fold the attached diff lines away")),
+            (false, true, false) => Some(("Show more", "Unfold the whole message")),
+            (false, true, true) => Some(("Show less", "Fold the message to its first lines")),
             (false, false, _) => None,
         };
         let mut body = TextView::html(
@@ -1478,7 +1481,7 @@ impl ChatSession {
                     .bg(theme.muted)
                     .text_sm()
                     .child(body)
-                    .when_some(toggle, |card, label| {
+                    .when_some(toggle, |card, (label, tooltip)| {
                         // In a row of its own, so that it keeps its width.
                         card.child(
                             h_flex().child(
@@ -1486,6 +1489,7 @@ impl ChatSession {
                                     .label(label)
                                     .xsmall()
                                     .ghost()
+                                    .tooltip(tooltip)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_expanded(ix, cx)
                                     })),
@@ -1848,6 +1852,11 @@ impl ChatSession {
                             .label(if is_plan { "Approve plan" } else { "Allow" })
                             .small()
                             .primary()
+                            .tooltip(if is_plan {
+                                "Let the agent leave planning and carry out this plan"
+                            } else {
+                                "Let this call run once; the next one asks again"
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.decide(rid.clone(), Decision::Allowed, cx)
                             })),
@@ -1858,6 +1867,7 @@ impl ChatSession {
                                 .label(label)
                                 .small()
                                 .outline()
+                                .tooltip("Let this call run, and ones like it from now on without asking")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.decide(rid2.clone(), Decision::AllowedForSession, cx)
                                 })),
@@ -1868,6 +1878,11 @@ impl ChatSession {
                             .label(if is_plan { "Keep planning" } else { "Deny" })
                             .small()
                             .ghost()
+                            .tooltip(if is_plan {
+                                "Send the plan back; the agent stays in plan mode"
+                            } else {
+                                "Refuse this call and tell the agent so"
+                            })
                             .when(focused, |button| button.track_focus(&self.permission_focus))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.decide(rid3.clone(), Decision::Denied, cx)
@@ -1889,7 +1904,7 @@ impl ChatSession {
             Button::new("stop")
                 .icon(IconName::Square)
                 .rounded_full()
-                .tooltip("Stop")
+                .tooltip("Interrupt the agent; the conversation stays")
                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
         } else {
             Button::new("send")

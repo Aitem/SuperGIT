@@ -427,6 +427,17 @@ impl SuperGitApp {
         } else {
             "Look up issue"
         };
+        let action_tooltip = if dialog.creating {
+            "Wait for the worktree to be created"
+        } else if dialog.lookup.is_some() {
+            "Wait for GitHub to return the issue"
+        } else if blocked {
+            "Wait for the running Git operation to finish"
+        } else if dialog.ready_to_create() {
+            "Check out the new branch in a folder of its own (Return)"
+        } else {
+            "Read the issue from GitHub to name the branch after it (Return)"
+        };
         div()
             .absolute()
             .inset_0()
@@ -538,6 +549,11 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(dialog.creating)
+                                    .tooltip(if dialog.creating {
+                                        "Wait for the worktree to be created"
+                                    } else {
+                                        "Close without creating a worktree (Esc)"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_worktree_dialog(window, cx);
                                     })),
@@ -548,6 +564,7 @@ impl SuperGitApp {
                                     .small()
                                     .primary()
                                     .disabled(busy || blocked)
+                                    .tooltip(action_tooltip)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_worktree_dialog(window, cx);
                                     })),

@@ -244,6 +244,13 @@ impl SuperGitApp {
                                 .small()
                                 .outline()
                                 .disabled(disabled || remotes.len() < 2)
+                                .tooltip(if remotes.len() < 2 {
+                                    "This repository has only one remote"
+                                } else if disabled {
+                                    "Wait for the running Git operation to finish"
+                                } else {
+                                    "Pick the remote to download new commits from"
+                                })
                                 .dropdown_menu(move |mut menu, _, _| {
                                     for remote in &remotes {
                                         let remote = remote.clone();
@@ -271,6 +278,11 @@ impl SuperGitApp {
                                 .small()
                                 .outline()
                                 .disabled(disabled)
+                                .tooltip(if disabled {
+                                    "Wait for the running Git operation to finish".to_owned()
+                                } else {
+                                    format!("Download new commits from {remote}; your files stay as they are")
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.run_sync(Sync::Fetch(remote.clone()), cx)
                                 })),
@@ -292,6 +304,14 @@ impl SuperGitApp {
                         target.remote,
                         target.remote_branch
                     );
+                    let push_tooltip = if disabled {
+                        "Wait for the running Git operation to finish".to_owned()
+                    } else {
+                        format!(
+                            "Upload this branch's commits to {}/{}",
+                            target.remote, target.remote_branch
+                        )
+                    };
                     let target = target.clone();
                     h_flex()
                         .gap_2()
@@ -311,6 +331,7 @@ impl SuperGitApp {
                                 .small()
                                 .primary()
                                 .disabled(disabled)
+                                .tooltip(push_tooltip)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.run_sync(Sync::Push(target.clone()), cx)
                                 })),
@@ -416,6 +437,7 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(dialog.running || dialog.load.is_some())
+                                    .tooltip("Check the branch and its remotes again")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.refresh_sync_preview(cx)),
                                     ),
@@ -426,6 +448,11 @@ impl SuperGitApp {
                                     .small()
                                     .outline()
                                     .disabled(dialog.running)
+                                    .tooltip(if dialog.running {
+                                        "Wait for the Git operation to finish"
+                                    } else {
+                                        "Back to the review (Esc)"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_sync_dialog(window, cx)
                                     })),

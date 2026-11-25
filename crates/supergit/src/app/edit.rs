@@ -14,6 +14,19 @@ pub(super) struct GitEditor {
     squash_message: Option<Entity<TextareaState>>,
 }
 
+/// Why a Git edit is off while another operation runs.
+const WAIT: &str = "Wait for the running Git operation to finish";
+
+/// A squash the selected commit offers (see `squash_offer`).
+struct SquashOffer {
+    /// (worktree, branch, head, commits): what the form squashes.
+    target: (PathBuf, String, String, usize),
+    /// The oldest commit's subject: the form's first message.
+    message: String,
+    /// Some of the commits may already be on the upstream branch.
+    published: bool,
+}
+
 impl SuperGitApp {
     /// The header's actions on the worktree's branch: fetch, pull, push,
     /// rebase, and for a linked worktree, delete.
@@ -217,6 +230,7 @@ impl SuperGitApp {
                     .small()
                     .ghost()
                     .selected(!self.git_editor.staging)
+                    .tooltip("Read the diff of this worktree's changes")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.git_editor.staging = false;
                         cx.notify();
@@ -228,6 +242,7 @@ impl SuperGitApp {
                     .small()
                     .ghost()
                     .selected(self.git_editor.staging)
+                    .tooltip("Pick files and hunks for the next commit and write its message")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.git_editor.staging = true;
                         this.refresh_index_hunks(cx);
@@ -311,7 +326,7 @@ impl SuperGitApp {
                 .tooltip(if amend {
                     "Replace HEAD with the staged changes. Leave the message blank to keep it"
                 } else {
-                    "Commit staged changes"
+                    "Record the staged changes as a new commit"
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let message = input.read(cx).value().trim().to_string();
@@ -531,6 +546,13 @@ impl SuperGitApp {
                                 .label(label)
                                 .small()
                                 .disabled(blocked)
+                                .tooltip(if blocked {
+                                    WAIT
+                                } else if edit == IndexEdit::Stage {
+                                    "Add these lines to the next commit"
+                                } else {
+                                    "Take these lines out of the next commit"
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let (path, patch) = (path.clone(), patch.clone());
                                     this.run_worktree_edit(
@@ -563,21 +585,16 @@ impl SuperGitApp {
         .into_any_element()
     }
 
-    pub(super) fn render_squash(&self, commits: &[Commit], cx: &mut Context<Self>) -> AnyElement {
-        let Some(status) = self
-            .selected_info()
-            .and_then(|info| info.status.as_ref().ok())
-        else {
-            return div().into_any_element();
-        };
-        let (Some(path), Some(branch), Some(head), Some(selected)) = (
-            &self.selected,
-            &status.branch,
-            &status.head_oid,
-            &self.selected_commit,
-        ) else {
-            return div().into_any_element();
-        };
+    /// The squash the selected commit offers: it and every later commit up
+    /// to HEAD, two or more, with no merge among them.
+    fn squash_offer(&self, commits: &[Commit]) -> Option<SquashOffer> {
+        let status = self.selected_info()?.status.as_ref().ok()?;
+        let (path, branch, head, selected) = (
+            self.selected.as_ref()?,
+            status.branch.as_ref()?,
+            status.head_oid.as_ref()?,
+            self.selected_commit.as_ref()?,
+        );
         let by_sha: HashMap<_, _> = commits
             .iter()
             .map(|commit| (commit.sha.as_str(), commit))
@@ -585,107 +602,120 @@ impl SuperGitApp {
         let mut next = head.as_str();
         let mut count = 0;
         let oldest = loop {
-            let Some(commit) = by_sha.get(next) else {
-                return div().into_any_element();
-            };
+            let commit = by_sha.get(next)?;
             if commit.parents.len() > 1 {
-                return div().into_any_element();
+                return None;
             }
             count += 1;
             if &commit.sha == selected {
                 break commit;
             }
-            let Some(parent) = commit.parents.first() else {
-                return div().into_any_element();
-            };
-            next = parent;
+            next = commit.parents.first()?;
         };
-        if count < 2 {
+        (count >= 2).then(|| SquashOffer {
+            target: (path.clone(), branch.clone(), head.clone(), count),
+            message: oldest.subject.clone(),
+            published: status.upstream.is_some()
+                && usize::try_from(status.ahead).is_ok_and(|ahead| ahead < count),
+        })
+    }
+
+    /// In the selected commit's card, beside Cherry-pick: opens the squash
+    /// form. At the row's end, so the buttons before it stay put.
+    pub(super) fn squash_button(&self, cx: &mut Context<Self>) -> Option<Button> {
+        let offer = self.squash_offer(self.history.commits.value()?)?;
+        let count = offer.target.3;
+        Some(
+            Button::new("preview-squash")
+                .label(format!("Squash {count} commits"))
+                .xsmall()
+                .ghost()
+                .tooltip("Combine this commit and the later ones into one, after a preview")
+                .disabled(self.git_operation_running())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.git_editor.squash_target = Some(offer.target.clone());
+                    let input = cx.new(|cx| {
+                        TextareaState::new(window, cx)
+                            .auto_grow(2, 5)
+                            .default_value(offer.message.clone())
+                            .placeholder("Squash commit message")
+                    });
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                    this.git_editor.squash_message = Some(input);
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// The squash form, above the commit once its button opened it.
+    pub(super) fn render_squash(&self, commits: &[Commit], cx: &mut Context<Self>) -> AnyElement {
+        let Some(offer) = self.squash_offer(commits) else {
             return div().into_any_element();
-        }
-        let (path, branch, head) = (path.clone(), branch.clone(), head.clone());
-        let candidate = (path.clone(), branch.clone(), head.clone(), count);
-        let published = status.upstream.is_some()
-            && usize::try_from(status.ahead).is_ok_and(|ahead| ahead < count);
+        };
+        let Some(input) = self
+            .git_editor
+            .squash_message
+            .clone()
+            .filter(|_| self.git_editor.squash_target.as_ref() == Some(&offer.target))
+        else {
+            return div().into_any_element();
+        };
+        let (path, branch, head, count) = offer.target.clone();
         let theme = cx.theme().clone();
-        if let Some(input) = self.git_editor.squash_message.as_ref()
-            && self.git_editor.squash_target.as_ref() == Some(&candidate)
-        {
-            let input = input.clone();
-            return v_flex()
-                .p_2()
-                .gap_2()
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .child(div().text_sm().child(format!(
-                    "Replace the latest {count} commits on {branch} with one commit."
-                )))
-                .when(published, |panel| {
-                    panel.child(div().text_xs().text_color(theme.warning).child(
-                        "This range includes commits that may already be on the upstream branch.",
-                    ))
-                })
-                .child(Textarea::new(&input))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("cancel-squash")
-                                .label("Cancel")
-                                .small()
-                                .ghost()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.git_editor.squash_target = None;
-                                    this.git_editor.squash_message = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("confirm-squash")
-                                .label(format!("Squash {count} commits"))
-                                .small()
-                                .primary()
-                                .disabled(self.action_task.is_some())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let message = input.read(cx).value().trim().to_string();
-                                    let (branch, head) = (branch.clone(), head.clone());
-                                    this.run_worktree_edit(
-                                        path.clone(),
-                                        "Squash",
-                                        None,
-                                        move |path| {
-                                            sg_git::squash(path, &branch, &head, count, &message)
-                                        },
-                                        cx,
-                                    );
-                                })),
-                        ),
-                )
-                .into_any_element();
-        }
-        let message = oldest.subject.clone();
-        h_flex()
-            .px_2()
-            .py_1()
+        v_flex()
+            .p_2()
+            .gap_2()
             .border_b_1()
-            .border_color(cx.theme().border)
+            .border_color(theme.border)
+            .child(div().text_sm().child(format!(
+                "Replace the latest {count} commits on {branch} with one commit."
+            )))
+            .when(offer.published, |panel| {
+                panel.child(div().text_xs().text_color(theme.warning).child(
+                    "This range includes commits that may already be on the upstream branch.",
+                ))
+            })
+            .child(Textarea::new(&input))
             .child(
-                Button::new("preview-squash")
-                    .label(format!("Squash last {count} commits"))
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.git_editor.squash_target = Some(candidate.clone());
-                        let input = cx.new(|cx| {
-                            TextareaState::new(window, cx)
-                                .auto_grow(2, 5)
-                                .default_value(message.clone())
-                                .placeholder("Squash commit message")
-                        });
-                        input.update(cx, |input, cx| input.focus(window, cx));
-                        this.git_editor.squash_message = Some(input);
-                        cx.notify();
-                    })),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("cancel-squash")
+                            .label("Cancel")
+                            .small()
+                            .ghost()
+                            .tooltip("Keep the commits as they are")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.git_editor.squash_target = None;
+                                this.git_editor.squash_message = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-squash")
+                            .label(format!("Squash {count} commits"))
+                            .small()
+                            .primary()
+                            .disabled(self.action_task.is_some())
+                            .tooltip(if self.action_task.is_some() {
+                                WAIT
+                            } else {
+                                "Replace them with one commit that has the message above"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let message = input.read(cx).value().trim().to_string();
+                                let (branch, head) = (branch.clone(), head.clone());
+                                this.run_worktree_edit(
+                                    path.clone(),
+                                    "Squash",
+                                    None,
+                                    move |path| {
+                                        sg_git::squash(path, &branch, &head, count, &message)
+                                    },
+                                    cx,
+                                );
+                            })),
+                    ),
             )
             .into_any_element()
     }

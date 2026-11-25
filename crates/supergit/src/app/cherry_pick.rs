@@ -177,6 +177,11 @@ impl SuperGitApp {
                     .small()
                     .primary()
                     .disabled(busy)
+                    .tooltip(if busy {
+                        "Wait for the running Git operation to finish"
+                    } else {
+                        "Copy this commit's changes onto the current branch as a new commit"
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.run_cherry_pick_action(CherryPickAction::Start, cx)
                     })),
@@ -190,6 +195,7 @@ impl SuperGitApp {
                         .small()
                         .ghost()
                         .disabled(busy)
+                        .tooltip("Close this dialog and open the Changes tab")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.close_cherry_pick(window, cx);
                             this.tab = MainTab::Changes;
@@ -204,11 +210,16 @@ impl SuperGitApp {
                                 .label(if dialog.abort_confirm {
                                     "Confirm abort"
                                 } else {
-                                    "Abort…"
+                                    "Abort"
                                 })
                                 .small()
                                 .danger()
                                 .disabled(busy)
+                                .tooltip(if dialog.abort_confirm {
+                                    "Discard the resolution so far and return to the branch tip"
+                                } else {
+                                    "Stop this cherry-pick, after a confirmation"
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if this
                                         .cherry_pick
@@ -344,6 +355,7 @@ impl SuperGitApp {
                                     .small()
                                     .ghost()
                                     .disabled(dialog.running || dialog.loading.is_some())
+                                    .tooltip("Check the worktree's cherry-pick state again")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.load_cherry_pick(cx)),
                                     ),
@@ -354,6 +366,11 @@ impl SuperGitApp {
                                     .small()
                                     .outline()
                                     .disabled(dialog.running)
+                                    .tooltip(if dialog.running {
+                                        "Wait for the cherry-pick to finish"
+                                    } else {
+                                        "Back to the review (Esc)"
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_cherry_pick(window, cx)
                                     })),

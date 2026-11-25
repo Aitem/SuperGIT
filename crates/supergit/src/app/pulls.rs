@@ -1819,6 +1819,9 @@ impl SuperGitApp {
                             .label("Show all pull requests")
                             .small()
                             .outline()
+                            .tooltip(
+                                "Switch to the repository's open and recently merged pull requests",
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_pr_scope(path.clone(), true, cx)
                             })),
@@ -2083,6 +2086,7 @@ impl SuperGitApp {
                         .label("Retry")
                         .small()
                         .ghost()
+                        .tooltip("Load this pull request's commits from GitHub again")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.pulls.commits.remove(&key);
                             this.ensure_pulls(cx);
@@ -2152,6 +2156,7 @@ impl SuperGitApp {
                                 .label("Retry")
                                 .small()
                                 .ghost()
+                                .tooltip("Load this pull request's diff again")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.retry_pr_patch(number, cx)
                                 })),
@@ -2161,6 +2166,7 @@ impl SuperGitApp {
                                 .label("Open files on GitHub")
                                 .small()
                                 .ghost()
+                                .tooltip("See the changed files in your browser")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let r = launch::open_url(&format!("{url}/files"));
                                     this.report(r, "Opened in browser", cx);
@@ -2362,6 +2368,7 @@ impl SuperGitApp {
                             .label("Open on GitHub")
                             .xsmall()
                             .outline()
+                            .tooltip("See this pull request in your browser")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let r = launch::open_url(&url);
                                 this.report(r, "Opened in browser", cx);
@@ -2372,6 +2379,7 @@ impl SuperGitApp {
                             .label("Copy URL")
                             .xsmall()
                             .ghost()
+                            .tooltip("Put this pull request's GitHub link on the clipboard")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
                                 this.flash("Copied pull request URL", false, cx);
@@ -2384,7 +2392,7 @@ impl SuperGitApp {
                                 .label(if exists {
                                     "Go to worktree"
                                 } else if can_review_fork {
-                                    "Review in worktree…"
+                                    "Review in worktree"
                                 } else {
                                     "Check out as worktree"
                                 })
@@ -2516,6 +2524,11 @@ impl SuperGitApp {
                                 .xsmall()
                                 .ghost()
                                 .disabled(busy)
+                                .tooltip(if busy {
+                                    "Another merge request to GitHub is still running"
+                                } else {
+                                    "Stop GitHub from merging this pull request on its own"
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.disable_auto_merge(number, cx)
                                 })),
@@ -2525,7 +2538,7 @@ impl SuperGitApp {
             .child(
                 h_flex().pt_1().gap_2().child(
                     Button::new("pr-merge")
-                        .label(if busy { "Merging…" } else { "Merge…" })
+                        .label(if busy { "Merging…" } else { "Merge" })
                         .small()
                         .when(status.can_merge(), |b| b.primary())
                         .when(!status.can_merge(), |b| b.outline())
@@ -2628,6 +2641,11 @@ impl SuperGitApp {
                                 })
                                 .xsmall()
                                 .ghost()
+                                .tooltip(if open.is_some() {
+                                    "Collapse this check's summary, failed steps and annotations"
+                                } else {
+                                    "Show this check's summary, failed steps and annotations here"
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_check_inspection(&id, cx);
                                 })),
@@ -2639,7 +2657,7 @@ impl SuperGitApp {
                                 .label("GitHub")
                                 .xsmall()
                                 .ghost()
-                                .tooltip(url.clone())
+                                .tooltip("See this check's run in your browser")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let r = launch::open_url(&url);
                                     this.report(r, "Opened in browser", cx);
@@ -2685,6 +2703,11 @@ impl SuperGitApp {
                                     })
                                     .xsmall()
                                     .ghost()
+                                    .tooltip(if show_passed {
+                                        "List only failed and pending checks"
+                                    } else {
+                                        "List passed and skipped checks too"
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pulls.show_passed_checks =
                                             !this.pulls.show_passed_checks;
@@ -2872,6 +2895,7 @@ impl SuperGitApp {
                                 .label("View in diff")
                                 .xsmall()
                                 .ghost()
+                                .tooltip("Show this thread at its line in the Files tab")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.jump_to_thread(number, &thread, cx);
@@ -2984,6 +3008,18 @@ impl SuperGitApp {
         if let Some(error) = &dialog.error {
             lines.push(note(error.clone(), theme.danger).into_any_element());
         }
+        let auto_tooltip = if running {
+            "Waiting for GitHub to finish the merge"
+        } else {
+            "Let GitHub merge once the required reviews and checks pass"
+        };
+        let confirm_tooltip = if running {
+            "Waiting for GitHub to finish the merge".to_string()
+        } else if !can_merge {
+            status.describe().to_string()
+        } else {
+            format!("Merge #{} into {} on GitHub now", pr.number, pr.base_branch)
+        };
         div()
             .absolute()
             .inset_0()
@@ -3033,6 +3069,13 @@ impl SuperGitApp {
                                     .outline()
                                     .label(format!("{} ▾", method.label()))
                                     .disabled(running || methods.len() < 2)
+                                    .tooltip(if running {
+                                        "Waiting for GitHub to finish the merge"
+                                    } else if methods.len() < 2 {
+                                        "The repository allows only this merge method"
+                                    } else {
+                                        "Pick how GitHub merges the pull request"
+                                    })
                                     .dropdown_menu(move |mut menu, _, _| {
                                         for &choice in &methods {
                                             let owner = owner.clone();
@@ -3060,6 +3103,7 @@ impl SuperGitApp {
                                     .label("Cancel")
                                     .small()
                                     .ghost()
+                                    .tooltip("Close without merging (Esc)")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_merge_dialog(window, cx)
                                     })),
@@ -3071,6 +3115,7 @@ impl SuperGitApp {
                                         .small()
                                         .outline()
                                         .disabled(running)
+                                        .tooltip(auto_tooltip)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.confirm_merge(true, window, cx)
                                         })),
@@ -3086,6 +3131,7 @@ impl SuperGitApp {
                                     .small()
                                     .primary()
                                     .disabled(running || !can_merge)
+                                    .tooltip(confirm_tooltip)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.confirm_merge(false, window, cx)
                                     })),

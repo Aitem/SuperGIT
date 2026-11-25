@@ -265,6 +265,11 @@ impl SuperGitApp {
                     .xsmall()
                     .ghost()
                     .disabled(!fresh)
+                    .tooltip(if fresh {
+                        "Write an answer to this review thread"
+                    } else {
+                        "Wait for the pull request's details to load"
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_thread_reply(reply_target.clone(), window, cx)
                     })),
@@ -286,6 +291,17 @@ impl SuperGitApp {
                     .xsmall()
                     .ghost()
                     .disabled(!fresh || busy)
+                    .tooltip(if resolving {
+                        "Waiting for GitHub to confirm"
+                    } else if !fresh {
+                        "Wait for the pull request's details to load"
+                    } else if busy {
+                        "Another reply or resolve is still in progress"
+                    } else if resolve {
+                        "Mark this thread done on GitHub"
+                    } else {
+                        "Mark this thread unresolved on GitHub"
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.update_review_thread(
                             resolve_target.clone(),
@@ -316,6 +332,11 @@ impl SuperGitApp {
                                     .xsmall()
                                     .ghost()
                                     .disabled(sending)
+                                    .tooltip(if sending {
+                                        "Wait until the reply is sent"
+                                    } else {
+                                        "Discard this reply draft"
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.pulls.thread_actions.drafts.remove(&cancel_target);
                                         this.pulls.thread_actions.errors.remove(&cancel_target);
@@ -333,6 +354,19 @@ impl SuperGitApp {
                                             || empty
                                             || !thread.permissions.viewer_can_reply,
                                     )
+                                    .tooltip(if sending {
+                                        "Sending the reply to GitHub"
+                                    } else if !fresh {
+                                        "Wait for the pull request's details to load"
+                                    } else if busy {
+                                        "Another reply or resolve is still in progress"
+                                    } else if !thread.permissions.viewer_can_reply {
+                                        "GitHub does not let you reply to this thread"
+                                    } else if empty {
+                                        "Write the reply first"
+                                    } else {
+                                        "Post it to this review thread on GitHub"
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.send_thread_reply(target.clone(), cx)
                                     })),

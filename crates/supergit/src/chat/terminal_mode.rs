@@ -469,6 +469,10 @@ impl ChatSession {
                     .label(agent.label())
                     .w(px(NEW_SESSION_WIDTH / 2.))
                     .selected(agent == provider)
+                    .tooltip(match agent {
+                        Provider::Claude => "Use Anthropic's Claude Code in this conversation",
+                        Provider::Codex => "Use OpenAI's Codex in this conversation",
+                    })
             }))
             .on_click(cx.listener(|this, clicked: &Vec<usize>, window, cx| {
                 if let Some(&agent) = clicked.first().and_then(|&ix| Provider::ALL.get(ix)) {
@@ -507,12 +511,22 @@ impl ChatSession {
     /// Start (or Resume): the one thing to do on a new conversation's
     /// screen, in either view, as wide as the choices above it.
     pub(super) fn render_start(&self, label: &'static str, cx: &mut Context<Self>) -> Button {
+        let tooltip = if self.git_busy {
+            "Wait for the Git operation on this worktree to finish"
+        } else if !self.is_terminal() {
+            "Open the chat to type the first message"
+        } else if self.convo.session_id.is_some() && self.has_history() {
+            "Reopen this session in the agent's terminal UI"
+        } else {
+            "Launch the agent's terminal UI in this worktree"
+        };
         Button::new("start")
             .label(label)
             .large()
             .w(px(NEW_SESSION_WIDTH))
             .primary()
             .disabled(self.git_busy)
+            .tooltip(tooltip)
             .on_click(cx.listener(|this, _, window, cx| this.start(window, cx)))
     }
 
@@ -641,6 +655,13 @@ impl ChatSession {
                                 })
                                 .xsmall()
                                 .disabled(self.git_busy)
+                                .tooltip(if self.git_busy {
+                                    "Wait for the Git operation on this worktree to finish"
+                                } else if self.has_history() {
+                                    "Reopen this session in the agent's terminal UI"
+                                } else {
+                                    "Launch the agent's terminal UI again, in a new session"
+                                })
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.start_terminal(window, cx);
                                 })),

@@ -383,6 +383,7 @@ impl SuperGitApp {
                                         .small()
                                         .ghost()
                                         .disabled(dialog.running)
+                                        .tooltip("Dismiss without publishing anything")
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.close_publish_dialog(window, cx)
                                         })),
@@ -424,17 +425,22 @@ impl SuperGitApp {
                 .child("The remote base is outside the local history. Fetch it to preview the commit list.")
                 .into_any_element(),
         };
-        let disabled = dialog.running
-            || dialog.title.read(cx).value().trim().is_empty()
-            || preview
-                .commits
-                .as_ref()
-                .is_some_and(|(count, _)| *count == 0);
+        let untitled = dialog.title.read(cx).value().trim().is_empty();
+        let no_commits = preview
+            .commits
+            .as_ref()
+            .is_some_and(|(count, _)| *count == 0);
+        let disabled = dialog.running || untitled || no_commits;
         let cancel = Button::new("cancel-publish-pr")
             .label("Cancel")
             .small()
             .ghost()
             .disabled(dialog.running)
+            .tooltip(if dialog.running {
+                "Wait until publishing finishes"
+            } else {
+                "Close without publishing (Esc)"
+            })
             .on_click(cx.listener(|this, _, window, cx| this.close_publish_dialog(window, cx)));
         let confirm = Button::new("confirm-publish-pr")
             .label(if dialog.running {
@@ -445,6 +451,15 @@ impl SuperGitApp {
             .small()
             .primary()
             .disabled(disabled)
+            .tooltip(if dialog.running {
+                "Pushing the branch and creating the draft on GitHub".to_string()
+            } else if untitled {
+                "Give the pull request a title first".to_string()
+            } else if no_commits {
+                format!("The branch has no commits ahead of {base}")
+            } else {
+                format!("Push to {remote}/{branch}, then open a draft into {base}")
+            })
             .on_click(cx.listener(|this, _, window, cx| this.confirm_publish_dialog(window, cx)));
         v_flex()
             .gap_3()
@@ -510,6 +525,7 @@ impl SuperGitApp {
                             .label("Done")
                             .small()
                             .ghost()
+                            .tooltip("Close this dialog")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_publish_dialog(window, cx)
                             })),
@@ -519,6 +535,7 @@ impl SuperGitApp {
                             .label("Open on GitHub")
                             .small()
                             .outline()
+                            .tooltip("See the pull request in your browser")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.report(launch::open_url(&url), "Opened on GitHub", cx)
                             })),
@@ -529,6 +546,7 @@ impl SuperGitApp {
                                 .label("Show in SuperGIT")
                                 .small()
                                 .primary()
+                                .tooltip("Close this dialog and select the pull request here")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.show_published_pr(window, cx)
                                 })),

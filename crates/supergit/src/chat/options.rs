@@ -165,11 +165,13 @@ impl ChatSession {
             active_effort.map(|effort| div().text_color(theme.muted_foreground).child(effort)),
         );
         chevron_trigger("chat-model", busy, &theme, parts)
-            .tooltip(
+            .tooltip(if busy {
+                "The model can change once this turn ends".to_string()
+            } else {
                 failure
                     .clone()
-                    .unwrap_or_else(|| "Model and effort for the next turn".to_string()),
-            )
+                    .unwrap_or_else(|| "Model and effort for the next turn".to_string())
+            })
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
                 menu = menu.label("Model");
                 if loading {

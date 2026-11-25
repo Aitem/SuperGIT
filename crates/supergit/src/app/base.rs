@@ -539,6 +539,20 @@ impl SuperGitApp {
                 note(format!("Cannot rebase now: {reason}."), theme.danger).into_any_element(),
             );
         }
+        let confirm_tooltip = match (&blocker, &dialog.plan) {
+            (Some(reason), _) => format!("Cannot rebase now: {reason}"),
+            (None, LoadState::Loading) => format!("Wait for the comparison with {onto}"),
+            (None, LoadState::Failed { .. }) => "The comparison failed: see above".to_string(),
+            (None, LoadState::Ready(plan)) if plan.is_up_to_date() => {
+                format!("{branch} already contains {onto}")
+            }
+            (None, LoadState::Ready(plan)) if plan.replayed == 0 => {
+                format!("Move {branch} to {onto}")
+            }
+            (None, LoadState::Ready(_)) => {
+                format!("Replay {branch}'s own commits on top of {onto}")
+            }
+        };
         let owner = cx.entity();
         let suggested = dialog.suggested.clone();
         let others = dialog.others.clone();
@@ -641,16 +655,20 @@ impl SuperGitApp {
                                     .label("Cancel")
                                     .small()
                                     .ghost()
+                                    .tooltip("Close without rebasing (Esc)")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_rebase_dialog(window, cx)
                                     })),
                             )
                             .child(
+                                // The target shows in the Onto picker: a long
+                                // branch name must not widen the button.
                                 Button::new("confirm-rebase")
-                                    .label(format!("Rebase onto {onto}"))
+                                    .label("Rebase")
                                     .small()
                                     .primary()
                                     .disabled(!ready || blocker.is_some())
+                                    .tooltip(confirm_tooltip)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.confirm_rebase(window, cx)
                                     })),
