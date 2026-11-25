@@ -74,6 +74,7 @@ actions!(
         ToggleClaude,
         ToggleSidebar,
         ToggleTerminal,
+        ToggleHistory,
         NewClaudeChat,
         OpenSwitcher,
         CloseSwitcher,
@@ -187,13 +188,6 @@ struct Switcher {
     selected: usize,
     scroll: ScrollHandle,
 }
-
-const TABS: [MainTab; 4] = [
-    MainTab::History,
-    MainTab::Changes,
-    MainTab::Sessions,
-    MainTab::PullRequests,
-];
 
 pub struct SuperGitApp {
     worktree_dialog: Option<issue_worktree::WorktreeDialog>,
@@ -2037,7 +2031,8 @@ impl SuperGitApp {
     }
 
     fn load_history(&mut self, limit: usize, cx: &mut Context<Self>) {
-        if self.tab != MainTab::History || self.history_task.is_some() {
+        let shown = self.tab == MainTab::History || self.repository_view().history_open;
+        if !shown || self.history_task.is_some() {
             return;
         }
         let Some(path) = self.selected.clone() else {
@@ -3092,34 +3087,15 @@ impl SuperGitApp {
                 .into_any_element();
         };
 
-        let tab_ix = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
-        let changes = if self.comparison_base().is_some() {
-            self.details
-                .files
-                .value()
-                .map(|files| files.len().to_string())
-                .unwrap_or_else(|| "—".into())
-        } else {
-            info.status
-                .as_ref()
-                .map(|status| status.files.len().to_string())
-                .unwrap_or_else(|_| "—".into())
-        };
-        let sessions = info.sessions.len();
-        // Commits since the branch forked from main; none on main itself.
-        let history = match &self.history.fork {
-            Some(fork) if self.tab == MainTab::History => {
-                format!("History · {}", fork.commits)
-            }
-            _ => "History".to_string(),
-        };
-        let open_prs = self
-            .prs
-            .iter()
-            .filter(|p| matches!(p.state, PrState::Open | PrState::Draft))
-            .count();
-
         let (_, main_width) = self.pane_widths(window, cx);
+        // The commit tree takes the left of the review when it is shown.
+        let history_open = self.repository_view().history_open;
+        let tree_width = self.history_tree_width(main_width, cx);
+        let pane_width = if history_open {
+            main_width - tree_width
+        } else {
+            main_width
+        };
         let content = match self.tab {
             MainTab::Changes => {
                 #[cfg(feature = "screenshot")]
@@ -3135,7 +3111,7 @@ impl SuperGitApp {
                             div()
                                 .flex_1()
                                 .min_h_0()
-                                .child(self.render_changes(&info, main_width, &theme, cx)),
+                                .child(self.render_changes(&info, pane_width, &theme, cx)),
                         )
                         .into_any_element()
                 };
@@ -3145,44 +3121,154 @@ impl SuperGitApp {
                     .child(div().flex_1().min_h_0().child(body))
                     .into_any_element()
             }
-            MainTab::History => self
-                .render_history(main_width, &theme, cx)
-                .into_any_element(),
+            MainTab::History => self.render_commit_view(pane_width, cx),
             MainTab::Sessions => self.render_sessions(&info, &theme, cx).into_any_element(),
             MainTab::PullRequests => {
                 self.ensure_pulls(cx);
-                self.render_pulls(&info, main_width, cx)
+                self.render_pulls(&info, pane_width, cx)
             }
         };
-        let _ = window;
-
         let header = self
             .render_header(&info, window_buttons, &theme, cx)
             .into_any_element();
         let header = self.window_drag_area(header, cx);
+        let pane = v_flex()
+            .size_full()
+            .min_w_0()
+            .child(self.render_review_tabs(&info, &theme, cx))
+            .child(div().flex_1().min_h_0().child(content));
+        let body = if history_open {
+            let max = history_tree_max(main_width);
+            h_resizable("history-layout")
+                .with_state(&self.history_layout)
+                .on_resize(cx.listener(|this, state, _, cx| {
+                    this.remember_layout(LayoutPanel::History, state, cx)
+                }))
+                .child(
+                    resizable_panel()
+                        .size(px(self.repository_view().history_width.min(max)))
+                        .size_range(px(160.)..px(max))
+                        .fixed()
+                        .child(self.render_history_tree(tree_width, &theme, cx)),
+                )
+                .child(
+                    resizable_panel()
+                        .size_range(px(180.)..Pixels::MAX)
+                        .child(elastic(pane)),
+                )
+                .into_any_element()
+        } else {
+            pane.into_any_element()
+        };
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .child(header)
-            .child(
-                TabBar::new("main-tabs")
-                    .underline()
-                    .px_2()
-                    .selected_index(tab_ix)
-                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                        this.tab = TABS[*ix];
-                        this.reload_history(cx);
-                        this.queue_persist(cx);
-                        cx.notify();
-                    }))
-                    .child(Tab::new().label(history))
-                    .child(Tab::new().label(format!("Changes · {changes}")))
-                    .child(Tab::new().label(format!("Agents · {sessions}")))
-                    .child(Tab::new().label(format!("Pull requests · {open_prs}"))),
-            )
-            .child(div().flex_1().min_h_0().child(content))
+            .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+
+    /// Above the review pane, as tall as the tree's search bar: History
+    /// shows or hides the commit tree; Changes, Agents and Pull requests
+    /// pick what the pane shows (a commit picked in the tree shows there
+    /// too).
+    fn render_review_tabs(
+        &self,
+        info: &WorktreeInfo,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let changes = if self.comparison_base().is_some() {
+            self.details
+                .files
+                .value()
+                .map(|files| files.len().to_string())
+                .unwrap_or_else(|| "—".into())
+        } else {
+            info.status
+                .as_ref()
+                .map(|status| status.files.len().to_string())
+                .unwrap_or_else(|_| "—".into())
+        };
+        let open_prs = self
+            .prs
+            .iter()
+            .filter(|p| matches!(p.state, PrState::Open | PrState::Draft))
+            .count();
+        // Commits since the branch forked from main; none on main itself.
+        let history = match &self.history.fork {
+            Some(fork) => format!("History · {}", fork.commits),
+            None => "History".to_string(),
+        };
+        let tabs = [
+            (
+                MainTab::Changes,
+                "review-changes",
+                format!("Changes · {changes}"),
+                "Uncommitted changes in this worktree",
+            ),
+            (
+                MainTab::Sessions,
+                "review-agents",
+                format!("Agents · {}", info.sessions.len()),
+                "Agent sessions that ran in this worktree",
+            ),
+            (
+                MainTab::PullRequests,
+                "review-pulls",
+                format!("Pull requests · {open_prs}"),
+                "The repository's pull requests",
+            ),
+        ]
+        .map(|(tab, id, label, tooltip)| {
+            Button::new(id)
+                .label(label)
+                .small()
+                .ghost()
+                .selected(self.tab == tab)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+        });
+        toolbar(theme)
+            .gap_1()
+            .child(
+                Button::new("toggle-history")
+                    .icon(IconName::PanelLeft)
+                    .label(history)
+                    .small()
+                    .ghost()
+                    .selected(self.repository_view().history_open)
+                    .tooltip(format!("Show or hide the commit tree ({MOD}-h)"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_history(&ToggleHistory, window, cx)
+                    })),
+            )
+            .child(div().flex_none().w_px().h(px(16.)).mx_1().bg(theme.border))
+            .children(tabs)
+    }
+
+    fn set_tab(&mut self, tab: MainTab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.reload_history(cx);
+            self.queue_persist(cx);
+            cx.notify();
+        }
+    }
+
+    /// Shows or hides the commit tree beside the review (`cmd-h`).
+    fn toggle_history(&mut self, _: &ToggleHistory, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = &self.repo else { return };
+        let view = self
+            .persisted
+            .repositories
+            .entry(repo.root.clone())
+            .or_default();
+        view.history_open = !view.history_open;
+        self.reload_history(cx);
+        self.queue_persist(cx);
+        cx.notify();
     }
 
     /// The worktree's header. `window_buttons`: they sit at its start
@@ -4446,22 +4532,79 @@ impl SuperGitApp {
         })
     }
 
-    fn render_history(
+    /// The commit tree's width: the split's first panel, within its range.
+    fn history_tree_width(&self, width: f32, cx: &App) -> f32 {
+        self.history_layout
+            .read(cx)
+            .sizes()
+            .first()
+            .map(|w| w.as_f32())
+            .unwrap_or(self.repository_view().history_width)
+            .min(history_tree_max(width))
+    }
+
+    /// The commit tree beside the review (`cmd-h`): the search and scope
+    /// bar, then the graph. `width` is the column's.
+    fn render_history_tree(
         &self,
         width: f32,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let error = self
             .load_error
             .as_deref()
             .or_else(|| self.history.commits.error());
-        let Some(commits) = self.history.commits.value() else {
-            return if let Some(error) = error {
-                self.render_data_notice("History unavailable", Some(error), false, cx)
-            } else {
-                self.render_data_notice("Loading history…", None, false, cx)
-            };
+        let commits = self.history.commits.value();
+        let terms = model::history::search_terms(&self.history_search.read(cx).value());
+        let searching = !terms.is_empty();
+        let matches = commits
+            .map(|commits| {
+                commits
+                    .iter()
+                    .filter(|commit| model::history::matches_commit(commit, &terms))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let count = commits
+            .filter(|_| searching)
+            .map(|commits| format!("{} of {}", matches.len(), commits.len()));
+        let scope_buttons = self.history_scope_buttons(cx);
+        // No line of its own at the right: the resize handle draws it.
+        let bar = toolbar(theme)
+            .gap_1()
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.history_search)
+                        .small()
+                        .cleanable(true)
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .small()
+                                .text_color(theme.muted_foreground),
+                        )
+                        // In the field: the bar keeps its height.
+                        .when_some(count, |input, count| {
+                            input.suffix(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(count),
+                            )
+                        }),
+                ),
+            )
+            .children(scope_buttons);
+        let column = v_flex().size_full().min_w_0().child(bar);
+        let Some(commits) = commits else {
+            return column
+                .child(div().flex_1().min_h_0().child(if let Some(error) = error {
+                    self.render_data_notice("History unavailable", Some(error), false, cx)
+                } else {
+                    self.render_data_notice("Loading history…", None, false, cx)
+                }))
+                .into_any_element();
         };
         let notice = error.map(|error| {
             self.render_data_notice(
@@ -4472,8 +4615,7 @@ impl SuperGitApp {
             )
         });
         if commits.is_empty() {
-            return v_flex()
-                .size_full()
+            return column
                 .children(notice)
                 .child(
                     div()
@@ -4490,21 +4632,6 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
-        let commits_max = (width - 180.).clamp(160., 800.);
-        let commits_width = self
-            .history_layout
-            .read(cx)
-            .sizes()
-            .first()
-            .map(|w| w.as_f32())
-            .unwrap_or(self.repository_view().history_width)
-            .min(commits_max);
-        let terms = model::history::search_terms(&self.history_search.read(cx).value());
-        let searching = !terms.is_empty();
-        let matches = commits
-            .iter()
-            .filter(|commit| model::history::matches_commit(commit, &terms))
-            .collect::<Vec<_>>();
         let (graph, lanes) = if searching {
             (Vec::new(), 0)
         } else {
@@ -4517,13 +4644,12 @@ impl SuperGitApp {
         let lanes = lanes.clamp(1, GRAPH_MAX_LANES);
         let base = self.history_base();
         // Branch and tag badges get at most 40% of the commit list.
-        let badge_room = (commits_width * 0.4).max(60.);
+        let badge_room = (width * 0.4).max(60.);
         let fork = self.selected_fork();
         let fork_point = fork
             .and_then(|fork| fork.parent.as_ref())
             .map(|parent| parent.merge_base.clone());
         let matching_count = matches.len();
-        let scope_buttons = self.history_scope_buttons(cx);
         let mut graph = graph.into_iter();
         let rows = matches.into_iter().enumerate().map(|(ix, c)| {
             let selected = self.selected_commit.as_deref() == Some(c.sha.as_str());
@@ -4543,109 +4669,69 @@ impl SuperGitApp {
                 selected,
                 theme,
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.select_commit(sha.clone(), cx)))
-        });
-        let content = h_resizable("history-layout")
-            .with_state(&self.history_layout)
-            .on_resize(cx.listener(|this, state, _, cx| {
-                this.remember_layout(LayoutPanel::History, state, cx)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // A commit picked in the tree shows beside it.
+                this.set_tab(MainTab::History, cx);
+                this.select_commit(sha.clone(), cx)
             }))
+        });
+        column
+            .children(notice)
             .child(
-                resizable_panel()
-                    .size(px(self
-                        .repository_view()
-                        .history_width
-                        .min((width - 180.).clamp(160., 800.))))
-                    .size_range(px(160.)..px((width - 180.).clamp(160., 800.)))
-                    .fixed()
-                    .child(
-                        // No line of its own at the right: the resize
-                        // handle draws it.
-                        v_flex()
-                            .size_full()
-                            .min_w_0()
-                            .child(
-                                toolbar(theme)
-                                    .child(
-                                        div().flex_1().min_w_0().child(
-                                            Input::new(&self.history_search)
-                                                .small()
-                                                .cleanable(true)
-                                                .prefix(
-                                                    Icon::new(IconName::Search)
-                                                        .small()
-                                                        .text_color(theme.muted_foreground),
-                                                )
-                                                // In the field: the bar keeps its height.
-                                                .when(searching, |input| {
-                                                    input.suffix(
-                                                        div()
-                                                            .flex_none()
-                                                            .text_xs()
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(format!(
-                                                                "{matching_count} of {}",
-                                                                commits.len()
-                                                            )),
-                                                    )
-                                                }),
-                                        ),
-                                    )
-                                    .gap_1()
-                                    .children(scope_buttons),
-                            )
-                            .child(
-                                v_flex()
-                                    .id("commit-list")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .when(matching_count == 0, |el| {
-                                        el.child(
-                                            div()
-                                                .p_3()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child("No loaded commits match"),
-                                        )
-                                    })
-                                    .children(rows),
-                            )
-                            .when(self.history.has_more, |el| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .p_2()
-                                        .border_t_1()
-                                        .border_color(theme.border)
-                                        .child(
-                                            Button::new("load-older-commits")
-                                                .small()
-                                                .outline()
-                                                .label("Load older commits")
-                                                .disabled(self.history_task.is_some())
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.load_history(
-                                                        this.history.next_limit(),
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                )
-                            }),
-                    ),
+                v_flex()
+                    .id("commit-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(matching_count == 0, |el| {
+                        el.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("No loaded commits match"),
+                        )
+                    })
+                    .children(rows),
             )
-            .child(
-                resizable_panel()
-                    .size_range(px(180.)..Pixels::MAX)
-                    .child(elastic(self.render_commit_patch(width - commits_width, cx))),
-            );
+            .when(self.history.has_more, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(
+                            Button::new("load-older-commits")
+                                .small()
+                                .outline()
+                                .label("Load older commits")
+                                .tooltip("Read the next page of history")
+                                .disabled(self.history_task.is_some())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.load_history(this.history.next_limit(), cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The review pane in the History tab: the selected commit (with the
+    /// squash offer), `width` wide.
+    fn render_commit_view(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .size_full()
-            .children(notice)
-            .child(self.render_squash(commits, cx))
-            .child(div().flex_1().min_h_0().child(content))
+            .when_some(self.history.commits.value(), |el, commits| {
+                el.child(self.render_squash(commits, cx))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_commit_patch(width, cx)),
+            )
             .into_any_element()
     }
 
@@ -5494,6 +5580,7 @@ impl Render for SuperGitApp {
             .on_action(cx.listener(Self::toggle_claude))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::toggle_history))
             .on_action(cx.listener(Self::new_chat_action))
             .on_action(cx.listener(Self::update_creation_base))
             .on_action(cx.listener(Self::open_switcher))
@@ -5644,6 +5731,11 @@ const RAIL_WIDTH: f32 = 48.;
 /// filter, diff options): a small field with 8px around it, and the line
 /// under it. Side by side, their lines meet.
 const TOOLBAR_HEIGHT: f32 = 41.;
+
+/// The commit tree's widest: the review keeps at least 180px.
+fn history_tree_max(width: f32) -> f32 {
+    (width - 180.).clamp(160., 800.)
+}
 
 /// A bar above one of the review's columns, as tall as the others.
 fn toolbar(theme: &gpui_kit::component::Theme) -> Div {

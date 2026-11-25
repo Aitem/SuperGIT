@@ -109,6 +109,7 @@ fn bind_terminal_keys(cx: &mut App) {
         cx.bind_keys(
             [
                 "ctrl-c", "ctrl-v", "ctrl-r", "ctrl-o", "ctrl-l", "ctrl-b", "ctrl-n", "ctrl-p",
+                "ctrl-h",
             ]
             .map(|keys| KeyBinding::new(keys, NoAction {}, context)),
         );
@@ -207,6 +208,7 @@ fn main() -> Result<()> {
             KeyBinding::new(shortcut!("l"), app::ToggleClaude, None),
             KeyBinding::new(shortcut!("b"), app::ToggleSidebar, None),
             KeyBinding::new(shortcut!("j"), app::ToggleTerminal, None),
+            KeyBinding::new(shortcut!("h"), app::ToggleHistory, None),
             KeyBinding::new(shortcut!("n"), app::NewClaudeChat, None),
             KeyBinding::new(shortcut!("p"), app::OpenSwitcher, None),
             KeyBinding::new(shortcut!(","), app::OpenSettings, None),
@@ -363,6 +365,7 @@ pub(crate) fn set_app_menus(cx: &mut App) {
             MenuItem::action("Toggle Sidebar", app::ToggleSidebar),
             MenuItem::action("Toggle Agent Panel", app::ToggleClaude),
             MenuItem::action("Toggle Terminal", app::ToggleTerminal),
+            MenuItem::action("Toggle History", app::ToggleHistory),
             MenuItem::action("New Agent Conversation", app::NewClaudeChat),
             MenuItem::separator(),
             MenuItem::submenu(Menu::new("Appearance").items(appearance::menu_items(cx))),
