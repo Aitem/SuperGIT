@@ -21,6 +21,8 @@ pub mod install;
 pub mod process;
 mod questions;
 pub mod sessions;
+mod side_question;
+pub use side_question::ask_side_question;
 pub mod tools;
 mod usage;
 

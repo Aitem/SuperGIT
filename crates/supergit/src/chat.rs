@@ -44,6 +44,7 @@ use sg_codex::{CodexFold, CodexProcess, CollaborationMode, Policy};
 mod activity;
 mod look;
 mod questions;
+mod side_question;
 mod terminal_mode;
 mod timeline;
 
@@ -126,7 +127,7 @@ impl Backend {
 }
 
 fn placeholder(provider: Provider) -> String {
-    format!("Ask {}…", provider.label())
+    format!("Ask {}… or /btw for a side question", provider.label())
 }
 
 /// What a conversation tells the app.
@@ -146,6 +147,9 @@ pub struct ChatSession {
     worktree: PathBuf,
     attachments: Vec<Attachment>,
     context_preview: Option<usize>,
+    side: Option<side_question::SideQuestion>,
+    side_worker: Option<Task<()>>,
+    side_timeout: Option<Task<()>>,
     attention: Attention,
     permission_focus: FocusHandle,
     /// Where the agent runs (a resumed session must run where it started).
@@ -389,6 +393,9 @@ impl ChatSession {
             worktree,
             attachments: Vec::new(),
             context_preview: None,
+            side: None,
+            side_worker: None,
+            side_timeout: None,
             attention: Attention::default(),
             permission_focus: cx.focus_handle(),
             cwd,
@@ -478,6 +485,7 @@ impl ChatSession {
             !self.convo.status.is_busy(),
             "An agent is still running or waiting for approval"
         );
+        self.dismiss_side();
         self.reader = None;
         let process = self.backend.clear_process();
         if process.is_some() {
@@ -806,6 +814,9 @@ impl ChatSession {
     }
 
     fn on_event(&mut self, event: ProcessEvent, cx: &mut Context<Self>) {
+        if self.side_event(&event, cx) {
+            return;
+        }
         let before = self.convo.items.len();
         let was_busy = self.convo.status.is_busy();
         match event {
@@ -945,7 +956,9 @@ impl ChatSession {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty()
+            || side_question::question(&text).is_some_and(|q| self.side_unavailable(q).is_some())
+        {
             return;
         }
         if let Some(error) = self
@@ -953,8 +966,16 @@ impl ChatSession {
             .iter()
             .find_map(|item| item.validate_destination(&self.worktree, &self.cwd).err())
         {
-            self.convo.push_notice(error.to_string(), true);
-            self.items_changed(self.convo.items.len().saturating_sub(1), cx);
+            if let Some(question) = side_question::question(&text) {
+                self.side = Some(side_question::SideQuestion::failed(
+                    question,
+                    error.to_string(),
+                ));
+                cx.notify();
+            } else {
+                self.convo.push_notice(error.to_string(), true);
+                self.items_changed(self.convo.items.len().saturating_sub(1), cx);
+            }
             return;
         }
         let contexts = self
@@ -984,6 +1005,9 @@ impl ChatSession {
         if self.is_terminal() {
             self.type_into_terminal(text.to_string(), true, cx);
             return true;
+        }
+        if let Some(question) = side_question::question(text) {
+            return self.ask_side(question, cx);
         }
         self.attention.set(Kind::Running, None);
         let text = text.to_string();
@@ -1900,6 +1924,18 @@ impl ChatSession {
         let theme = cx.theme().clone();
         let busy = self.convo.status.is_busy();
         let loading = self.history_loading();
+        let draft = self.input.read(cx).value();
+        let side = side_question::question(&draft);
+        let side_button = side.map(|q| {
+            let why = self.side_unavailable(q);
+            Button::new("ask-side")
+                .label("Ask aside")
+                .small()
+                .ghost()
+                .disabled(why.is_some())
+                .tooltip(why.unwrap_or("Send the side question (Enter)"))
+                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+        });
         let send = if busy {
             Button::new("stop")
                 .icon(IconName::Square)
@@ -2022,6 +2058,7 @@ impl ChatSession {
                         })),
                 )
             })
+            .children(self.render_side(cx))
             .child(self.render_text_box(cx))
             .child(
                 h_flex()
@@ -2037,7 +2074,8 @@ impl ChatSession {
                             .child(usage)
                     }))
                     .child(self.render_model_options(cx))
-                    .child(send),
+                    .children(side_button)
+                    .when(busy || side.is_none(), |row| row.child(send)),
             )
             // Last, so it lies over the padding it shares the top edge with.
             .child(self.render_composer_edge(cx))

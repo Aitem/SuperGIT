@@ -32,11 +32,23 @@ while IFS= read -r line; do
       else
         echo "{\"id\":$id,\"result\":{\"account\":{\"type\":\"apiKey\"},\"requiresOpenaiAuth\":true}}"
       fi ;;
+    *'"method":"thread/fork"'*)
+      if [ "$MODE" = bad-fork ]; then
+        echo "{\"id\":$id,\"result\":{\"thread\":{\"id\":\"parent\",\"ephemeral\":true}}}"
+      else
+        echo "{\"id\":$id,\"result\":{\"thread\":{\"id\":\"child\",\"ephemeral\":true}}}"
+      fi ;;
     *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
       echo "{\"id\":$id,\"result\":{\"thread\":{\"id\":\"$THREAD\",\"cwd\":\"$PWD\"},\"model\":\"fake-model\",\"reasoningEffort\":\"high\"}}" ;;
     *'"method":"turn/start"'*)
       echo "{\"id\":$id,\"result\":{\"turn\":{\"id\":\"tu-1\",\"status\":\"inProgress\",\"items\":[]}}}"
       echo '{"method":"turn/started","params":{"turn":{"id":"tu-1","status":"inProgress"}}}'
+      if [ "$MODE" = side ]; then
+        echo '{"method":"turn/completed","params":{"threadId":"parent","turn":{"status":"interrupted"}}}'
+        echo '{"method":"item/completed","params":{"threadId":"child","item":{"type":"agentMessage","text":"Side answer"}}}'
+        echo '{"method":"turn/completed","params":{"threadId":"child","turn":{"status":"completed"}}}'
+        continue
+      fi
       if [ "$MODE" = crash ]; then echo "fatal: model stream died" >&2; exit 1; fi
       if [ "$MODE" = collaboration ]; then
         echo '{"method":"turn/completed","params":{"turn":{"id":"tu-1","status":"completed","error":null}}}'
@@ -487,4 +499,37 @@ fn stop_before_the_handshake_drops_the_waiting_turn() {
     s.process.interrupt().unwrap();
     s.until("the turn end", |s| interrupted(&s.convo));
     assert_eq!(s.convo.status, Status::Idle);
+}
+
+#[test]
+fn a_side_question_only_runs_in_a_distinct_ephemeral_thread() {
+    for mode in ["side", "bad-fork"] {
+        let fake = Fake::new(mode, mode, "0.167.0");
+        let result = futures::executor::block_on(sg_codex::ask_side_question(
+            SpawnOptions {
+                cwd: fake.worktree("wt"),
+                program: Some(fake.program.clone()),
+                ..Default::default()
+            },
+            "parent".into(),
+            "Why?".into(),
+            TurnOptions::default(),
+        ));
+        let fork = &fake.sent("wt", "thread/fork")[0]["params"];
+        assert_eq!(fork["threadId"], "parent");
+        assert_eq!(fork["ephemeral"], true);
+        assert_eq!(fork["sandbox"], "read-only");
+        let turns = fake.sent("wt", "turn/start");
+        if mode == "side" {
+            assert_eq!(result.unwrap(), "Side answer");
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0]["params"]["threadId"], "child");
+            assert_eq!(turns[0]["params"]["approvalPolicy"], "never");
+        } else {
+            assert!(result.is_err());
+            assert!(turns.is_empty());
+        }
+        assert!(fake.sent("wt", "thread/resume").is_empty());
+        assert!(fake.sent("wt", "turn/interrupt").is_empty());
+    }
 }
