@@ -118,7 +118,8 @@ impl MainTab {
 
 #[derive(Clone, Copy)]
 enum LayoutPanel {
-    Chat,
+    /// The review's width beside the agent panel.
+    Review,
     /// The terminal panel's height (under the review).
     Terminal,
     Changes,
@@ -258,7 +259,8 @@ pub struct SuperGitApp {
     changes_diff: Entity<DiffState>,
     /// The sidebar's width (window-wide, not per project).
     sidebar_layout: Entity<ResizableState>,
-    chat_layout: Entity<ResizableState>,
+    /// The agent panel and the review beside it.
+    review_layout: Entity<ResizableState>,
     changes_layout: Entity<ResizableState>,
     history_layout: Entity<ResizableState>,
     history_search: Entity<InputState>,
@@ -495,7 +497,7 @@ impl SuperGitApp {
             history: History::default(),
             changes_diff,
             sidebar_layout: cx.new(|_| ResizableState::default()),
-            chat_layout: cx.new(|_| ResizableState::default()),
+            review_layout: cx.new(|_| ResizableState::default()),
             changes_layout: cx.new(|_| ResizableState::default()),
             history_layout: cx.new(|_| ResizableState::default()),
             history_search,
@@ -573,8 +575,9 @@ impl SuperGitApp {
         this
     }
 
-    /// The agent panel's widest size and the main area's width, beside the
-    /// sidebar and the agent rail.
+    /// The review's widest size beside the agent panel, and its width now:
+    /// what it keeps beside the panel, or all the room between the sidebar
+    /// and the agent rail while the panel is closed.
     fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32) {
         // A worktree's agent rail stays at the right edge, panel open or not.
         let rail = if self.selected.is_some() {
@@ -583,21 +586,24 @@ impl SuperGitApp {
             0.
         };
         let total = window.viewport_size().width.as_f32() - self.sidebar_width(cx) - rail;
-        let show_chat = self.chat_open && self.selected.is_some();
-        let saved = self.repository_view();
-        let chat_max = (total - 360.).clamp(320., 960.);
-        let chat = if show_chat {
-            self.chat_layout
+        let review_max = (total - CHAT_MIN).max(REVIEW_MIN);
+        let review = if self.chat_shown() {
+            self.review_layout
                 .read(cx)
                 .sizes()
                 .get(1)
                 .map(|v| v.as_f32())
-                .unwrap_or(saved.chat_width)
-                .clamp(320., chat_max)
+                .unwrap_or(self.repository_view().review_width)
+                .clamp(REVIEW_MIN, review_max)
         } else {
-            0.
+            total.max(REVIEW_MIN)
         };
-        (chat_max, (total - chat).max(360.))
+        (review_max, review)
+    }
+
+    /// The agent panel is on screen, left of the review.
+    fn chat_shown(&self) -> bool {
+        self.chat_open && self.selected.is_some()
     }
 
     fn repository_view(&self) -> &RepositoryView {
@@ -953,8 +959,9 @@ impl SuperGitApp {
         state: &Entity<ResizableState>,
         cx: &mut Context<Self>,
     ) {
-        // The chat and the terminal come second in their groups.
-        let ix = if matches!(panel, LayoutPanel::Chat | LayoutPanel::Terminal) {
+        // The review (right of the agent panel) and the terminal come second
+        // in their groups.
+        let ix = if matches!(panel, LayoutPanel::Review | LayoutPanel::Terminal) {
             1
         } else {
             0
@@ -969,7 +976,7 @@ impl SuperGitApp {
             .entry(repo.root.clone())
             .or_default();
         match panel {
-            LayoutPanel::Chat => view.chat_width = width,
+            LayoutPanel::Review => view.review_width = width,
             LayoutPanel::Terminal => view.terminal_height = width,
             LayoutPanel::Changes => view.changes_width = width,
             LayoutPanel::History => view.history_width = width,
@@ -2290,7 +2297,7 @@ impl SuperGitApp {
             self.stash_project();
             self.repo = Some(repo);
             self.reset_view(cx);
-            self.chat_layout = cx.new(|_| ResizableState::default());
+            self.review_layout = cx.new(|_| ResizableState::default());
             self.terminal_panel.reset_layout(cx);
             self.changes_layout = cx.new(|_| ResizableState::default());
             self.history_layout = cx.new(|_| ResizableState::default());
@@ -3069,8 +3076,8 @@ impl SuperGitApp {
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         // macOS, the sidebar collapsed: the window buttons sit at the start
-        // of this column's first row.
-        let window_buttons = self.window_buttons_beside_rail(window);
+        // of this column's first row, unless the agent panel comes first.
+        let window_buttons = self.window_buttons_beside_rail(window) && !self.chat_shown();
         let Some(info) = self.selected_info().cloned() else {
             let body = if let Some(error) = &self.load_error {
                 self.render_data_notice("Worktrees unavailable", Some(error), false, cx)
@@ -5205,8 +5212,8 @@ impl SuperGitApp {
         cx.notify();
     }
 
-    /// The agent rail at the window's right edge, beside the agent panel or
-    /// in its place: the button that collapses or expands the panel, one
+    /// The agent rail at the window's right edge, beside the review: the
+    /// button that collapses or expands the panel, one
     /// mark per conversation of the selected worktree (the agent's mark, in
     /// its own colors while the agent works, gray otherwise; the selected
     /// one on a background), then New under them. Hovered, an item shows its label at
@@ -5223,7 +5230,7 @@ impl SuperGitApp {
         let active = self.active_chat.get(&path).copied().unwrap_or(0);
         let closable = chats.len() > 1;
         let owner = cx.entity().downgrade();
-        // The first square is as tall as the panel's header: their lines
+        // The first square is as tall as the headers beside it: their lines
         // meet.
         let item = |id: ElementId| rail_square(id, theme.border);
         // Busy in any process, this window's or another (Claude Code's
@@ -5340,7 +5347,14 @@ impl SuperGitApp {
 
     /// The agent panel: the conversation on screen under a header with its
     /// agent and title. Switching, New and collapsing live in the rail.
-    fn render_claude_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// `window_buttons`: they sit at the header's start (macOS, the sidebar
+    /// collapsed), so it begins past them.
+    fn render_claude_panel(
+        &mut self,
+        window_buttons: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
         let theme = cx.theme().clone();
@@ -5367,37 +5381,34 @@ impl SuperGitApp {
             (chat.provider(), chat.title())
         });
 
-        v_flex()
-            .w_full()
-            .min_w_0()
+        // As tall as the review's header beside it: their lines meet.
+        let header = h_flex()
+            .h(px(RAIL_WIDTH))
             .flex_none()
-            .h_full()
-            // The resize handle at its left draws the line there.
-            .child(
-                // As tall as the rail is wide: its first square sits beside.
-                h_flex()
-                    .h(px(RAIL_WIDTH))
-                    .flex_none()
-                    .px_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .when_some(current, |el, (provider, title)| {
-                        el.child(
-                            crate::icons::agent_icon(provider)
-                                .with_size(gpui_kit::component::Size::Medium),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(title),
-                        )
-                    }),
-            )
+            .px_3()
+            .when(window_buttons, |row| row.pl(px(WINDOW_BUTTONS_INSET)))
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .when_some(current, |el, (provider, title)| {
+                el.child(
+                    crate::icons::agent_icon(provider).with_size(gpui_kit::component::Size::Medium),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+            });
+        v_flex()
+            .size_full()
+            .min_w_0()
+            // The resize handle at its right draws the line there.
+            .child(self.window_drag_area(header, cx))
             .child(
                 div()
                     .flex_1()
@@ -5435,11 +5446,11 @@ impl SuperGitApp {
         let rest = if self.repo.is_none() {
             480.
         } else if self.selected.is_none() {
-            360.
+            REVIEW_MIN
         } else if self.chat_open {
-            680. + RAIL_WIDTH
+            CHAT_MIN + REVIEW_MIN + RAIL_WIDTH
         } else {
-            360. + RAIL_WIDTH
+            REVIEW_MIN + RAIL_WIDTH
         };
         let max = (window.viewport_size().width.as_f32() - rest).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         div()
@@ -5467,10 +5478,11 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// The active project's review and agents, or the welcome screen.
+    /// The active project's agent panel, the review right of it and the
+    /// agent rail at the edge, or the welcome screen.
     fn render_project(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        // The status bar stays under the center column, so the side panels
-        // and their splitters reach the window's bottom edge.
+        // The status bar stays under the review, so the agent panel and the
+        // splitters reach the window's bottom edge.
         if self.repo.is_none() {
             let row = self
                 .window_buttons_beside_rail(window)
@@ -5496,25 +5508,30 @@ impl SuperGitApp {
         if self.selected.is_none() {
             return main;
         }
+        // The agent panel takes the room the review leaves; the review keeps
+        // its width when the window resizes.
         let content = if self.chat_open {
-            let (chat_max, _) = self.pane_widths(window, cx);
-            let chat = self.render_claude_panel(window, cx);
-            h_resizable("chat-layout")
-                .with_state(&self.chat_layout)
+            let (review_max, _) = self.pane_widths(window, cx);
+            // macOS, the sidebar collapsed: the window buttons sit in the
+            // panel's header, the first one past the sidebar's rail.
+            let window_buttons = self.window_buttons_beside_rail(window);
+            let chat = self.render_claude_panel(window_buttons, window, cx);
+            h_resizable("review-layout")
+                .with_state(&self.review_layout)
                 .on_resize(cx.listener(|this, state, _, cx| {
-                    this.remember_layout(LayoutPanel::Chat, state, cx)
+                    this.remember_layout(LayoutPanel::Review, state, cx)
                 }))
                 .child(
                     resizable_panel()
-                        .size_range(px(360.)..Pixels::MAX)
-                        .child(elastic(main)),
+                        .size_range(px(CHAT_MIN)..Pixels::MAX)
+                        .child(elastic(chat)),
                 )
                 .child(
                     resizable_panel()
-                        .size(px(self.repository_view().chat_width.min(chat_max)))
-                        .size_range(px(320.)..px(chat_max))
+                        .size(px(self.repository_view().review_width.min(review_max)))
+                        .size_range(px(REVIEW_MIN)..px(review_max))
                         .fixed()
-                        .child(chat),
+                        .child(elastic(main)),
                 )
                 .into_any_element()
         } else {
@@ -5825,6 +5842,12 @@ pub(crate) fn default_provider() -> Provider {
 
 /// Width of a collapsed side panel (sidebar, agent panel).
 const RAIL_WIDTH: f32 = 48.;
+
+/// The agent panel's narrowest, beside the review.
+const CHAT_MIN: f32 = 320.;
+
+/// The review's narrowest: beside the agent panel, or alone.
+const REVIEW_MIN: f32 = 360.;
 
 /// Height of the bars above the review's columns (commit search, file
 /// filter, diff options): a small field with 8px around it, and the line

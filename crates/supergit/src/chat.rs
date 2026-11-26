@@ -1354,40 +1354,40 @@ impl ChatSession {
                 .top_0()
                 .left_0()
                 .right_0()
-                // Level with the message cards.
-                .px_3()
-                .pt_2()
-                .child(
-                    h_flex()
-                        .id("sticky-prompt")
-                        .gap_2()
-                        .items_center()
-                        .px_3()
-                        .py_1p5()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.background)
-                        .shadow_md()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|el| el.bg(theme.muted))
-                        .tooltip(|window, cx| {
-                            Tooltip::new("Scroll to this message").build(window, cx)
-                        })
-                        .tooltip_show_delay(crate::TOOLTIP_DELAY)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.scroller
-                                .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
-                        }))
-                        .child(
-                            Icon::new(IconName::ArrowUp)
-                                .xsmall()
-                                .flex_none()
-                                .text_color(theme.muted_foreground),
-                        )
-                        .child(div().min_w_0().truncate().child(line)),
-                )
+                .child(look::column(
+                    // Level with the message cards.
+                    div().px_3().pt_2().child(
+                        h_flex()
+                            .id("sticky-prompt")
+                            .gap_2()
+                            .items_center()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.background)
+                            .shadow_md()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(theme.muted))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Scroll to this message").build(window, cx)
+                            })
+                            .tooltip_show_delay(crate::TOOLTIP_DELAY)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.scroller
+                                    .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+                            }))
+                            .child(
+                                Icon::new(IconName::ArrowUp)
+                                    .xsmall()
+                                    .flex_none()
+                                    .text_color(theme.muted_foreground),
+                            )
+                            .child(div().min_w_0().truncate().child(line)),
+                    ),
+                ))
                 .into_any_element(),
         )
     }
@@ -2013,16 +2013,11 @@ impl ChatSession {
                 })
                 .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
         };
-        v_flex()
+        let content = v_flex()
             .gap_1()
             .px_3()
             .pt_2()
             .pb_3()
-            .relative()
-            .bg(theme.background)
-            .on_drag_move(
-                cx.listener(|this, event, window, cx| this.drag_composer_edge(event, window, cx)),
-            )
             .when(!self.attachments.is_empty(), |composer| {
                 composer.child(
                     v_flex()
@@ -2130,7 +2125,16 @@ impl ChatSession {
                     }))
                     .child(self.render_model_options(cx))
                     .child(send),
+            );
+        // The edge spans the panel; the composer keeps to the column.
+        div()
+            .flex_none()
+            .relative()
+            .bg(theme.background)
+            .on_drag_move(
+                cx.listener(|this, event, window, cx| this.drag_composer_edge(event, window, cx)),
             )
+            .child(look::column(content))
             // Last, so it lies over the padding it shares the top edge with.
             .child(self.render_composer_edge(cx))
     }
@@ -2186,9 +2190,14 @@ impl Render for ChatSession {
                         )
                         // Its 32px between rows made runs of tool calls sparse;
                         // `render_item` spaces rows by kind instead. Its own
-                        // 12px at the sides line the rows up with the panel's
-                        // header and the composer.
-                        .with_row_style(StyleRefinement::default().pb(px(0.)))
+                        // 12px at the sides line the rows up with the
+                        // composer; a wide panel centers them in its column.
+                        .with_row_style(
+                            StyleRefinement::default()
+                                .pb(px(0.))
+                                .max_w(look::COLUMN_MAX)
+                                .mx_auto(),
+                        )
                         .with_list_style(StyleRefinement::default().pt_3().pb_3())
                         // Scrolled up, the conversation fades out at the
                         // bottom instead of ending mid-line.
@@ -2197,7 +2206,7 @@ impl Render for ChatSession {
                     .children(self.render_sticky_prompt(cx))
                     .into_any_element()
             })
-            .children(self.render_activity(cx))
+            .children(self.render_activity(cx).map(look::column))
             .when(!choosing, |el| el.child(self.render_composer(cx)))
             .into_any_element()
     }
