@@ -282,9 +282,9 @@ impl ChatSession {
     }
 }
 
-/// A composer setting as a dropdown's trigger: its name muted, its value
-/// in the text color, then a chevron.
-fn setting_trigger(
+/// A setting as a dropdown's trigger (the composer's, Settings' sounds):
+/// its name muted, its value in the text color, then a chevron.
+pub(crate) fn setting_trigger(
     id: &'static str,
     name: &'static str,
     value: impl Into<SharedString>,

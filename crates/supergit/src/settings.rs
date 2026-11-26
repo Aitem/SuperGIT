@@ -92,8 +92,15 @@ impl AgentView {
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
+    /// Banners (system notifications) when an agent needs approval or an
+    /// answer, and when it finishes or fails.
     pub notify_approvals: bool,
     pub notify_completions: bool,
+    /// The sound when an agent needs approval or an answer (`sound::SOUNDS`);
+    /// none: the default (`sound::default`), empty: silent.
+    pub sound_approvals: Option<String>,
+    /// The sound when an agent finishes or fails; as `sound_approvals`.
+    pub sound_completions: Option<String>,
     /// The agent new conversations start with (`claude`, `codex`): the one
     /// picked last.
     pub agent: String,
@@ -115,6 +122,36 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The sound in effect for approvals and questions (`needs_you`), else
+    /// for finished and failed turns; none when silent.
+    pub fn sound(&self, needs_you: bool) -> Option<&str> {
+        let picked = if needs_you {
+            &self.sound_approvals
+        } else {
+            &self.sound_completions
+        };
+        match picked.as_deref() {
+            None => Some(crate::sound::default(needs_you)).filter(|name| !name.is_empty()),
+            Some("") => None,
+            Some(name) => Some(name),
+        }
+    }
+
+    /// Pick a sound (`None`: silent). The default is stored as none, so a
+    /// later default reaches it.
+    pub fn set_sound(&mut self, needs_you: bool, name: Option<&str>) {
+        let stored = match name {
+            None => Some(String::new()),
+            Some(name) if name == crate::sound::default(needs_you) => None,
+            Some(name) => Some(name.to_owned()),
+        };
+        if needs_you {
+            self.sound_approvals = stored;
+        } else {
+            self.sound_completions = stored;
+        }
+    }
+
     /// The initial prompt's template in effect.
     pub fn initial_prompt(&self) -> &str {
         self.initial_prompt
@@ -189,6 +226,8 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.appearance, Appearance::System);
         assert!(!s.notify_approvals && !s.notify_completions);
+        assert_eq!(s.sound(true), Some(crate::sound::default(true)));
+        assert_eq!(s.sound(false), Some(crate::sound::default(false)));
         assert_eq!(s.diff_layout, DiffLayout::Unified);
         assert!(!s.difftastic);
         let s: Settings =
@@ -198,6 +237,27 @@ mod tests {
         assert_eq!(s.agent_view, AgentView::Chat);
         let s: Settings = serde_json::from_str(r#"{"agent_view":"terminal"}"#).unwrap();
         assert_eq!(s.agent_view, AgentView::Terminal);
+    }
+
+    #[test]
+    fn sounds_store_silence_and_leave_the_default_unstored() {
+        let other = crate::sound::SOUNDS
+            .iter()
+            .copied()
+            .find(|name| *name != crate::sound::default(true))
+            .unwrap();
+        let mut s = Settings::default();
+        s.set_sound(true, Some(other));
+        assert_eq!(s.sound(true), Some(other));
+        s.set_sound(true, None);
+        assert_eq!(s.sound(true), None);
+        let json = serde_json::to_string(&s).unwrap();
+        let s: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s.sound(true), None);
+        let mut s = s;
+        s.set_sound(true, Some(crate::sound::default(true)));
+        assert_eq!(s.sound_approvals, None);
+        assert_eq!(s.sound(false), Some(crate::sound::default(false)));
     }
 
     #[test]
