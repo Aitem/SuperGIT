@@ -4,6 +4,7 @@
 mod sync;
 
 mod base;
+mod commit_pane;
 mod edit;
 mod issue_worktree;
 mod projects;
@@ -33,7 +34,7 @@ use gpui_kit::component::diff::{
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex, v_flex};
@@ -115,6 +116,7 @@ enum LayoutPanel {
     /// The terminal panel's height (under the review).
     Terminal,
     Changes,
+    /// The commit tree's height above a commit's details.
     History,
     CommitFiles,
     Pulls,
@@ -259,6 +261,10 @@ pub struct SuperGitApp {
     review_layout: Entity<ResizableState>,
     changes_layout: Entity<ResizableState>,
     history_layout: Entity<ResizableState>,
+    /// The commit tree's scroll: kept when a commit's details open under it.
+    history_scroll: ScrollHandle,
+    /// The selected commit's pane under the tree, scrolling as one.
+    commit_chain: std::rc::Rc<commit_pane::ScrollChain>,
     history_search: Entity<InputState>,
     selected_commit: Option<String>,
     commit_diff: Entity<DiffState>,
@@ -509,6 +515,8 @@ impl SuperGitApp {
             review_layout: cx.new(|_| ResizableState::default()),
             changes_layout: cx.new(|_| ResizableState::default()),
             history_layout: cx.new(|_| ResizableState::default()),
+            history_scroll: ScrollHandle::new(),
+            commit_chain: std::rc::Rc::new(commit_pane::ScrollChain::new()),
             history_search,
             selected_commit: None,
             commit_diff,
@@ -999,7 +1007,7 @@ impl SuperGitApp {
             LayoutPanel::Review => view.review_width = width,
             LayoutPanel::Terminal => view.terminal_height = width,
             LayoutPanel::Changes => view.changes_width = width,
-            LayoutPanel::History => view.history_width = width,
+            LayoutPanel::History => view.history_height = width,
             LayoutPanel::CommitFiles => view.commit_files_width = width,
             LayoutPanel::Pulls => view.pulls_width = width,
         }
@@ -1730,6 +1738,8 @@ impl SuperGitApp {
         #[cfg(feature = "screenshot")]
         self.debug_drag_once(cx);
         #[cfg(feature = "screenshot")]
+        self.debug_scroll_once(cx);
+        #[cfg(feature = "screenshot")]
         self.debug_right_click_once(cx);
         cx.notify();
     }
@@ -1809,6 +1819,74 @@ impl SuperGitApp {
                 let text = gpui_kit::base::TextSelection::selected_text(window, cx);
                 eprintln!("SUPERGIT_DEBUG_DRAG selected:\n{text}");
             });
+        })
+        .detach();
+    }
+
+    /// Screenshot builds only: `SUPERGIT_DEBUG_SCROLL=x,y,dy[,count]` turns
+    /// the wheel at a window point (= PNG pixels) `count` times (default 1)
+    /// by `dy` pixels each (negative: down the content) five seconds after
+    /// startup, drawing a frame per turn: for checking nested scrolling.
+    /// Several runs, one after another, separated by `;`.
+    #[cfg(feature = "screenshot")]
+    fn debug_scroll_once(&mut self, cx: &mut Context<Self>) {
+        let Ok(spec) = std::env::var("SUPERGIT_DEBUG_SCROLL") else {
+            return;
+        };
+        if std::env::var_os("SUPERGIT_DEBUG_SCROLL_DONE").is_some() {
+            return;
+        }
+        let runs: Vec<(f32, f32, f32, usize)> = spec
+            .split(';')
+            .filter_map(|run| {
+                let values: Vec<f32> = run
+                    .split(',')
+                    .filter_map(|value| value.trim().parse().ok())
+                    .collect();
+                match values[..] {
+                    [x, y, dy] => Some((x, y, dy, 1)),
+                    [x, y, dy, count] => Some((x, y, dy, count.max(1.) as usize)),
+                    _ => None,
+                }
+            })
+            .collect();
+        // SAFETY: isolated screenshot builds only, on the main thread.
+        unsafe { std::env::set_var("SUPERGIT_DEBUG_SCROLL_DONE", "1") };
+        let Some(window) = cx.windows().first().copied() else {
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            for (x, y, dy, count) in runs {
+                let position = point(px(x), px(y));
+                let _ = window.update(cx, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    );
+                });
+                for _ in 0..count {
+                    let _ = window.update(cx, |_, window, cx| {
+                        window.draw(cx).clear(cx);
+                        window.dispatch_event(
+                            PlatformInput::Scroll(ScrollEvent {
+                                position,
+                                delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    });
+                    cx.background_executor()
+                        .timer(Duration::from_millis(60))
+                        .await;
+                }
+            }
         })
         .detach();
     }
@@ -2120,16 +2198,12 @@ impl SuperGitApp {
             self.commit_difft.update(cx, |view, cx| view.clear(cx));
         }
         self.history.update(history);
+        // A commit restored for this worktree loads its details; none is
+        // picked for the user: History opens on the tree alone.
         if self.tab == ReviewTab::History
             && self.commit_task.is_none()
             && self.commit_patch.is_loading()
-            && let Some(sha) = self.selected_commit.clone().or_else(|| {
-                self.history
-                    .commits
-                    .value()
-                    .and_then(|commits| commits.first())
-                    .map(|c| c.sha.clone())
-            })
+            && let Some(sha) = self.selected_commit.clone()
         {
             self.select_commit(sha, cx);
         }
@@ -2223,6 +2297,7 @@ impl SuperGitApp {
             self.commit_diff
                 .update(cx, |state, cx| state.set_files(Vec::new(), cx));
             self.commit_difft.update(cx, |view, cx| view.clear(cx));
+            self.commit_chain.reset();
         }
         self.selected_commit = Some(sha.clone());
         self.commit_generation += 1;
@@ -2761,9 +2836,15 @@ impl SuperGitApp {
         if self.chat_shown() {
             self.chat_open = false;
             let tab = self.tab;
-            if let Some(view) = self.repository_view_mut() {
+            let opened = self.repository_view_mut().is_some_and(|view| {
+                let opened = !view.review_open;
                 view.review_open = true;
                 view.review_tab = tab;
+                opened
+            });
+            // History opens on the commit tree alone.
+            if opened && tab == ReviewTab::History {
+                self.close_commit(cx);
             }
             self.reload_history(cx);
         } else {
@@ -3225,24 +3306,30 @@ impl SuperGitApp {
                     .into_any_element()
             }
             ReviewTab::History => {
-                let tree_width = self.history_tree_width(width, cx);
-                let max = history_tree_max(width);
-                let commit = self.render_commit_view(width - tree_width, cx);
-                h_resizable("history-layout")
+                // The tree alone until a commit is picked; then the commit
+                // under it, the tree keeping its saved height.
+                let tree = self.render_history_tree(width, &theme, cx);
+                if self.selected_commit.is_none() {
+                    return tree;
+                }
+                // The commit pane keeps at least 160px.
+                let max = (window.viewport_size().height.as_f32() - RAIL_WIDTH - 200.).max(120.);
+                let commit = self.render_commit_pane(width, cx);
+                v_resizable("history-layout")
                     .with_state(&self.history_layout)
                     .on_resize(cx.listener(|this, state, _, cx| {
                         this.remember_layout(LayoutPanel::History, state, cx)
                     }))
                     .child(
                         resizable_panel()
-                            .size(px(self.repository_view().history_width.min(max)))
-                            .size_range(px(160.)..px(max))
+                            .size(px(self.repository_view().history_height.min(max)))
+                            .size_range(px(120.)..px(max))
                             .fixed()
-                            .child(self.render_history_tree(tree_width, &theme, cx)),
+                            .child(tree),
                     )
                     .child(
                         resizable_panel()
-                            .size_range(px(180.)..Pixels::MAX)
+                            .size_range(px(160.)..Pixels::MAX)
                             .child(elastic(commit)),
                     )
                     .into_any_element()
@@ -3281,6 +3368,10 @@ impl SuperGitApp {
         view.review_open = !hide;
         view.review_tab = tab;
         self.tab = tab;
+        // History opens on the commit tree alone.
+        if !hide && tab == ReviewTab::History {
+            self.close_commit(cx);
+        }
         if hide && !self.chat_open {
             self.chat_open = true;
             if let Some(chat) = self.active_chat_entity() {
@@ -3701,6 +3792,16 @@ impl SuperGitApp {
     /// request): a toolbar with the layout and difftastic toggles above the
     /// diff itself.
     fn render_review_diff(&self, list: FileList, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .child(self.render_diff_toolbar(list, cx))
+            .child(self.render_diff_body(list, cx))
+            .into_any_element()
+    }
+
+    /// The diff itself (difftastic's when it is on), under its bar.
+    fn render_diff_body(&self, list: FileList, cx: &mut Context<Self>) -> AnyElement {
         let owner = cx.entity().downgrade();
         // A PR whose commits are not local keeps the line diff.
         let difftastic =
@@ -3722,26 +3823,39 @@ impl SuperGitApp {
             let diff = Diff::new(state)
                 .line_number(true)
                 .soft_wrap(self.diff_layout == DiffLayout::Split);
+            // A commit's pane needs to know when the diff shows its top.
+            let diff = match (list, state.read(cx).files().first()) {
+                (FileList::Commit, Some(first)) => {
+                    let first = first.path().clone();
+                    let chain = self.commit_chain.clone();
+                    diff.render_header_prefix(move |file, _, _| {
+                        if *file.path() == first {
+                            commit_pane::ScrollChain::header_probe(&chain)
+                        } else {
+                            div().absolute().into_any_element()
+                        }
+                    })
+                }
+                _ => diff,
+            };
             self.with_review_cards(diff, list, cx).into_any_element()
         };
-        v_flex()
-            .size_full()
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
             .min_w_0()
-            .child(self.render_diff_toolbar(list, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(content)
-                    .context_menu(move |menu, _, cx| {
-                        let Some(owner) = owner.upgrade() else {
-                            return menu;
-                        };
-                        owner.update(cx, |this, cx| this.context_menu(menu, None, cx))
-                    }),
-            )
+            .overflow_hidden()
+            .child(content)
+            .when(list == FileList::Commit, |body| {
+                body.child(commit_pane::ScrollChain::diff_top_probe(&self.commit_chain))
+            })
+            .context_menu(move |menu, _, cx| {
+                let Some(owner) = owner.upgrade() else {
+                    return menu;
+                };
+                owner.update(cx, |this, cx| this.context_menu(menu, None, cx))
+            })
             .into_any_element()
     }
 
@@ -3782,10 +3896,25 @@ impl SuperGitApp {
                 "Structural diff by difftastic {version}: only changed syntax is highlighted, reformatting is ignored"
             ),
         };
+        let files_toggle = (list == FileList::Commit).then(|| {
+            let open = self.repository_view().commit_files_open;
+            Button::new("commit-files-toggle")
+                .icon(IconName::PanelLeft)
+                .xsmall()
+                .ghost()
+                .selected(open)
+                .tooltip(if open {
+                    "Hide the file list: the diff takes the width"
+                } else {
+                    "Show the commit's files beside its diff"
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_commit_files(cx)))
+        });
         toolbar(theme)
             .w_full()
             .min_w_0()
             .gap_1()
+            .children(files_toggle)
             .children(layouts)
             .children(
                 (list == FileList::Pull)
@@ -4567,6 +4696,10 @@ impl SuperGitApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    // A commit's pane asks where its file list stands.
+                    .when(list == FileList::Commit, |el| {
+                        el.track_scroll(&self.commit_chain.files)
+                    })
                     .when(rows.is_empty(), |el| {
                         el.child(
                             div()
@@ -4612,16 +4745,6 @@ impl SuperGitApp {
     }
 
     /// The commit tree's width: the split's first panel, within its range.
-    fn history_tree_width(&self, width: f32, cx: &App) -> f32 {
-        self.history_layout
-            .read(cx)
-            .sizes()
-            .first()
-            .map(|w| w.as_f32())
-            .unwrap_or(self.repository_view().history_width)
-            .min(history_tree_max(width))
-    }
-
     /// The commit tree in the History panel (`cmd-shift-h`): the search and scope
     /// bar, then the graph. `width` is the column's.
     fn render_history_tree(
@@ -4749,9 +4872,14 @@ impl SuperGitApp {
                 theme,
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                // A commit picked in the tree shows beside it.
-                this.set_tab(ReviewTab::History, cx);
-                this.select_commit(sha.clone(), cx)
+                // A commit picked in the tree shows under it; picked again,
+                // it closes. The row stays in view as the tree shrinks.
+                if this.selected_commit.as_deref() == Some(sha.as_str()) {
+                    this.close_commit(cx);
+                } else {
+                    this.select_commit(sha.clone(), cx);
+                    this.history_scroll.scroll_to_item(ix);
+                }
             }))
         });
         column
@@ -4762,6 +4890,7 @@ impl SuperGitApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.history_scroll)
                     .when(matching_count == 0, |el| {
                         el.child(
                             div()
@@ -4797,23 +4926,6 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// The review pane in the History tab: the selected commit (with the
-    /// squash offer), `width` wide.
-    fn render_commit_view(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
-            .size_full()
-            .when_some(self.history.commits.value(), |el, commits| {
-                el.child(self.render_squash(commits, cx))
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_commit_patch(width, cx)),
-            )
-            .into_any_element()
-    }
-
     /// The selected worktree's fork data, once it is loaded for it.
     fn selected_fork(&self) -> Option<&sg_git::Fork> {
         self.history.fork.as_ref()
@@ -4824,47 +4936,6 @@ impl SuperGitApp {
         self.selected_fork()
             .map(|fork| fork.base.clone())
             .or_else(|| self.details.suggested_base.clone())
-    }
-
-    /// The selected commit: its files (filter, flat or tree) beside its diff,
-    /// laid out like the Changes tab. `width` is the room right of the
-    /// commit list.
-    fn render_commit_patch(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
-        if self.selected_commit.is_none() {
-            return self.render_data_notice("Select a commit", None, false, cx);
-        }
-        if self.commit_patch.is_loading() {
-            return self.render_data_notice("Loading commit diff…", None, false, cx);
-        }
-        let notice = self.commit_patch.error().map(|error| {
-            self.render_data_notice(
-                if self.commit_patch.value().is_some() {
-                    "Commit diff may be out of date — showing the last successful data"
-                } else {
-                    "Commit diff unavailable"
-                },
-                Some(error),
-                true,
-                cx,
-            )
-        });
-        let card = self
-            .commit_details
-            .as_ref()
-            .filter(|d| self.selected_commit.as_deref() == Some(d.commit.sha.as_str()))
-            .map(|details| self.render_commit_card(details, cx));
-        v_flex()
-            .size_full()
-            .children(notice)
-            .children(card)
-            .when_some(self.commit_patch.value(), |el, patch| {
-                el.child(div().flex_1().min_h_0().child(if patch.is_empty() {
-                    self.render_data_notice("No changes in this commit", None, false, cx)
-                } else {
-                    self.render_commit_files(width, cx)
-                }))
-            })
-            .into_any_element()
     }
 
     /// Above a commit's files and diff: its message, author, date, sha
@@ -4909,16 +4980,28 @@ impl SuperGitApp {
             .border_b_1()
             .border_color(theme.border)
             .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(commit.subject.clone()),
+                h_flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(commit.subject.clone()),
+                    )
+                    .child(
+                        Button::new("close-commit")
+                            .icon(IconName::Close)
+                            .xsmall()
+                            .ghost()
+                            .tooltip("Close the commit: the tree takes the panel again")
+                            .on_click(cx.listener(|this, _, _, cx| this.close_commit(cx))),
+                    ),
             )
             .when(!details.body.is_empty(), |el| {
                 el.child(
                     div()
-                        .id("commit-body")
-                        .max_h(px(160.))
-                        .overflow_y_scroll()
                         .text_sm()
                         .text_color(muted)
                         .child(reflow(&details.body)),
@@ -5029,36 +5112,6 @@ impl SuperGitApp {
                             .text_color(theme.danger)
                             .child(format!("−{deletions}")),
                     ),
-            )
-            .into_any_element()
-    }
-
-    fn render_commit_files(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let files: Vec<FileChange> = self
-            .commit_diff
-            .read(cx)
-            .files()
-            .iter()
-            .map(commit_file)
-            .collect();
-        let list_max = (width - 180.).clamp(140., 600.);
-        h_resizable("commit-files-layout")
-            .with_state(&self.commit_files_layout)
-            .on_resize(cx.listener(|this, state, _, cx| {
-                this.remember_layout(LayoutPanel::CommitFiles, state, cx)
-            }))
-            .child(
-                resizable_panel()
-                    .size(px(self.repository_view().commit_files_width.min(list_max)))
-                    .size_range(px(140.)..px(list_max))
-                    .fixed()
-                    .child(self.render_file_list(FileList::Commit, &files, &theme, cx)),
-            )
-            .child(
-                resizable_panel()
-                    .size_range(px(180.)..Pixels::MAX)
-                    .child(elastic(self.render_review_diff(FileList::Commit, cx))),
             )
             .into_any_element()
     }
@@ -5658,11 +5711,6 @@ const REVIEW_MIN: f32 = 360.;
 /// filter, diff options): a small field with 8px around it, and the line
 /// under it. Side by side, their lines meet.
 const TOOLBAR_HEIGHT: f32 = 41.;
-
-/// The commit tree's widest: the review keeps at least 180px.
-fn history_tree_max(width: f32) -> f32 {
-    (width - 180.).clamp(160., 800.)
-}
 
 /// A bar above one of the review's columns, as tall as the others.
 fn toolbar(theme: &gpui_kit::component::Theme) -> Div {

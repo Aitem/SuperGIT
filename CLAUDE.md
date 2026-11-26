@@ -361,7 +361,11 @@ real (unfocused) window — keep them few, the user may be working.
 commit two seconds after startup, like a click;
 `SUPERGIT_DEBUG_DRAG=x1,y1,x2,y2` (screenshot builds) drags the mouse between
 two window points (= PNG pixels) five seconds after startup, drawing a frame
-per step, and prints what `cmd-c` would copy (text selection checks);
+per step, and prints what `cmd-c` would copy (text selection checks; equal
+points make a click);
+`SUPERGIT_DEBUG_SCROLL=x,y,dy[,count]` (screenshot builds) turns the wheel
+there `count` times by `dy` px (negative: down), several runs separated by
+`;` (nested scrolling, e.g. a commit's pane);
 `SUPERGIT_DEBUG_RIGHT_CLICK=x,y` (screenshot builds) right-clicks that point
 five seconds after startup (context menus; take the shot a bit later), and
 `=x,y,mx,my` then clicks the menu item at `mx,my`;
@@ -435,8 +439,18 @@ never commit, push or create worktrees there without asking.
   (the panel keeps its width when the window resizes; the conversation
   takes the rest). `cmd-shift-h` toggles History; `cmd-l` hides the
   conversation so the panel fills the room (opening it if hidden), and
-  back. History is the commit tree (search, scope, graph) with the commit
-  picked in it beside; history loads only while it is on screen.
+  back. History is the commit tree (search, scope, graph) alone; a commit
+  picked in it opens under it (`v_resizable`, the tree keeps
+  `history_height`), picked again or closed (×) it goes, and opening
+  History starts on the tree alone. History loads only while it is on
+  screen.
+- **A commit's pane** (`app/commit_pane.rs`): the card, then its changes
+  (the diff's bar, the file list when `commit_files_open` — toggled by
+  the bar's first button, hidden by default — and the diff), scrolling
+  as one: the changes are as tall as the pane, and `ScrollChain`'s
+  capture-phase wheel handler moves the card away before the diff
+  scrolls, and back only once the diff (or the file list) is at its top
+  (probes record the diff's top and its first file header's).
   `set_tab` shows a panel from code (cherry-pick, PR review context).
 - **Sidebar tree**: a repository's row (Git's logo, `icons::git_mark`)
   is also its main checkout's: a click selects it, its counts and agents
