@@ -4,6 +4,7 @@
 //! opens that project at that worktree.
 
 use super::projects::{ATTENTION_ORDER, Activity, project_name};
+use super::tree_menus::{ConversationTarget, WorktreeTarget};
 use super::*;
 use gpui_kit::component::menu::DropdownMenu as _;
 
@@ -457,7 +458,7 @@ impl SuperGitApp {
                             .text_color(theme.muted_foreground),
                     ),
             );
-        let row = self.project_menu(row, root.to_path_buf(), cx);
+        let row = self.repository_menu(row, root, main.map(WorktreeInfo::path), active, cx);
 
         // The main checkout's conversations, under its row.
         let main_agents = match (folded, scope, main) {
@@ -795,73 +796,17 @@ impl SuperGitApp {
                         .children(notes),
                 )
             });
-        if !scope.active {
-            return row.into_any_element();
-        }
-        let rebase = self.rebase_menu_item(info, cx);
-        let owner = cx.entity().downgrade();
-        let context_path = info.wt.path.clone();
-        row.context_menu(move |menu, _, _cx| {
-            let menu = match &rebase {
-                Some((label, enabled)) => {
-                    let rebase_owner = owner.clone();
-                    let rebase_path = context_path.clone();
-                    menu.item(
-                        PopupMenuItem::new(label.clone())
-                            .disabled(!enabled)
-                            .on_click(move |_, window, cx| {
-                                let _ = rebase_owner.update(cx, |this, cx| {
-                                    this.open_rebase_dialog(rebase_path.clone(), window, cx)
-                                });
-                            }),
-                    )
-                    .separator()
-                }
-                None => menu,
-            };
-            let keep_owner = owner.clone();
-            let keep_path = context_path.clone();
-            let cleanup_owner = owner.clone();
-            let cleanup_path = context_path.clone();
-            let editor_owner = owner.clone();
-            let editor_path = context_path.clone();
-            let reveal_owner = owner.clone();
-            let reveal_path = context_path.clone();
-            menu.item(
-                PopupMenuItem::new("Open in Editor").on_click(move |_, _, cx| {
-                    let result = launch::open_in_editor(&editor_path);
-                    let _ = editor_owner
-                        .update(cx, |this, cx| this.report(result, "Opened in editor", cx));
-                }),
-            )
-            .item(
-                PopupMenuItem::new(format!("Reveal in {}", launch::FILE_MANAGER)).on_click(
-                    move |_, _, cx| {
-                        let result = launch::reveal_in_finder(&reveal_path);
-                        let _ = reveal_owner.update(cx, |this, cx| {
-                            this.report(result, &format!("Opened in {}", launch::FILE_MANAGER), cx)
-                        });
-                    },
-                ),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("Keep active")
-                    .checked(kept)
-                    .on_click(move |_, _, cx| {
-                        let _ = keep_owner
-                            .update(cx, |this, cx| this.toggle_keep_path(keep_path.clone(), cx));
-                    }),
-            )
-            .item(
-                PopupMenuItem::new("Clean up worktree…").on_click(move |_, window, cx| {
-                    let _ = cleanup_owner.update(cx, |this, cx| {
-                        this.open_cleanup_preview(vec![cleanup_path.clone()], window, cx)
-                    });
-                }),
-            )
-        })
-        .into_any_element()
+        let target = WorktreeTarget {
+            path: info.wt.path.clone(),
+            branch: info.wt.branch.clone(),
+            active: scope.active,
+            kept,
+            rebase: scope
+                .active
+                .then(|| self.rebase_menu_item(info, cx))
+                .flatten(),
+        };
+        self.worktree_menu(row, target, cx)
     }
 
     /// The worktree's conversations, as the agent rail shows them (the
@@ -909,6 +854,10 @@ impl SuperGitApp {
                             || busy_elsewhere(chat.provider(), chat.session_id()),
                         on_screen: on_screen == Some(ix),
                         selected: picked == Some(chat.local_id()),
+                        session_id: chat.session_id().map(str::to_string),
+                        cwd: chat.cwd().to_path_buf(),
+                        transcript: chat.transcript_file(),
+                        can_fork: chat.can_fork(),
                     })
                 })
                 .collect();
@@ -919,7 +868,11 @@ impl SuperGitApp {
             .get(path)
             .into_iter()
             .flatten()
-            .filter(|saved| saved.session_id.is_some() || saved.transcript.is_some())
+            .filter(|saved| {
+                saved.session_id.is_some()
+                    || saved.transcript.is_some()
+                    || saved.fork_from.is_some()
+            })
             .filter_map(|saved| {
                 let provider = Provider::parse(&saved.provider)?;
                 Some(AgentEntry {
@@ -935,6 +888,10 @@ impl SuperGitApp {
                     working: busy_elsewhere(provider, saved.session_id.as_deref()),
                     on_screen: false,
                     selected: false,
+                    session_id: saved.session_id.clone(),
+                    cwd: saved.cwd.clone(),
+                    transcript: saved.transcript.clone(),
+                    can_fork: saved.session_id.is_some() || saved.fork_from.is_some(),
                 })
             })
             .collect()
@@ -976,7 +933,20 @@ impl SuperGitApp {
                 );
                 let (root, worktree) = (root.to_path_buf(), info.wt.path.clone());
                 let (conversation, provider) = (agent.local_id.clone(), agent.provider);
-                h_flex()
+                let target = ConversationTarget {
+                    root: root.clone(),
+                    worktree: worktree.clone(),
+                    local_id: agent.local_id.clone(),
+                    provider,
+                    session_id: agent.session_id.clone(),
+                    cwd: agent.cwd.clone(),
+                    transcript: agent.transcript.clone(),
+                    can_fork: agent.can_fork,
+                    unread: agent.unread,
+                    working: agent.working,
+                    active: scope.active,
+                };
+                let row = h_flex()
                     .id(SharedString::from(format!("agent-row-{}", agent.local_id)))
                     .h(px(AGENT_ROW))
                     .pl(px(indent))
@@ -1033,8 +1003,8 @@ impl SuperGitApp {
                                     .text_color(attention_color(kind, theme)),
                             ),
                         )
-                    })
-                    .into_any_element()
+                    });
+                self.conversation_menu(row, target, cx)
             })
             .collect()
     }
@@ -1455,4 +1425,8 @@ struct AgentEntry {
     /// On screen and picked last in the tree or the rail: the tree's
     /// selection.
     selected: bool,
+    session_id: Option<String>,
+    cwd: PathBuf,
+    transcript: Option<PathBuf>,
+    can_fork: bool,
 }

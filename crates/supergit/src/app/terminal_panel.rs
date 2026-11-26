@@ -74,7 +74,7 @@ impl SuperGitApp {
     }
 
     /// Show the selected worktree's shell (starting it) and focus it.
-    fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.repo.is_none() {
             return;
         }

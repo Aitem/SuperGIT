@@ -76,6 +76,9 @@ pub struct SpawnOptions {
     pub cwd: PathBuf,
     /// Continue an existing session by id.
     pub resume: Option<String>,
+    /// With `resume`: continue a copy of that session under a new id
+    /// (`--fork-session`); the original stays as it is.
+    pub fork: bool,
     /// `None` leaves the choice to the CLI (`permissions.defaultMode` in the
     /// user's settings, else `default`).
     pub permission_mode: Option<PermissionMode>,
@@ -120,6 +123,9 @@ impl ClaudeProcess {
         }
         if let Some(id) = &opts.resume {
             cmd.arg(format!("--resume={id}"));
+            if opts.fork {
+                cmd.arg("--fork-session");
+            }
         }
         if let Some(model) = &opts.model {
             cmd.args(["--model", model]);

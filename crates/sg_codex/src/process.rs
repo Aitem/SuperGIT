@@ -152,6 +152,9 @@ pub struct SpawnOptions {
     pub cwd: PathBuf,
     /// Continue an existing thread by id.
     pub resume: Option<String>,
+    /// With `resume`: continue a copy of that thread (`thread/fork`); the
+    /// original stays as it is.
+    pub fork: bool,
     pub policy: Policy,
     pub model: Option<String>,
     /// Instructions for a new thread besides Codex's own
@@ -565,7 +568,7 @@ impl Driver {
                     self.open_thread();
                 }
             }
-            "thread/start" | "thread/resume" if !fatal => {
+            "thread/start" | "thread/resume" | "thread/fork" if !fatal => {
                 self.thread_id = result
                     .and_then(|r| r.pointer("/thread/id"))
                     .and_then(Value::as_str)
@@ -590,7 +593,9 @@ impl Driver {
                 }
             }
             // Without a session nothing else can work.
-            "initialize" | "account/read" | "thread/start" | "thread/resume" => self.stop(),
+            "initialize" | "account/read" | "thread/start" | "thread/resume" | "thread/fork" => {
+                self.stop()
+            }
             _ => {}
         }
     }
@@ -605,6 +610,13 @@ impl Driver {
             params["model"] = json!(model);
         }
         match self.opts.resume.clone() {
+            // A fork is a new thread in the original's place.
+            Some(id) if self.opts.fork => {
+                params["threadId"] = json!(id);
+                params["cwd"] = json!(self.opts.cwd);
+                params["excludeTurns"] = json!(true);
+                self.request("thread/fork", params);
+            }
             Some(id) => {
                 params["threadId"] = json!(id);
                 params["excludeTurns"] = json!(true);

@@ -123,6 +123,7 @@ impl CodexFold {
             let error = strip_ansi(error);
             let text = match method {
                 "thread/resume" => format!("Can't resume this Codex thread: {error}"),
+                "thread/fork" => format!("Can't fork this Codex thread: {error}"),
                 "turn/interrupt" => format!("Can't stop the turn: {error}"),
                 "initialize" | "account/read" | "thread/start" | "turn/start" => error,
                 other => format!("{other}: {error}"),
@@ -135,7 +136,7 @@ impl CodexFold {
             }
             return;
         }
-        if matches!(method, "thread/start" | "thread/resume") {
+        if matches!(method, "thread/start" | "thread/resume" | "thread/fork") {
             let result = v.get("result").unwrap_or(&Value::Null);
             self.on_thread(c, result.get("thread").unwrap_or(&Value::Null));
             if let Some(model) = result.get("model").and_then(Value::as_str) {

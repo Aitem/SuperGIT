@@ -12,6 +12,7 @@ mod sidebar;
 mod staged_commit;
 mod staging;
 mod terminal_panel;
+mod tree_menus;
 mod update_check;
 mod worktrees;
 
@@ -1701,6 +1702,8 @@ impl SuperGitApp {
         self.debug_commit_once(cx);
         #[cfg(feature = "screenshot")]
         self.debug_drag_once(cx);
+        #[cfg(feature = "screenshot")]
+        self.debug_right_click_once(cx);
         cx.notify();
     }
 

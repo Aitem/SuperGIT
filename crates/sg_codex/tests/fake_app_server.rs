@@ -34,6 +34,8 @@ while IFS= read -r line; do
       fi ;;
     *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
       echo "{\"id\":$id,\"result\":{\"thread\":{\"id\":\"$THREAD\",\"cwd\":\"$PWD\"},\"model\":\"fake-model\",\"reasoningEffort\":\"high\"}}" ;;
+    *'"method":"thread/fork"'*)
+      echo "{\"id\":$id,\"result\":{\"thread\":{\"id\":\"fork-$THREAD\",\"cwd\":\"$PWD\"},\"model\":\"fake-model\",\"reasoningEffort\":\"high\"}}" ;;
     *'"method":"turn/start"'*)
       echo "{\"id\":$id,\"result\":{\"turn\":{\"id\":\"tu-1\",\"status\":\"inProgress\",\"items\":[]}}}"
       echo '{"method":"turn/started","params":{"turn":{"id":"tu-1","status":"inProgress"}}}'
@@ -127,9 +129,14 @@ struct Session {
 
 impl Session {
     fn start(program: &Path, cwd: PathBuf, resume: Option<&str>) -> Self {
+        Self::spawn(program, cwd, resume, false)
+    }
+
+    fn spawn(program: &Path, cwd: PathBuf, resume: Option<&str>, fork: bool) -> Self {
         let (process, events) = CodexProcess::spawn(&SpawnOptions {
             cwd,
             resume: resume.map(String::from),
+            fork,
             policy: Policy::Auto,
             model: None,
             developer_instructions: Some("You work in a worktree.".into()),
@@ -411,6 +418,23 @@ fn crash_reports_and_the_next_turn_resumes_the_thread() {
     assert_eq!(resume["params"]["excludeTurns"], true);
     // The thread keeps the instructions it started with.
     assert!(resume["params"].get("developerInstructions").is_none());
+}
+
+#[test]
+fn a_fork_continues_a_copy_of_the_thread() {
+    let fake = Fake::new("fork", "normal", "0.157.1");
+    let mut s = Session::spawn(&fake.program, fake.worktree("wt"), Some("th-wt"), true);
+    s.send("go on from here");
+    s.until("the prompt", |s| s.convo.status == Status::NeedsPermission);
+    // The copy has an id of its own; the original is not resumed.
+    assert_eq!(s.convo.session_id.as_deref(), Some("fork-th-wt"));
+    assert!(fake.sent("wt", "thread/resume").is_empty());
+    let fork = &fake.sent("wt", "thread/fork")[0];
+    assert_eq!(fork["params"]["threadId"], "th-wt");
+    assert_eq!(fork["params"]["excludeTurns"], true);
+    assert!(fork["params"]["cwd"].as_str().unwrap().ends_with("wt"));
+    let turn = &fake.sent("wt", "turn/start")[0];
+    assert_eq!(turn["params"]["threadId"], "fork-th-wt");
 }
 
 #[test]
