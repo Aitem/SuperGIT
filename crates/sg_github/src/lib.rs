@@ -43,18 +43,23 @@ where
     gh_with_input(repo, args, None)
 }
 
+fn gh_command(repo: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Command {
+    let mut command = Command::new("gh");
+    command
+        .args(args)
+        .current_dir(repo)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1");
+    command
+}
+
 fn gh_with_input<I, S>(repo: &Path, args: I, input: Option<&[u8]>) -> Result<Vec<u8>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let args: Vec<S> = args.into_iter().collect();
-    let mut command = Command::new("gh");
-    command
-        .args(&args)
-        .current_dir(repo)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1");
+    let mut command = gh_command(repo, &args);
     let (out, written) = if let Some(input) = input {
         let mut child = command
             .stdin(Stdio::piped())

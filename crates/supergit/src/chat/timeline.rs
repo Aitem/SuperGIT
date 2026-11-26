@@ -79,18 +79,46 @@ pub(super) fn run_at(
     (calls >= 2).then_some(start..end)
 }
 
+#[derive(Default)]
+pub(super) struct Runs(std::collections::BTreeMap<usize, Range<usize>>);
+
+impl Runs {
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(super) fn lookup(
+        &mut self,
+        items: &[Item],
+        ix: usize,
+        groupable: &dyn Fn(&Item) -> bool,
+    ) -> Option<Range<usize>> {
+        if !groupable(items.get(ix)?) {
+            return None;
+        }
+        if let Some((_, run)) = self.0.range(..=ix).next_back()
+            && run.contains(&ix)
+        {
+            return Some(run.clone());
+        }
+        let run = run_at(items, ix, groupable)?;
+        self.0.insert(run.start, run.clone());
+        Some(run)
+    }
+}
+
 /// The step row `ix` draws, `None` when it is hidden or a user turn.
 fn shape(
     items: &[Item],
     ix: usize,
-    groupable: &dyn Fn(&Item) -> bool,
+    lookup: &mut dyn FnMut(usize) -> Option<Range<usize>>,
     open: &HashSet<usize>,
 ) -> Option<Shape> {
     let item = items.get(ix)?;
     if quiet(item) || matches!(item, Item::User { .. }) {
         return None;
     }
-    Some(match run_at(items, ix, groupable) {
+    Some(match lookup(ix) {
         Some(run) if run.start == ix => Shape::Run(run),
         Some(run) if open.contains(&run.start) => Shape::InRun,
         Some(_) => return None,
@@ -104,7 +132,7 @@ fn turn_edge(
     items: &[Item],
     ix: usize,
     back: bool,
-    groupable: &dyn Fn(&Item) -> bool,
+    lookup: &mut dyn FnMut(usize) -> Option<Range<usize>>,
     open: &HashSet<usize>,
 ) -> bool {
     let mut j = ix;
@@ -123,11 +151,11 @@ fn turn_edge(
         if matches!(items[j], Item::User { .. }) {
             return true;
         }
-        if shape(items, j, groupable, open).is_some() {
+        if shape(items, j, lookup, open).is_some() {
             return false;
         }
         // A hidden call of a folded run: its first call is visible.
-        if let Some(run) = run_at(items, j, groupable) {
+        if let Some(run) = lookup(j) {
             if back {
                 return false;
             }
@@ -139,24 +167,30 @@ fn turn_edge(
 /// How row `ix` is drawn. `groupable`: tool calls that may fold into a run
 /// (not edits, which show their diff); `open`: runs (by first index) the
 /// user unfolded.
-pub(super) fn row(
+pub(super) fn indexed_row(
     items: &[Item],
     ix: usize,
-    groupable: &dyn Fn(&Item) -> bool,
+    lookup: &mut dyn FnMut(usize) -> Option<Range<usize>>,
     open: &HashSet<usize>,
 ) -> Row {
     match items.get(ix) {
         Some(Item::User { .. }) => Row::User,
-        Some(_) => match shape(items, ix, groupable, open) {
+        Some(_) => match shape(items, ix, lookup, open) {
             Some(shape) => Row::Step {
-                first: turn_edge(items, ix, true, groupable, open),
-                last: turn_edge(items, ix, false, groupable, open),
+                first: turn_edge(items, ix, true, lookup, open),
+                last: turn_edge(items, ix, false, lookup, open),
                 shape,
             },
             None => Row::Hidden,
         },
         None => Row::Hidden,
     }
+}
+
+#[cfg(test)]
+fn row(items: &[Item], ix: usize, groupable: &dyn Fn(&Item) -> bool, open: &HashSet<usize>) -> Row {
+    let mut runs = Runs::default();
+    indexed_row(items, ix, &mut |i| runs.lookup(items, i, groupable), open)
 }
 
 /// Is the text at `ix` the agent's last word of its turn (a turn's end, a
