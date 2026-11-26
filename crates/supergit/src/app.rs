@@ -220,6 +220,9 @@ pub struct SuperGitApp {
     window_buttons_at: Option<Point<Pixels>>,
     /// A press on the header that may become a window drag.
     window_drag: bool,
+    /// The conversation last picked in the tree or the agent rail: while it
+    /// is on screen, it — not its worktree — shows selected in the tree.
+    tree_agent: Option<String>,
     settings_open: bool,
     settings_focus: Option<FocusHandle>,
     settings_handle: FocusHandle,
@@ -461,6 +464,7 @@ impl SuperGitApp {
             header_selection,
             window_buttons_at: None,
             window_drag: false,
+            tree_agent: None,
             settings_open: cfg!(feature = "screenshot")
                 && std::env::var_os("SUPERGIT_DEBUG_SETTINGS").is_some(),
             settings_focus: None,
@@ -5184,6 +5188,11 @@ impl SuperGitApp {
         let Some(path) = self.selected.clone() else {
             return;
         };
+        self.tree_agent = self
+            .chats
+            .get(&path)
+            .and_then(|chats| chats.get(ix))
+            .map(|chat| chat.read(cx).local_id().to_string());
         self.active_chat.insert(path, ix);
         self.chat_open = true;
         if let Some(chat) = self.active_chat_entity() {
