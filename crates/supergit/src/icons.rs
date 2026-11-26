@@ -3,7 +3,9 @@
 //! Embedding only these keeps the full 7 MB catalog out of the binary.
 //!
 //! The agents are drawn with their official marks (`assets/agents`, from
-//! Simple Icons, CC0): Claude's, and OpenAI's for Codex.
+//! Simple Icons, CC0): Claude's, and OpenAI's for Codex. A repository is
+//! drawn with Git's logo (`assets/git`, Simple Icons' drawing of the Git
+//! Logo by Jason Long, CC BY 3.0).
 
 use std::borrow::Cow;
 
@@ -14,7 +16,8 @@ use sg_agents::Provider;
 
 const CLAUDE_MARK: &str = "agents/claude.svg";
 const OPENAI_MARK: &str = "agents/openai.svg";
-const AGENT_MARKS: [(&str, &[u8]); 2] = [
+const GIT_MARK: &str = "git/git.svg";
+const AGENT_MARKS: [(&str, &[u8]); 3] = [
     (
         CLAUDE_MARK,
         include_bytes!("../../../assets/agents/claude.svg"),
@@ -23,7 +26,16 @@ const AGENT_MARKS: [(&str, &[u8]); 2] = [
         OPENAI_MARK,
         include_bytes!("../../../assets/agents/openai.svg"),
     ),
+    (GIT_MARK, include_bytes!("../../../assets/git/git.svg")),
 ];
+
+/// Git's orange.
+const GIT_ORANGE: u32 = 0xF05032;
+
+/// Git's logo in its orange: a repository (a project row in the sidebar).
+pub fn git_mark() -> Icon {
+    Icon::empty().path(GIT_MARK).text_color(rgb(GIT_ORANGE))
+}
 
 /// Claude's brand orange.
 const CLAUDE_ORANGE: u32 = 0xD97757;
@@ -171,7 +183,7 @@ mod tests {
 
     #[test]
     fn agent_marks_are_embedded_svgs() {
-        for mark in [CLAUDE_MARK, OPENAI_MARK] {
+        for mark in [CLAUDE_MARK, OPENAI_MARK, GIT_MARK] {
             let svg = AppAssets.load(mark).unwrap().unwrap();
             assert!(svg.starts_with(b"<svg"), "{mark}");
         }

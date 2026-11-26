@@ -18,6 +18,51 @@ const SIGNAL_CELL: f32 = 16.;
 /// between projects, so the rows of one read as a block.
 const PROJECT_ROW: f32 = 40.;
 const WORKTREE_ROW: f32 = 32.;
+/// A conversation's row under its worktree: lower than the worktree's.
+const AGENT_ROW: f32 = 24.;
+/// A worktree's type icon (branch, house) before its name.
+const TYPE_ICON: f32 = 12.;
+/// Where the project row's name starts (padding, chevron, Git's mark and
+/// the gaps): the main checkout's conversations line up under it.
+const MAIN_AGENT_INDENT: f32 = 8. + FOLD_BUTTON + 4. + 14. + 4.;
+
+/// Where a worktree's name starts (its indent, signal cell, type icon and
+/// the gaps): its conversations line up under it.
+fn worktree_agent_indent(completed: bool) -> f32 {
+    let row = if completed {
+        WORKTREE_INDENT + SIGNAL_CELL
+    } else {
+        WORKTREE_INDENT
+    };
+    row + SIGNAL_CELL + 4. + TYPE_ICON + 4.
+}
+
+/// The main checkout's changed files and commits ahead and behind, on its
+/// project's row (only those that are not zero).
+fn main_counts(main: &WorktreeInfo, theme: &gpui_kit::component::Theme) -> AnyElement {
+    let status = main.status.as_ref().ok();
+    let counts = [
+        (IconName::Diff, status.map_or(0, |s| s.files.len() as u64)),
+        (IconName::ArrowUp, status.map_or(0, |s| u64::from(s.ahead))),
+        (
+            IconName::ArrowDown,
+            status.map_or(0, |s| u64::from(s.behind)),
+        ),
+    ];
+    h_flex()
+        .flex_none()
+        .gap_1p5()
+        .children(counts.into_iter().filter(|(_, n)| *n > 0).map(|(icon, n)| {
+            h_flex()
+                .flex_none()
+                .gap_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
+                .child(n.to_string())
+        }))
+        .into_any_element()
+}
 /// Where rows end, from the sidebar's right edge: a project's "+" icon, and
 /// under it the marks of its worktrees.
 const ROW_END: f32 = 16.;
@@ -294,6 +339,21 @@ impl SuperGitApp {
             self.snapshot_scope(root)
         };
         let signal = Signal::of_project(self.project_activity(root, cx));
+        // The project's row is its main checkout: no row of its own below.
+        let (scope, worktrees) = if active {
+            (Some(self.active_scope()), &self.worktrees[..])
+        } else {
+            snapshot.map_or((None, &[][..]), |(scope, worktrees)| {
+                (Some(scope), worktrees)
+            })
+        };
+        let main = worktrees.iter().find(|info| info.wt.is_main);
+        let selected = main.is_some_and(|main| {
+            active
+                && self.selected.as_deref() == Some(main.path())
+                && self.tree_agent_in(main.path(), cx).is_none()
+        });
+        let main_path = main.map(|main| main.wt.path.clone());
         let target = root.to_path_buf();
         let fold_target = root.to_path_buf();
         let add_target = root.to_path_buf();
@@ -306,8 +366,25 @@ impl SuperGitApp {
             .pr(px(ROW_END - (FOLD_BUTTON - 16.) / 2.))
             .gap_1()
             .cursor_pointer()
-            .hover(|el| el.bg(theme.list_hover))
-            .on_click(cx.listener(move |this, _, _, cx| this.click_project(target.clone(), cx)))
+            .when(selected, |el| el.bg(theme.sidebar_accent))
+            .hover(|el| {
+                el.bg(if selected {
+                    theme.sidebar_accent
+                } else {
+                    theme.list_hover
+                })
+            })
+            // Selects the main checkout; the chevron folds.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.tree_agent = None;
+                match main_path.clone() {
+                    Some(path) if this.active_root() == Some(target.as_path()) => {
+                        this.select_worktree(path, cx)
+                    }
+                    Some(path) => this.open_worktree_in(target.clone(), path, cx),
+                    None => this.click_project(target.clone(), cx),
+                }
+            }))
             .child(
                 div()
                     .id("project-fold")
@@ -334,6 +411,17 @@ impl SuperGitApp {
             )
             .child(
                 div()
+                    .id("project-mark")
+                    .flex_none()
+                    .child(crate::icons::git_mark().small())
+                    .tooltip(|window, cx| {
+                        Tooltip::new("Git repository: its row is the main checkout")
+                            .build(window, cx)
+                    })
+                    .tooltip_show_delay(crate::TOOLTIP_DELAY),
+            )
+            .child(
+                div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
@@ -341,6 +429,7 @@ impl SuperGitApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(project_name(root)),
             )
+            .children(main.map(|main| main_counts(main, theme)))
             .when(signal.is_some(), |row| {
                 row.child(self.render_signal("project-signal", signal, root, theme, cx))
             })
@@ -370,6 +459,13 @@ impl SuperGitApp {
             );
         let row = self.project_menu(row, root.to_path_buf(), cx);
 
+        // The main checkout's conversations, under its row.
+        let main_agents = match (folded, scope, main) {
+            (false, Some(scope), Some(main)) => {
+                self.render_agent_rows(main, MAIN_AGENT_INDENT, scope, root, theme, cx)
+            }
+            _ => Vec::new(),
+        };
         let children = if folded {
             None
         } else if active {
@@ -390,6 +486,7 @@ impl SuperGitApp {
                 node.border_t_1().border_color(theme.sidebar_border)
             })
             .child(row)
+            .children(main_agents)
             .children(children)
             .into_any_element()
     }
@@ -432,14 +529,33 @@ impl SuperGitApp {
         let mut completed = Vec::new();
         let mut completed_paths = Vec::new();
         for (ix, info) in worktrees.iter().enumerate() {
+            if info.wt.is_main {
+                continue;
+            }
             if self.completed_in(scope, info, cx) {
                 completed_paths.push(info.wt.path.clone());
                 if !collapsed {
                     completed
                         .push(self.render_worktree_row(ix, info, true, scope, root, theme, cx));
+                    completed.extend(self.render_agent_rows(
+                        info,
+                        worktree_agent_indent(true),
+                        scope,
+                        root,
+                        theme,
+                        cx,
+                    ));
                 }
             } else {
                 open.push(self.render_worktree_row(ix, info, false, scope, root, theme, cx));
+                open.extend(self.render_agent_rows(
+                    info,
+                    worktree_agent_indent(false),
+                    scope,
+                    root,
+                    theme,
+                    cx,
+                ));
             }
         }
         let completed_count = completed_paths.len();
@@ -529,7 +645,11 @@ impl SuperGitApp {
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selected = scope.active && self.selected.as_deref() == Some(info.path());
+        // One selection in the tree: the worktree, unless its conversation
+        // picked last is on screen (that row shows selected instead).
+        let selected = scope.active
+            && self.selected.as_deref() == Some(info.path())
+            && self.tree_agent_in(info.path(), cx).is_none();
         let path = info.wt.path.clone();
         let pr = scope.pr_for_branch(info.wt.branch.as_deref());
         let signal = self.worktree_signal(scope, info, cx);
@@ -570,9 +690,23 @@ impl SuperGitApp {
         let name =
             StyledText::new(name).with_highlights((prefix > 0).then_some((0..prefix, muted)));
 
+        // What it is at a glance: a branch's worktree, or a house for one
+        // on the main line.
+        let on_main_line = matches!(info.wt.branch.as_deref(), Some("main" | "master"));
         let title = h_flex()
             .gap_1()
             .child(self.render_signal("signal", signal, root, theme, cx))
+            .child(
+                div().flex_none().w(px(TYPE_ICON)).child(
+                    Icon::new(if on_main_line {
+                        IconName::House
+                    } else {
+                        IconName::GitBranch
+                    })
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+                ),
+            )
             .child(
                 div()
                     .id(("worktree-name", ix))
@@ -594,22 +728,6 @@ impl SuperGitApp {
                     .flex_none()
                     .pl_1()
                     .gap_1p5()
-                    .when(info.wt.is_main, |el| {
-                        el.child(
-                            div()
-                                .id("main-checkout")
-                                .flex_none()
-                                .child(
-                                    Icon::new(IconName::House)
-                                        .xsmall()
-                                        .text_color(theme.muted_foreground),
-                                )
-                                .tooltip(|window, cx| {
-                                    Tooltip::new("The repository's main checkout").build(window, cx)
-                                })
-                                .tooltip_show_delay(crate::TOOLTIP_DELAY),
-                        )
-                    })
                     .when(kept, |el| el.child(tag("kept")))
                     .when(changed > 0, |el| {
                         el.child(count(IconName::Diff, changed.to_string()))
@@ -659,6 +777,7 @@ impl SuperGitApp {
                 })
             })
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.tree_agent = None;
                 if this.active_root() == Some(open_root.as_path()) {
                     this.select_worktree(path.clone(), cx);
                 } else {
@@ -745,6 +864,181 @@ impl SuperGitApp {
         .into_any_element()
     }
 
+    /// The worktree's conversations, as the agent rail shows them (the
+    /// ready-to-type draft stays out): live ones while the worktree has
+    /// been open, else the saved ones.
+    /// The conversation picked last in the tree or the rail, if it is the
+    /// one on screen and belongs to `path`.
+    fn tree_agent_in(&self, path: &Path, cx: &App) -> Option<&str> {
+        let picked = self.tree_agent.as_deref()?;
+        if !self.chat_open || self.selected.as_deref() != Some(path) {
+            return None;
+        }
+        let ix = self.active_chat.get(path).copied().unwrap_or(0);
+        let chat = self.chats.get(path)?.get(ix)?;
+        (chat.read(cx).local_id() == picked).then_some(picked)
+    }
+
+    fn agents_in(&self, scope: Scope<'_>, info: &WorktreeInfo, cx: &App) -> Vec<AgentEntry> {
+        let path = info.path();
+        let picked = scope.active.then(|| self.tree_agent_in(path, cx)).flatten();
+        // Busy in another process too (Claude Code's registry).
+        let busy_elsewhere = |provider: Provider, id: Option<&str>| {
+            id.is_some_and(|id| {
+                info.sessions
+                    .iter()
+                    .any(|s| s.busy && s.provider == provider && s.id == id)
+            })
+        };
+        if let Some(chats) = self.chats.get(path) {
+            let on_screen =
+                (scope.active && self.chat_open && self.selected.as_deref() == Some(path))
+                    .then(|| self.active_chat.get(path).copied().unwrap_or(0));
+            return chats
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, chat)| {
+                    let chat = chat.read(cx);
+                    (!chat.is_fresh()).then(|| AgentEntry {
+                        provider: chat.provider(),
+                        title: chat.title(),
+                        local_id: chat.local_id().to_string(),
+                        kind: chat.attention().kind,
+                        unread: chat.attention().unread,
+                        working: chat.is_working()
+                            || busy_elsewhere(chat.provider(), chat.session_id()),
+                        on_screen: on_screen == Some(ix),
+                        selected: picked == Some(chat.local_id()),
+                    })
+                })
+                .collect();
+        }
+        scope
+            .view
+            .conversations
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter(|saved| saved.session_id.is_some() || saved.transcript.is_some())
+            .filter_map(|saved| {
+                let provider = Provider::parse(&saved.provider)?;
+                Some(AgentEntry {
+                    provider,
+                    title: if saved.title.trim().is_empty() {
+                        "Conversation".to_string()
+                    } else {
+                        saved.title.clone()
+                    },
+                    local_id: saved.local_id.clone(),
+                    kind: saved.attention.kind,
+                    unread: saved.attention.unread,
+                    working: busy_elsewhere(provider, saved.session_id.as_deref()),
+                    on_screen: false,
+                    selected: false,
+                })
+            })
+            .collect()
+    }
+
+    /// One row per conversation under its worktree: the agent's mark (in its
+    /// colors while it works), the title, and the state's icon when it wants
+    /// the user. A click opens the conversation in the agent panel.
+    /// `indent`: where the parent's name starts, so the marks line up under
+    /// it.
+    fn render_agent_rows(
+        &self,
+        info: &WorktreeInfo,
+        indent: f32,
+        scope: Scope<'_>,
+        root: &Path,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        self.agents_in(scope, info, cx)
+            .into_iter()
+            .map(|agent| {
+                let state = if agent.working {
+                    Some(Kind::Running)
+                } else {
+                    Some(agent.kind)
+                        .filter(|kind| *kind != Kind::Idle && (kind.is_live() || agent.unread))
+                };
+                let mark = if agent.working {
+                    crate::icons::agent_icon(agent.provider)
+                } else {
+                    crate::icons::agent_mark(agent.provider).text_color(theme.muted_foreground)
+                };
+                let tooltip = format!(
+                    "{} · {}\n{}",
+                    agent.provider.label(),
+                    agent.title,
+                    state.map_or("idle", Kind::label)
+                );
+                let (root, worktree) = (root.to_path_buf(), info.wt.path.clone());
+                let (conversation, provider) = (agent.local_id.clone(), agent.provider);
+                h_flex()
+                    .id(SharedString::from(format!("agent-row-{}", agent.local_id)))
+                    .h(px(AGENT_ROW))
+                    .pl(px(indent))
+                    .pr(px(ROW_END))
+                    .gap_1p5()
+                    .text_xs()
+                    .cursor_pointer()
+                    // Picked last and on screen: selected, as a worktree is
+                    // (which then shows unselected), kept under the pointer.
+                    .when(agent.selected, |el| el.bg(theme.sidebar_accent))
+                    .hover(|el| {
+                        el.bg(if agent.selected {
+                            theme.sidebar_accent
+                        } else {
+                            theme.list_hover
+                        })
+                    })
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.tree_agent = Some(conversation.clone());
+                        this.open_project_attention(
+                            root.clone(),
+                            worktree.clone(),
+                            conversation.clone(),
+                            provider,
+                            window,
+                            cx,
+                        );
+                    }))
+                    .child(div().flex_none().child(mark.xsmall()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .when(agent.on_screen, |el| el.font_weight(FontWeight::MEDIUM))
+                            .text_color(if agent.working || agent.unread || agent.on_screen {
+                                theme.sidebar_foreground
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(agent.title),
+                    )
+                    // Shapes, not only colors: a spinner-like ring while it
+                    // works, ! for an approval, ? for a question, ✓ done, ×
+                    // failed.
+                    .when_some(state, |el, kind| {
+                        let icon = signal_icon(kind).unwrap_or(IconName::LoaderCircle);
+                        el.child(
+                            div().flex_none().child(
+                                Icon::new(icon)
+                                    .xsmall()
+                                    .text_color(attention_color(kind, theme)),
+                            ),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     /// A worktree's most urgent signal: its native conversations (exact),
     /// live processes, and in the active project the estimated state of
     /// sessions running outside SuperGIT.
@@ -798,7 +1092,11 @@ impl SuperGitApp {
                 .justify_center()
         };
         let Some(signal) = signal else {
-            return cell().child(dot(theme.border)).into_any_element();
+            // Quiet: gray, but not the border's gray, which vanishes on a
+            // selected row's background.
+            return cell()
+                .child(dot(theme.muted_foreground.opacity(0.6)))
+                .into_any_element();
         };
         let color = attention_color(signal.kind, theme);
         let cell = cell()
@@ -1141,4 +1439,20 @@ fn note(text: String, color: Hsla) -> AnyElement {
         .text_color(color)
         .child(text)
         .into_any_element()
+}
+
+/// A conversation as the tree lists it (see `agents_in`).
+struct AgentEntry {
+    provider: Provider,
+    title: String,
+    local_id: String,
+    kind: Kind,
+    unread: bool,
+    /// Busy with a turn here, or in another process.
+    working: bool,
+    /// The one the agent panel shows.
+    on_screen: bool,
+    /// On screen and picked last in the tree or the rail: the tree's
+    /// selection.
+    selected: bool,
 }

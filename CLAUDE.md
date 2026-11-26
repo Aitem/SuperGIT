@@ -426,6 +426,17 @@ never commit, push or create worktrees there without asking.
   shown; a commit picked in the tree shows in the pane
   (`MainTab::History`), and history loads whenever the tree or a commit
   is on screen.
+- **Sidebar tree**: a repository's row (Git's logo, `icons::git_mark`)
+  is also its main checkout's: a click selects it, its counts and agents
+  show there, and no separate main row is drawn. Linked worktrees follow,
+  each with its branch's icon (a house for `main`/`master`).
+- **Agents in the sidebar**: under each worktree, a row per conversation
+  that has started (`sidebar.rs` `agents_in`: the live chats once the
+  worktree was open, else the saved ones): the agent's mark (in its colors
+  while it works), the title, the state's icon; a click opens it
+  (`open_project_attention`). The same data as the agent rail, which stays
+  for now. The tree has one selection: the conversation picked last in the
+  tree or the rail (`tree_agent`) while it is on screen, else the worktree.
 - **Panel lines**: a resizable split draws the line between its panels
   itself (gpui-component's resize handle, in the first pixel of the panel
   after it). A panel beside a handle draws no border on that side, or the
