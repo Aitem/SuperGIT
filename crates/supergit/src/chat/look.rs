@@ -20,13 +20,6 @@ use sg_agents::chat::{InputResolution, Item, ToolCall};
 
 /// Width of the timeline column left of the agent's steps.
 pub(super) const GUTTER: f32 = 18.;
-/// The conversation's widest column: its rows, the activity line and the
-/// composer; a wider panel centers it. Wide enough for a diff of 100-column
-/// code (rustfmt's limit) beside its line numbers, so edits read without
-/// scrolling sideways. Prose then runs past the 80 characters WCAG 2.2
-/// gives readable text (1.4.8), a trade made for the diffs. In rems, so it
-/// follows the text size.
-pub(super) const COLUMN_MAX: Rems = rems(60.);
 /// Text size of the agent's steps: a size under its prose.
 pub(super) const STEP_TEXT: f32 = 13.;
 /// Max lines of tool output shown when a tool row is expanded.
@@ -35,16 +28,6 @@ pub(super) const OUTPUT_LINES: usize = 40;
 const OUTPUT_CHARS: usize = 16_000;
 /// Lines of a long prompt shown until it is unfolded.
 pub(super) const PROMPT_LINES: usize = 12;
-
-/// `content` in the conversation's column: the panel's width up to
-/// [`COLUMN_MAX`], centered past it.
-pub(super) fn column(content: impl IntoElement) -> Div {
-    h_flex()
-        .flex_none()
-        .w_full()
-        .justify_center()
-        .child(div().flex_1().min_w_0().max_w(COLUMN_MAX).child(content))
-}
 
 /// What marks a step on the timeline.
 #[derive(Clone, Copy)]
