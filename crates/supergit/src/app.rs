@@ -3151,6 +3151,9 @@ impl SuperGitApp {
         };
         if self.window_buttons_at != Some(at) {
             self.window_buttons_at = Some(at);
+            // gpui has this method on macOS only; `FULL_HEIGHT_PANELS` is a
+            // plain `false` elsewhere, so the call must not be compiled there.
+            #[cfg(target_os = "macos")]
             window.set_traffic_light_position(at);
         }
     }
