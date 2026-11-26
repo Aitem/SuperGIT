@@ -128,6 +128,27 @@ fn worktree_lifecycle() {
 }
 
 #[test]
+fn plain_folders_are_no_repository_but_broken_ones_are_errors() {
+    let t = TempRepo::new("find");
+    // A folder inside the repository belongs to it.
+    let inside = t.root().join("docs");
+    std::fs::create_dir_all(&inside).unwrap();
+    let found = Repo::find(&inside).unwrap().unwrap();
+    assert_eq!(canonical(&found.root), canonical(&t.root()));
+
+    // Beside it, a plain folder: no repository, and no error.
+    let folder = t.dir.join("workspace");
+    std::fs::create_dir_all(&folder).unwrap();
+    assert!(Repo::find(&folder).unwrap().is_none());
+
+    // A `.git` Git cannot read is the repository's problem, not a folder.
+    let broken = t.dir.join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "gitdir: /nowhere\n").unwrap();
+    assert!(Repo::find(&broken).is_err());
+}
+
+#[test]
 fn existing_branch_checkout_and_unborn_repo() {
     let t = TempRepo::new("existing");
     t.git(&["branch", "topic"]);

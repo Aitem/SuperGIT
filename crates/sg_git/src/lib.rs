@@ -130,12 +130,32 @@ impl Repo {
         Ok(Self { root, common_dir })
     }
 
+    /// Like [`Repo::discover`], but `Ok(None)` when no repository holds
+    /// `path`: neither it nor a folder above it has a `.git`, and it is no
+    /// bare repository itself — a plain folder. Git's other failures (a
+    /// repository it refuses to read, a broken `.git`) stay errors. Decided
+    /// from the files, not from Git's messages, which may be translated.
+    pub fn find(path: &Path) -> Result<Option<Self>> {
+        match Self::discover(path) {
+            Ok(repo) => Ok(Some(repo)),
+            Err(_) if !looks_like_repository(path) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn name(&self) -> String {
         self.root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.root.display().to_string())
     }
+}
+
+/// A `.git` (folder or file) in `path` or above it, or `path` is a bare
+/// repository (`HEAD` and `objects` in it).
+fn looks_like_repository(path: &Path) -> bool {
+    path.ancestors().any(|dir| dir.join(".git").exists())
+        || (path.join("HEAD").is_file() && path.join("objects").is_dir())
 }
 
 mod clone_repository;

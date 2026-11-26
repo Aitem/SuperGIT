@@ -11,17 +11,73 @@ use sg_git::{Repo, Worktree, WorktreeStatus};
 pub(super) mod history;
 pub use history::{History, HistorySource};
 
+/// A project's folder name.
+pub fn project_name(root: &Path) -> String {
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// What a project is: a Git repository, or a plain folder (a workspace
+/// holding several repositories, notes, anything) where agents and the
+/// terminal work without Git.
+#[derive(Clone, Debug)]
+pub enum Project {
+    Repo(Repo),
+    Folder(PathBuf),
+}
+
+impl Project {
+    /// The project at `path`: the repository holding it, else the folder
+    /// itself.
+    pub fn open(path: &Path) -> Result<Self> {
+        if !path.is_dir() {
+            anyhow::bail!("{} is not a folder", path.display());
+        }
+        Ok(match Repo::find(path)? {
+            Some(repo) => Self::Repo(repo),
+            None => Self::Folder(path.to_path_buf()),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        match self {
+            Self::Repo(repo) => &repo.root,
+            Self::Folder(root) => root,
+        }
+    }
+
+    /// Its places to work: a repository's worktrees, or the folder alone.
+    pub fn load(&self, index: &SharedSessionIndex) -> Result<Vec<WorktreeInfo>> {
+        match self {
+            Self::Repo(repo) => load_worktrees(repo, index),
+            Self::Folder(root) => load_folder(root, index),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorktreeInfo {
     pub wt: Worktree,
     pub status: Result<WorktreeStatus, String>,
     pub sessions: Vec<Session>,
     pub cleanup_identity: Option<sg_git::WorktreeIdentity>,
+    /// A folder project's folder: no Git, so no branch, changes or history.
+    pub folder: bool,
 }
 
 impl WorktreeInfo {
     pub fn path(&self) -> &Path {
         &self.wt.path
+    }
+
+    /// Its name in the UI: the branch (a short sha when detached), or a
+    /// folder's own name.
+    pub fn name(&self) -> String {
+        if self.folder {
+            return project_name(&self.wt.path);
+        }
+        self.wt.display_name()
     }
 
     /// The most attention-worthy state among this worktree's sessions.
@@ -114,9 +170,54 @@ pub fn load_worktrees(repo: &Repo, index: &SharedSessionIndex) -> Result<Vec<Wor
                 status,
                 sessions,
                 cleanup_identity,
+                folder: false,
             },
         )
         .collect())
+}
+
+/// A folder project's one place to work: the folder itself, in the role of
+/// a main checkout without Git (no branch, nothing changed), with the agent
+/// sessions that started in it.
+pub fn load_folder(root: &Path, index: &SharedSessionIndex) -> Result<Vec<WorktreeInfo>> {
+    if !root.is_dir() {
+        anyhow::bail!("{} is not a folder anymore", root.display());
+    }
+    let mut sessions = index
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sessions_by_worktree(&[root.to_path_buf()])
+        .pop()
+        .unwrap_or_default();
+    sessions.retain(|session| started_in(session, root));
+    Ok(vec![WorktreeInfo {
+        wt: Worktree {
+            path: root.to_path_buf(),
+            head: None,
+            branch: None,
+            is_main: true,
+            is_bare: false,
+            is_detached: false,
+            locked: None,
+            prunable: None,
+        },
+        status: Ok(WorktreeStatus::default()),
+        sessions,
+        cleanup_identity: None,
+        folder: true,
+    }])
+}
+
+/// A folder holds whole repositories (a workspace): a session that started
+/// in one of them, or in any other folder under it, is not the folder's.
+/// Its own sessions start in it (and may move on, `cd` into a repository).
+fn started_in(session: &Session, root: &Path) -> bool {
+    session
+        .start_cwd
+        .as_ref()
+        .or(session.cwd.as_ref())
+        .map(PathBuf::as_path)
+        == Some(root)
 }
 
 /// A successful empty result is different from loading or a failed refresh.
@@ -371,6 +472,70 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_folder_without_git_opens_as_a_folder_project() {
+        let dir = TempDir::new();
+        let folder = dir.0.join("workspace");
+        std::fs::create_dir_all(folder.join("notes")).unwrap();
+        let project = Project::open(&folder).unwrap();
+        assert!(matches!(&project, Project::Folder(root) if *root == folder));
+        assert_eq!(project.root(), folder);
+        assert!(Project::open(&folder.join("missing")).is_err());
+
+        // A repository inside it is a project of its own.
+        let repo = folder.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let project = Project::open(&repo.join(".")).unwrap();
+        assert!(matches!(project, Project::Repo(_)));
+
+        // Its one place is named after the folder, not "(unknown)".
+        let place = WorktreeInfo {
+            wt: Worktree {
+                path: folder.clone(),
+                head: None,
+                branch: None,
+                is_main: true,
+                is_bare: false,
+                is_detached: false,
+                locked: None,
+                prunable: None,
+            },
+            status: Ok(WorktreeStatus::default()),
+            sessions: Vec::new(),
+            cleanup_identity: None,
+            folder: true,
+        };
+        assert_eq!(place.name(), "workspace");
+    }
+
+    #[test]
+    fn a_folder_keeps_the_sessions_that_started_in_it() {
+        let session = |start: &str, now: &str| Session {
+            provider: sg_agents::Provider::Claude,
+            id: "s".into(),
+            transcript: PathBuf::new(),
+            title: String::new(),
+            last_prompt: None,
+            git_branch: None,
+            cwd: Some(now.into()),
+            start_cwd: Some(start.into()),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            state: AgentState::Idle,
+            busy: false,
+        };
+        let root = Path::new("/work");
+        assert!(started_in(&session("/work", "/work"), root));
+        // Moved into a repository of the workspace: still the folder's.
+        assert!(started_in(&session("/work", "/work/app"), root));
+        // Started in that repository: its project's, not the folder's.
+        assert!(!started_in(&session("/work/app", "/work/app"), root));
     }
 
     #[test]

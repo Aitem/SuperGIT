@@ -63,12 +63,7 @@ fn wants_attention(kind: Kind, state: &crate::attention::Attention) -> bool {
     state.kind == kind && (kind.is_live() || state.unread)
 }
 
-/// The repository's folder name.
-pub(super) fn project_name(root: &Path) -> String {
-    root.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string())
-}
+pub(super) use crate::model::project_name;
 
 /// `root` with the home directory shortened to `~`.
 pub(super) fn short_path(root: &Path) -> String {
@@ -84,7 +79,33 @@ pub(super) fn short_path(root: &Path) -> String {
 
 impl SuperGitApp {
     pub(super) fn active_root(&self) -> Option<&Path> {
-        self.repo.as_ref().map(|repo| repo.root.as_path())
+        self.repo
+            .as_ref()
+            .map(|repo| repo.root.as_path())
+            .or(self.folder.as_deref())
+    }
+
+    /// A project is open: a repository or a folder (else the welcome screen).
+    pub(super) fn project_open(&self) -> bool {
+        self.repo.is_some() || self.folder.is_some()
+    }
+
+    /// The active project, to load in the background.
+    pub(super) fn active_project(&self) -> Option<model::Project> {
+        match (&self.repo, &self.folder) {
+            (Some(repo), _) => Some(model::Project::Repo(repo.clone())),
+            (None, Some(root)) => Some(model::Project::Folder(root.clone())),
+            (None, None) => None,
+        }
+    }
+
+    /// `root` is a plain folder, not a Git repository: the active project
+    /// knows; another one as it was last opened or read.
+    pub(super) fn is_folder_project(&self, root: &Path) -> bool {
+        if self.active_root() == Some(root) {
+            return self.folder.is_some();
+        }
+        self.persisted.projects.is_folder(root)
     }
 
     /// Switching projects in the middle of a worktree operation would apply
@@ -193,18 +214,24 @@ impl SuperGitApp {
         }
         let index = self.index.clone();
         let request = root.clone();
+        // A folder has no pull requests: no `gh` call for it.
+        let folder_hint = self.persisted.projects.is_folder(&root);
         let task = cx.spawn(async move |this, cx| {
             let worktrees = cx.background_executor().spawn({
                 let root = request.clone();
                 async move {
-                    let repo = Repo::discover(&root)?;
-                    model::load_worktrees(&repo, &index)
+                    let project = model::Project::open(&root)?;
+                    let folder = matches!(project, model::Project::Folder(_));
+                    project.load(&index).map(|worktrees| (worktrees, folder))
                 }
             });
+            // Next to the worktrees.
             let prs = cx.background_executor().spawn({
                 let root = request.clone();
                 async move {
-                    if sg_github::gh_available() {
+                    if folder_hint {
+                        Err("Pull requests load once the project is open".to_string())
+                    } else if sg_github::gh_available() {
                         sg_github::list_prs(&root, 100, 30).map_err(|e| e.to_string())
                     } else {
                         Err("gh CLI not found — install it for pull requests".to_string())
@@ -212,12 +239,22 @@ impl SuperGitApp {
                 }
             });
             let worktrees = worktrees.await;
+            let folder = worktrees.as_ref().is_ok_and(|(_, folder)| *folder);
             let listed = this
                 .update(cx, |this, cx| {
-                    this.apply_project_worktrees(&request, worktrees, cx)
+                    this.apply_project_worktrees(
+                        &request,
+                        worktrees.map(|(worktrees, _)| worktrees),
+                        folder,
+                        cx,
+                    )
                 })
                 .unwrap_or(false);
-            if !listed {
+            if !listed || folder {
+                if folder {
+                    this.update(cx, |this, _| this.project_loads.remove(&request))
+                        .ok();
+                }
                 return;
             }
             let prs = prs.await;
@@ -233,6 +270,7 @@ impl SuperGitApp {
         &mut self,
         root: &Path,
         result: anyhow::Result<Vec<WorktreeInfo>>,
+        folder: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         // Opened meanwhile (it polls itself now) or removed.
@@ -244,6 +282,10 @@ impl SuperGitApp {
         }
         match result {
             Ok(worktrees) => {
+                if self.persisted.projects.is_folder(root) != folder {
+                    self.persisted.projects.set_folder(root, folder);
+                    self.queue_persist(cx);
+                }
                 match self.project_cache.get_mut(root) {
                     Some(snapshot) => snapshot.worktrees = worktrees,
                     None => {
@@ -455,7 +497,7 @@ impl SuperGitApp {
 
     /// The sidebar is shown once there is a project to list.
     pub(super) fn projects_visible(&self) -> bool {
-        self.repo.is_some() || !self.persisted.projects.roots.is_empty()
+        self.project_open() || !self.persisted.projects.roots.is_empty()
     }
 
     /// "+": recent repositories not in the sidebar yet, and the folder dialog.

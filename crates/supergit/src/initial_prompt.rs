@@ -5,8 +5,9 @@
 //!
 //! The template (`Settings::initial_prompt`, this default when unset) takes
 //! placeholders — `{worktree}`, `{branch}`, `{repo}`, `{repo_name}` — and
-//! two sections: `{#linked}…{/linked}` shows only in a linked worktree,
-//! `{#main}…{/main}` only in the main checkout. Any other brace is text.
+//! three sections: `{#linked}…{/linked}` shows only in a linked worktree,
+//! `{#main}…{/main}` only in the main checkout, `{#folder}…{/folder}` only
+//! in a folder project (no Git). Any other brace is text.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,8 @@ Main checkout: {repo}. The repository's other worktrees sit next to it, and othe
 - Stay on {branch}: a branch checked out in another worktree can't be checked out here.{/linked}\
 {#main}You are working in the main checkout of {repo_name}: {repo}, on branch {branch}, opened in SuperGIT.
 
-The repository may have other worktrees, with other agents working in them. Edit files only here, and keep in mind that commits, branches and the stash are shared with them.{/main}";
+The repository may have other worktrees, with other agents working in them. Edit files only here, and keep in mind that commits, branches and the stash are shared with them.{/main}\
+{#folder}You are working in the folder {worktree}, opened in SuperGIT. It is not a Git repository itself, though it may hold some. Other agents may be working in it at the same time.{/folder}";
 
 /// Where an agent works, for the placeholders.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,12 +39,15 @@ pub struct Place {
     pub repo: PathBuf,
     /// A linked worktree, not the main checkout.
     pub linked: bool,
+    /// A folder project: `worktree` and `repo` are the folder, no Git.
+    pub folder: bool,
 }
 
 impl Place {
     fn value(&self, name: &str) -> Option<String> {
         Some(match name {
             "worktree" => self.worktree.display().to_string(),
+            "branch" if self.folder => "no branch".into(),
             "branch" => self
                 .branch
                 .clone()
@@ -56,7 +61,8 @@ impl Place {
     fn holds(&self, section: &str) -> Option<bool> {
         match section {
             "linked" => Some(self.linked),
-            "main" => Some(!self.linked),
+            "main" => Some(!self.linked && !self.folder),
+            "folder" => Some(self.folder),
             _ => None,
         }
     }
@@ -150,6 +156,7 @@ mod tests {
             branch: Some("feature/login".into()),
             repo: "/src/app".into(),
             linked: true,
+            folder: false,
         }
     }
 
@@ -159,6 +166,17 @@ mod tests {
             branch: Some("main".into()),
             repo: "/src/app".into(),
             linked: false,
+            folder: false,
+        }
+    }
+
+    fn folder() -> Place {
+        Place {
+            worktree: "/work/space".into(),
+            branch: None,
+            repo: "/work/space".into(),
+            linked: false,
+            folder: true,
         }
     }
 
@@ -207,5 +225,16 @@ mod tests {
         assert!(!main.contains("Worktree:"));
         assert!(!main.contains('{'));
         assert_eq!(render("{#main}only main{/main}", &linked()), "");
+        let in_folder = render(DEFAULT, &folder());
+        assert!(in_folder.starts_with("You are working in the folder /work/space"));
+        assert!(!in_folder.contains("Git worktree") && !in_folder.contains("main checkout"));
+        assert!(!in_folder.contains('{'));
+        assert_eq!(
+            render(
+                "{#main}main{/main}{#folder}{repo_name} on {branch}{/folder}",
+                &folder()
+            ),
+            "space on no branch"
+        );
     }
 }

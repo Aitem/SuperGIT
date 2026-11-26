@@ -216,6 +216,9 @@ pub struct Projects {
     pub sidebar_width: f32,
     /// Projects folded in the tree: their worktrees are hidden.
     pub folded: Vec<PathBuf>,
+    /// Projects that are plain folders, not Git repositories, as last
+    /// opened or read: the tree draws them so before they load.
+    pub folders: Vec<PathBuf>,
 }
 
 impl Default for Projects {
@@ -225,6 +228,7 @@ impl Default for Projects {
             collapsed: false,
             sidebar_width: 340.,
             folded: Vec::new(),
+            folders: Vec::new(),
         }
     }
 }
@@ -235,9 +239,10 @@ impl Projects {
         let mut seen = std::collections::HashSet::new();
         self.roots.retain(|root| seen.insert(root.clone()));
         let roots = &self.roots;
-        let mut seen = std::collections::HashSet::new();
-        self.folded
-            .retain(|root| roots.contains(root) && seen.insert(root.clone()));
+        for list in [&mut self.folded, &mut self.folders] {
+            let mut seen = std::collections::HashSet::new();
+            list.retain(|root| roots.contains(root) && seen.insert(root.clone()));
+        }
     }
 
     pub fn is_folded(&self, root: &Path) -> bool {
@@ -248,6 +253,17 @@ impl Projects {
         self.folded.retain(|known| known != root);
         if folded {
             self.folded.push(root.to_path_buf());
+        }
+    }
+
+    pub fn is_folder(&self, root: &Path) -> bool {
+        self.folders.iter().any(|known| known == root)
+    }
+
+    pub fn set_folder(&mut self, root: &Path, folder: bool) {
+        self.folders.retain(|known| known != root);
+        if folder {
+            self.folders.push(root.to_path_buf());
         }
     }
 
@@ -362,13 +378,17 @@ mod tests {
 
         // `width` is the old Projects panel's: the tree ignores it.
         let mut projects: Projects = serde_json::from_str(
-            r#"{"roots":["/a","/b","/a"],"width":200,"sidebar_width":9000,"folded":["/b","/gone","/b"]}"#,
+            r#"{"roots":["/a","/b","/a"],"width":200,"sidebar_width":9000,"folded":["/b","/gone","/b"],"folders":["/a","/gone"]}"#,
         )
         .unwrap();
         projects.sanitize();
         assert_eq!(projects.roots, [PathBuf::from("/a"), PathBuf::from("/b")]);
         assert_eq!(projects.sidebar_width, 520.);
         assert_eq!(projects.folded, [PathBuf::from("/b")]);
+        assert_eq!(projects.folders, [PathBuf::from("/a")]);
+        assert!(projects.is_folder(Path::new("/a")) && !projects.is_folder(Path::new("/b")));
+        projects.set_folder(Path::new("/a"), false);
+        assert!(projects.folders.is_empty());
         assert!(projects.is_folded(Path::new("/b")));
         projects.set_folded(Path::new("/b"), false);
         projects.set_folded(Path::new("/a"), true);
