@@ -111,7 +111,8 @@ pub struct RepositoryView {
     /// while the conversation is hidden).
     pub review_width: f32,
     pub changes_width: f32,
-    pub history_width: f32,
+    /// The commit tree's height above a commit's details (History).
+    pub history_height: f32,
     /// File list beside a commit's diff in the History tab.
     pub commit_files_width: f32,
     /// The pull request list beside a PR's details.
@@ -122,6 +123,9 @@ pub struct RepositoryView {
     /// File lists (Changes, and a commit's files in History) show a folder
     /// tree instead of flat paths.
     pub changes_tree: bool,
+    /// A commit's file list shows beside its diff (History); hidden, the
+    /// diff takes the width.
+    pub commit_files_open: bool,
     /// What the History tab lists: every branch, or this one.
     pub history_scope: crate::model::history::HistoryScope,
     /// The review panel shows right of the conversation (the right rail's
@@ -174,12 +178,13 @@ impl Default for RepositoryView {
             active_conversations: BTreeMap::new(),
             review_width: 600.,
             changes_width: 300.,
-            history_width: 300.,
+            history_height: 280.,
             commit_files_width: 240.,
             pulls_width: 320.,
             chat_open: true,
             terminal_height: 280.,
             changes_tree: false,
+            commit_files_open: false,
             history_scope: Default::default(),
             review_open: false,
             review_tab: ReviewTab::History,
@@ -191,7 +196,7 @@ impl RepositoryView {
     pub fn sanitize(&mut self) {
         self.review_width = finite(self.review_width, 600.).clamp(360., 1600.);
         self.changes_width = finite(self.changes_width, 300.).clamp(140., 600.);
-        self.history_width = finite(self.history_width, 300.).clamp(160., 800.);
+        self.history_height = finite(self.history_height, 280.).clamp(120., 2000.);
         self.commit_files_width = finite(self.commit_files_width, 240.).clamp(140., 600.);
         self.pulls_width = finite(self.pulls_width, 320.).clamp(200., 640.);
         self.terminal_height = finite(self.terminal_height, 280.).clamp(100., 2000.);

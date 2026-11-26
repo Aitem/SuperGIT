@@ -271,6 +271,12 @@ impl DifftView {
     }
 
     /// Scrolls to `path`'s header.
+    /// The first row shows at the top: nothing above to scroll back to.
+    pub fn at_top(&self) -> bool {
+        let top = self.list.logical_scroll_top();
+        top.item_ix == 0 && top.offset_in_item <= Pixels::ZERO
+    }
+
     pub fn scroll_to_file(&mut self, path: &str, cx: &mut Context<Self>) {
         let target = self.items.iter().position(
             |item| matches!(item, Item::Header(file) if self.files[*file].file.path == path),
