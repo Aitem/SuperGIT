@@ -13,6 +13,7 @@ mod staged_commit;
 mod staging;
 mod terminal_panel;
 mod tree_menus;
+mod tree_rename;
 mod update_check;
 mod worktrees;
 
@@ -225,6 +226,8 @@ pub struct SuperGitApp {
     /// The conversation last picked in the tree or the agent rail: while it
     /// is on screen, it — not its worktree — shows selected in the tree.
     tree_agent: Option<String>,
+    /// A conversation being renamed in the tree (`tree_rename`).
+    renaming: Option<tree_rename::Rename>,
     settings_open: bool,
     settings_focus: Option<FocusHandle>,
     settings_handle: FocusHandle,
@@ -468,6 +471,7 @@ impl SuperGitApp {
             window_buttons_at: None,
             window_drag: false,
             tree_agent: None,
+            renaming: None,
             settings_open: cfg!(feature = "screenshot")
                 && std::env::var_os("SUPERGIT_DEBUG_SETTINGS").is_some(),
             settings_focus: None,
@@ -1038,9 +1042,9 @@ impl SuperGitApp {
                     entries.push(Entry {
                         key: format!("chat:{}:{}", path.display(), chat.local_id),
                         path: path.clone(),
-                        title: chat.title.clone(),
+                        title: chat.display_title().to_string(),
                         detail: format!("{} · {branch} · {}", provider.label(), path.display()),
-                        search: format!("{} {search} {}", chat.title, provider.as_str()),
+                        search: format!("{} {search} {}", chat.display_title(), provider.as_str()),
                         destination: Destination::Conversation(chat.local_id.clone()),
                     });
                 }

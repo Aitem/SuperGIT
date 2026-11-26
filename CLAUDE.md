@@ -364,7 +364,9 @@ commit two seconds after startup, like a click;
 two window points (= PNG pixels) five seconds after startup, drawing a frame
 per step, and prints what `cmd-c` would copy (text selection checks);
 `SUPERGIT_DEBUG_RIGHT_CLICK=x,y` (screenshot builds) right-clicks that point
-five seconds after startup (context menus; take the shot a bit later);
+five seconds after startup (context menus; take the shot a bit later), and
+`=x,y,mx,my` then clicks the menu item at `mx,my`;
+`SUPERGIT_DEBUG_DOUBLE_CLICK=x,y` double-clicks it (renaming a conversation);
 `SUPERGIT_DEBUG_PR=<number>` (screenshot builds, with `SUPERGIT_TAB=prs`)
 selects that pull request, `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its details
 (conversation, review threads), `SUPERGIT_DEBUG_PR_FILES=1` opens its Files
@@ -454,14 +456,20 @@ never commit, push or create worktrees there without asking.
   checkout (New Worktree…, new conversations, open/reveal/terminal, Copy
   Path, Remove from Projects), worktree (new conversations, Rebase, open,
   copy path/branch, Keep Active, Delete Worktree… → the cleanup preview),
-  conversation (Fork, Mark as Read, copy session id / resume command,
-  reveal transcript, Close). Rows of a project that is not open get only
+  conversation (Rename…, Fork, Mark as Read, copy session id / resume
+  command, reveal transcript, Close). Rows of a project that is not open get only
   what needs no open project. Close stops the agent and drops the row; the
   transcript stays (Agents tab → Open). Fork: `ChatSession::fork_seed` →
   `restore` with `fork_from` = the original's id; it shows that history and
   starts as a copy (Claude `--resume <id> --fork-session`, plus
   `--session-id <new>` in the TUI; Codex `thread/fork` / `codex fork <id>`)
   until its agent names its own session.
+- **Renaming a conversation** (`app/tree_rename.rs`): Rename… or a double
+  click turns its title in the tree into a field, as in VS Code (all
+  selected; Return or a click elsewhere keeps it, Escape does not; empty
+  = the agent's title again). The name is SuperGIT's
+  (`SavedConversation::name`, `ChatSession::set_name`; `title` stays the
+  agent's): transcripts are not written.
 - **Panel lines**: a resizable split draws the line between its panels
   itself (gpui-component's resize handle, in the first pixel of the panel
   after it). A panel beside a handle draws no border on that side, or the

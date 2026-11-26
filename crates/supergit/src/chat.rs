@@ -161,6 +161,9 @@ pub struct ChatSession {
     /// session's history, and its agent starts as a copy of it (Claude's
     /// `--fork-session`, Codex's `thread/fork`). The original stays as it is.
     fork_from: Option<String>,
+    /// The name the user gave it (Rename): shown instead of the agent's
+    /// title, which keeps changing underneath.
+    name: Option<String>,
     convo: Conversation,
     backend: Backend,
     options: options::AgentOptions,
@@ -274,6 +277,8 @@ impl ChatSession {
             transcript: None,
             fork_from: Some(id),
             title: format!("{} (fork)", self.title()),
+            // A named original's fork keeps a name too.
+            name: self.name.as_ref().map(|name| format!("{name} (fork)")),
             draft: String::new(),
             attachments: Vec::new(),
             attention: Default::default(),
@@ -317,6 +322,7 @@ impl ChatSession {
             chat.local_id = saved.local_id.clone();
         }
         // A fork that has not started yet shows its original's history.
+        chat.name = saved.name.clone().filter(|name| !name.trim().is_empty());
         chat.fork_from = saved
             .fork_from
             .clone()
@@ -388,7 +394,7 @@ impl ChatSession {
             session_id: self.convo.session_id.clone(),
             transcript,
             cwd: self.cwd.clone(),
-            title: self.title(),
+            title: self.agent_title(),
             model: self.options.model.clone(),
             effort: self.options.effort.clone(),
             draft: self.input.read(cx).value().to_string(),
@@ -404,6 +410,7 @@ impl ChatSession {
             },
             terminal: self.is_terminal(),
             fork_from: self.fork_from.clone(),
+            name: self.name.clone(),
         }
     }
 
@@ -458,6 +465,7 @@ impl ChatSession {
             ),
             transcript: None,
             fork_from: None,
+            name: None,
             convo,
             backend,
             options: Default::default(),
@@ -601,12 +609,30 @@ impl ChatSession {
         self.convo.session_id.as_deref()
     }
 
+    /// The name the user gave it, else the agent's title.
     pub fn title(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.agent_title())
+    }
+
+    /// What the agent calls it (its transcript, its TUI), whatever the
+    /// user named it.
+    fn agent_title(&self) -> String {
         self.convo
             .title
             .clone()
             .or_else(|| self.terminal_title().map(str::to_string))
             .unwrap_or_else(|| "New conversation".into())
+    }
+
+    /// Rename: `None` (or blank) gives back the agent's own title.
+    pub fn set_name(&mut self, name: Option<String>, cx: &mut Context<Self>) {
+        let name = name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        if self.name != name {
+            self.name = name;
+            cx.notify();
+        }
     }
 
     /// The agent is busy with a turn here: working, or stopped on a

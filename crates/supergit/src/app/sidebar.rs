@@ -897,10 +897,10 @@ impl SuperGitApp {
                 let provider = Provider::parse(&saved.provider)?;
                 Some(AgentEntry {
                     provider,
-                    title: if saved.title.trim().is_empty() {
+                    title: if saved.display_title().trim().is_empty() {
                         "Conversation".to_string()
                     } else {
-                        saved.title.clone()
+                        saved.display_title().to_string()
                     },
                     local_id: saved.local_id.clone(),
                     kind: saved.attention.kind,
@@ -962,10 +962,16 @@ impl SuperGitApp {
                     cwd: agent.cwd.clone(),
                     transcript: agent.transcript.clone(),
                     can_fork: agent.can_fork,
+                    title: agent.title.clone(),
                     unread: agent.unread,
                     working: agent.working,
                     active: scope.active,
                 };
+                // Being renamed: the title is a field, the row neither
+                // opens the conversation nor shows its tooltip meanwhile.
+                let field = self.rename_field(&worktree, &agent.local_id, cx);
+                let renaming = field.is_some();
+                let current = agent.title.clone();
                 let row = h_flex()
                     .id(SharedString::from(format!("agent-row-{}", agent.local_id)))
                     .h(px(AGENT_ROW))
@@ -984,21 +990,39 @@ impl SuperGitApp {
                             theme.list_hover
                         })
                     })
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.tree_agent = Some(conversation.clone());
-                        this.open_project_attention(
-                            root.clone(),
-                            worktree.clone(),
-                            conversation.clone(),
-                            provider,
-                            window,
-                            cx,
-                        );
-                    }))
+                    .when(!renaming, |row| {
+                        row.tooltip(move |window, cx| {
+                            Tooltip::new(tooltip.clone()).build(window, cx)
+                        })
+                        .tooltip_show_delay(crate::TOOLTIP_DELAY)
+                        // A click opens it, a double click renames it.
+                        .on_click(cx.listener(
+                            move |this, event: &ClickEvent, window, cx| {
+                                if event.click_count() >= 2 {
+                                    this.start_rename(
+                                        root.clone(),
+                                        worktree.clone(),
+                                        conversation.clone(),
+                                        current.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                this.tree_agent = Some(conversation.clone());
+                                this.open_project_attention(
+                                    root.clone(),
+                                    worktree.clone(),
+                                    conversation.clone(),
+                                    provider,
+                                    window,
+                                    cx,
+                                );
+                            },
+                        ))
+                    })
                     .child(div().flex_none().child(mark.xsmall()))
-                    .child(
+                    .child(field.unwrap_or_else(|| {
                         div()
                             .flex_1()
                             .min_w_0()
@@ -1009,8 +1033,9 @@ impl SuperGitApp {
                             } else {
                                 theme.muted_foreground
                             })
-                            .child(agent.title),
-                    )
+                            .child(agent.title)
+                            .into_any_element()
+                    }))
                     // Shapes, not only colors: a spinner-like ring while it
                     // works, ! for an approval, ? for a question, ✓ done, ×
                     // failed.
