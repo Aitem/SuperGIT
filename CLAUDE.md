@@ -15,7 +15,8 @@ Platform differences stay behind small seams; keep both working:
   gpui-component's `AppMenuBar`, drawn in the title bar (`menu_bar`).
 - Window chrome: on macOS the side panels reach the window's top edge
   (`FULL_HEIGHT_PANELS`) and the window buttons sit in the first row: the
-  sidebar's header, or beside its rail when it is collapsed
+  sidebar's header, or beside its rail when it is collapsed: the agent
+  panel's header, the review's while the panel is closed
   (`sync_window_buttons`). A row they sit in starts `WINDOW_BUTTONS_INSET`
   further right and moves the window through `window_drag_area`. Elsewhere,
   and on macOS without a sidebar, a `TitleBar` row spans the window. Keep
@@ -421,6 +422,11 @@ never commit, push or create worktrees there without asking.
   `IconName` (lucide) draws nothing until it is listed in
   `icons::ExtraIcons` (and in the `icons_used_by_the_app_are_embedded`
   test).
+- **Window columns**: sidebar | agent panel (the chat, takes the room
+  left) | review (the worktree's header, review bar, commit tree, terminal
+  panel, status bar; a saved width, `RepositoryView::review_width`, kept
+  when the window resizes) | agent rail. With the panel closed (`cmd-l`)
+  the review fills the room up to the rail.
 - **Review layout**: under the worktree's header, a bar across the review
   holds History — a toggle for the commit tree (`cmd-shift-h`,
   `RepositoryView::history_open`) — and the Changes / Agents / Pull

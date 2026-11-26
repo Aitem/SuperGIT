@@ -96,7 +96,9 @@ pub struct RepositoryView {
     pub worktrees: BTreeMap<PathBuf, WorktreeView>,
     pub conversations: BTreeMap<PathBuf, Vec<SavedConversation>>,
     pub active_conversations: BTreeMap<PathBuf, usize>,
-    pub chat_width: f32,
+    /// The review's width beside the agent panel (it fills the room while
+    /// the panel is closed).
+    pub review_width: f32,
     pub changes_width: f32,
     pub history_width: f32,
     /// File list beside a commit's diff in the History tab.
@@ -134,7 +136,7 @@ impl Default for RepositoryView {
             worktrees: BTreeMap::new(),
             conversations: BTreeMap::new(),
             active_conversations: BTreeMap::new(),
-            chat_width: 480.,
+            review_width: 600.,
             changes_width: 300.,
             history_width: 300.,
             commit_files_width: 240.,
@@ -150,7 +152,7 @@ impl Default for RepositoryView {
 
 impl RepositoryView {
     pub fn sanitize(&mut self) {
-        self.chat_width = finite(self.chat_width, 480.).clamp(320., 960.);
+        self.review_width = finite(self.review_width, 600.).clamp(360., 1600.);
         self.changes_width = finite(self.changes_width, 300.).clamp(140., 600.);
         self.history_width = finite(self.history_width, 300.).clamp(160., 800.);
         self.commit_files_width = finite(self.commit_files_width, 240.).clamp(140., 600.);
@@ -289,9 +291,9 @@ mod tests {
     #[test]
     fn old_and_partial_state_load_with_defaults() {
         let mut state: RepositoryView =
-            serde_json::from_str(r#"{"chat_width":9999,"future":true}"#).unwrap();
+            serde_json::from_str(r#"{"review_width":9999,"future":true}"#).unwrap();
         state.sanitize();
-        assert_eq!(state.chat_width, 960.);
+        assert_eq!(state.review_width, 1600.);
         assert!(state.chat_open);
         assert!(!state.auto_cleanup);
         assert_eq!(state.protected_branches, ["main", "master"]);
