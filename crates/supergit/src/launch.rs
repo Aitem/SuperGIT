@@ -45,6 +45,16 @@ pub fn resume_command(provider: sg_agents::Provider, session_id: &str) -> String
     }
 }
 
+/// The same from any shell: first into `cwd`, where the session started
+/// (`--resume` looks for it there).
+pub fn resume_command_in(provider: sg_agents::Provider, session_id: &str, cwd: &Path) -> String {
+    format!(
+        "cd {} && {}",
+        shell_quote(&cwd.to_string_lossy()),
+        resume_command(provider, session_id)
+    )
+}
+
 /// `SUPERGIT_EDITOR` (a CLI like `code`, `zed`, `cursor`), else VS Code
 /// (on Linux the first of VS Code, VSCodium, Zed, Cursor on `PATH`).
 pub fn open_in_editor(dir: &Path) -> Result<()> {

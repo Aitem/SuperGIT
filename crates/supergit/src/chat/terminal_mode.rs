@@ -148,15 +148,30 @@ impl ChatSession {
     }
 
     /// What to run: a new session with an id we choose (so it can be
-    /// resumed and recognized), or the existing one.
+    /// resumed and recognized), the existing one, or a fork's copy of its
+    /// original.
     fn terminal_spawn(&mut self, cx: &App) -> Spawn {
         let resume = self.convo.session_id.clone().filter(|_| self.has_history());
+        let fork = self.fork_from.take().filter(|_| resume.is_none());
         let initial_prompt = crate::initial_prompt::for_worktree(&self.worktree, cx);
         let (program, args) = match self.provider() {
             Provider::Claude => {
-                let mut args: Vec<String> = match resume {
-                    Some(id) => vec!["--resume".into(), id],
-                    None => {
+                let mut args: Vec<String> = match (resume, fork) {
+                    (Some(id), _) => vec!["--resume".into(), id],
+                    // The copy gets an id we choose, as a new session does.
+                    (None, Some(original)) => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        self.convo.session_id = Some(id.clone());
+                        self.transcript = None;
+                        vec![
+                            "--resume".into(),
+                            original,
+                            "--fork-session".into(),
+                            "--session-id".into(),
+                            id,
+                        ]
+                    }
+                    (None, None) => {
                         let id = uuid::Uuid::new_v4().to_string();
                         self.convo.session_id = Some(id.clone());
                         vec!["--session-id".into(), id]
@@ -173,12 +188,14 @@ impl ChatSession {
                 let program = sg_codex::install::locate()
                     .map(|found| found.program)
                     .unwrap_or_else(|_| "codex".into());
-                let args = match resume {
-                    Some(id) => vec!["resume".into(), id],
+                let args = match (resume, fork) {
+                    (Some(id), _) => vec!["resume".into(), id],
+                    // The copy keeps its original's instructions.
+                    (None, Some(original)) => vec!["fork".into(), original],
                     // A new thread keeps its instructions. A config
                     // override; its value a TOML string (JSON's escapes
                     // are TOML's).
-                    None => initial_prompt
+                    (None, None) => initial_prompt
                         .map(|prompt| {
                             vec![
                                 "-c".into(),

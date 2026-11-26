@@ -77,6 +77,10 @@ pub struct SavedConversation {
     /// Shown as the agent's TUI in the embedded terminal, not as a chat.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub terminal: bool,
+    /// A fork not started yet: the session it copies (its history shows
+    /// until the fork's agent names a session of its own).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_from: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

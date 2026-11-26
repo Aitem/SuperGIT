@@ -299,7 +299,7 @@ impl SuperGitApp {
 
     /// Remove a project from the panel. Its conversations are saved (adding
     /// the project again restores them) and their idle processes stop.
-    fn remove_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn remove_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         let busy = self.project_chats(&root).any(|(_, chat)| {
             matches!(
                 chat.read(cx).status(),

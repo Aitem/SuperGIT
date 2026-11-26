@@ -129,6 +129,11 @@ fn placeholder(provider: Provider) -> String {
     format!("Ask {}…", provider.label())
 }
 
+/// Where Claude Code keeps the transcript of session `id` started in `cwd`.
+fn claude_transcript(cwd: &std::path::Path, id: &str) -> Option<PathBuf> {
+    Some(sg_agents::project_dir(cwd)?.join(format!("{id}.jsonl")))
+}
+
 /// What a conversation tells the app.
 pub enum ChatEvent {
     /// `Chat | Terminal` picked for a new conversation: the default from now
@@ -152,6 +157,10 @@ pub struct ChatSession {
     cwd: PathBuf,
     local_id: String,
     transcript: Option<PathBuf>,
+    /// A fork of this session that has no id of its own yet: it shows that
+    /// session's history, and its agent starts as a copy of it (Claude's
+    /// `--fork-session`, Codex's `thread/fork`). The original stays as it is.
+    fork_from: Option<String>,
     convo: Conversation,
     backend: Backend,
     options: options::AgentOptions,
@@ -242,6 +251,35 @@ impl ChatSession {
         chat
     }
 
+    /// What a fork of this conversation restores from (`restore`): its
+    /// history so far, continued from the first message on as a copy of its
+    /// session, in the same view (chat or TUI) and with the same options.
+    /// `None` while there is no session with history to copy.
+    pub fn fork_seed(&self, cx: &App) -> Option<crate::workspace::SavedConversation> {
+        let id = self
+            .convo
+            .session_id
+            .clone()
+            .or_else(|| self.fork_from.clone())?;
+        // `--resume` fails without a transcript: nothing was said yet.
+        if self.provider() == Provider::Claude
+            && !claude_transcript(&self.cwd, &id).is_some_and(|path| path.is_file())
+        {
+            return None;
+        }
+        Some(crate::workspace::SavedConversation {
+            local_id: String::new(),
+            session_id: None,
+            transcript: None,
+            fork_from: Some(id),
+            title: format!("{} (fork)", self.title()),
+            draft: String::new(),
+            attachments: Vec::new(),
+            attention: Default::default(),
+            ..self.snapshot(cx)
+        })
+    }
+
     /// Restore visible history and an unsent draft, without starting an agent.
     pub fn restore(
         worktree: PathBuf,
@@ -277,7 +315,17 @@ impl ChatSession {
         if !saved.local_id.is_empty() {
             chat.local_id = saved.local_id.clone();
         }
-        chat.transcript = saved.transcript.clone().filter(|p| p.is_file());
+        // A fork that has not started yet shows its original's history.
+        chat.fork_from = saved
+            .fork_from
+            .clone()
+            .filter(|_| saved.session_id.is_none());
+        chat.transcript = match (&chat.fork_from, provider) {
+            (Some(id), Provider::Claude) => claude_transcript(&chat.cwd, id),
+            (Some(_), Provider::Codex) => None,
+            (None, _) => saved.transcript.clone(),
+        }
+        .filter(|p| p.is_file());
         if saved.terminal {
             chat.terminal = Some(Default::default());
         }
@@ -314,16 +362,23 @@ impl ChatSession {
         chat
     }
 
-    pub fn snapshot(&self, cx: &App) -> crate::workspace::SavedConversation {
-        let transcript = match self.provider() {
-            Provider::Claude => self.transcript.clone().or_else(|| {
-                Some(
-                    sg_agents::project_dir(&self.cwd)?
-                        .join(format!("{}.jsonl", self.convo.session_id.as_ref()?)),
-                )
-            }),
+    /// The session's transcript (Claude's jsonl, Codex's rollout), if it
+    /// has one; a fork has its own only once it started.
+    pub fn transcript_file(&self) -> Option<PathBuf> {
+        if self.fork_from.is_some() {
+            return None;
+        }
+        match self.provider() {
+            Provider::Claude => self
+                .transcript
+                .clone()
+                .or_else(|| claude_transcript(&self.cwd, self.convo.session_id.as_ref()?)),
             Provider::Codex => self.transcript.clone(),
-        };
+        }
+    }
+
+    pub fn snapshot(&self, cx: &App) -> crate::workspace::SavedConversation {
+        let transcript = self.transcript_file();
         crate::workspace::SavedConversation {
             attachments: self.attachments.clone(),
             attention: self.attention.clone(),
@@ -347,6 +402,7 @@ impl ChatSession {
                 Backend::Claude { .. } => None,
             },
             terminal: self.is_terminal(),
+            fork_from: self.fork_from.clone(),
         }
     }
 
@@ -400,6 +456,7 @@ impl ChatSession {
                     .as_nanos()
             ),
             transcript: None,
+            fork_from: None,
             convo,
             backend,
             options: Default::default(),
@@ -419,6 +476,16 @@ impl ChatSession {
             terminal: None,
             _subscriptions: vec![sub, sticky],
         }
+    }
+
+    /// Where the agent runs: where its session started.
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    /// A session with history to fork, or a fork of one that has not started.
+    pub fn can_fork(&self) -> bool {
+        self.convo.session_id.is_some() || self.fork_from.is_some()
     }
 
     pub fn provider(&self) -> Provider {
@@ -450,6 +517,7 @@ impl ChatSession {
     pub fn is_fresh(&self) -> bool {
         self.convo.items.is_empty()
             && self.convo.session_id.is_none()
+            && self.fork_from.is_none()
             && self.backend.agent().is_none()
             && self.terminal.as_ref().is_none_or(|t| t.view.is_none())
     }
@@ -637,7 +705,13 @@ impl ChatSession {
         else {
             return;
         };
-        let Some(thread_id) = self.convo.session_id.clone() else {
+        // A fork shows its original's history until it starts.
+        let Some(thread_id) = self
+            .convo
+            .session_id
+            .clone()
+            .or_else(|| self.fork_from.clone())
+        else {
             return;
         };
         let cwd = self.cwd.clone();
@@ -670,10 +744,14 @@ impl ChatSession {
             Ok(h) => {
                 let title = self.convo.title.take();
                 CodexFold::new().apply_history(&mut self.convo, &h);
-                if self.convo.title.is_none() {
+                if self.fork_from.is_some() {
+                    // The original's id and name: the fork has neither yet.
+                    self.convo.session_id = None;
+                    self.convo.title = title;
+                } else if self.convo.title.is_none() {
                     self.convo.title = title;
                 }
-                if self.transcript.is_none() {
+                if self.transcript.is_none() && self.fork_from.is_none() {
                     self.transcript = h
                         .thread
                         .get("path")
@@ -722,7 +800,8 @@ impl ChatSession {
             Ok(mut loaded) => {
                 // The chat decided which session it continues.
                 loaded.session_id = self.convo.session_id.take();
-                if loaded.title.is_none() {
+                // A fork keeps its own title ("… (fork)").
+                if loaded.title.is_none() || self.fork_from.is_some() {
                     loaded.title = self.convo.title.take();
                 }
                 // Notices shown meanwhile follow the history.
@@ -759,13 +838,20 @@ impl ChatSession {
         {
             return Ok(p);
         }
-        let resume = self.convo.session_id.clone();
+        // A fork that has not started continues a copy of its original.
+        let fork = self.convo.session_id.is_none() && self.fork_from.is_some();
+        let resume = self
+            .convo
+            .session_id
+            .clone()
+            .or_else(|| self.fork_from.clone());
         let initial_prompt = crate::initial_prompt::for_worktree(&self.worktree, cx);
         let mut events = match &mut self.backend {
             Backend::Claude { process, mode, .. } => {
                 let (p, events) = ClaudeProcess::spawn(&SpawnOptions {
                     cwd: self.cwd.clone(),
                     resume,
+                    fork,
                     permission_mode: Some(*mode),
                     model: self.options.model.clone(),
                     effort: self.options.effort.clone(),
@@ -781,6 +867,7 @@ impl ChatSession {
                 let (p, events) = CodexProcess::spawn(&sg_codex::SpawnOptions {
                     cwd: self.cwd.clone(),
                     resume,
+                    fork,
                     policy: *policy,
                     developer_instructions: initial_prompt,
                     ..Default::default()
@@ -885,6 +972,11 @@ impl ChatSession {
                     // The user's own Stop: nothing to come back to.
                     Some(Outcome::Stopped) => self.attention.set(Kind::Idle, None),
                     None => self.sync_pending_attention(),
+                }
+                // A fork is its own session once its agent names it.
+                if self.fork_from.is_some() && self.convo.session_id.is_some() {
+                    self.fork_from = None;
+                    self.transcript = None;
                 }
             }
             ProcessEvent::Stderr(line) => {

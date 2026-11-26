@@ -201,8 +201,9 @@ process per conversation (protocol of Codex 0.157; `install::MIN_VERSION`).
   `codex app-server generate-ts --out /tmp/codex-ts`.
 - Driver thread (process.rs) owns stdin and protocol state: `initialize` →
   `initialized` → `account/read` (signed out → "run `codex login`") →
-  `thread/start {cwd, approvalPolicy, sandbox}` or `thread/resume {threadId,
-  excludeTurns}` → `turn/start` per queued message (with `approvalPolicy` +
+  `thread/start {cwd, approvalPolicy, sandbox}`, `thread/resume {threadId,
+  excludeTurns}` or `thread/fork` (same params plus `cwd`; a copy under a
+  new id) → `turn/start` per queued message (with `approvalPolicy` +
   `sandboxPolicy`: Codex applies policies per turn) → `turn/interrupt
   {threadId, turnId}`. Answers to our requests reach the fold as
   `{"response": method, "result"|"error"}`; notifications and server requests
@@ -361,6 +362,8 @@ commit two seconds after startup, like a click;
 `SUPERGIT_DEBUG_DRAG=x1,y1,x2,y2` (screenshot builds) drags the mouse between
 two window points (= PNG pixels) five seconds after startup, drawing a frame
 per step, and prints what `cmd-c` would copy (text selection checks);
+`SUPERGIT_DEBUG_RIGHT_CLICK=x,y` (screenshot builds) right-clicks that point
+five seconds after startup (context menus; take the shot a bit later);
 `SUPERGIT_DEBUG_PR=<number>` (screenshot builds, with `SUPERGIT_TAB=prs`)
 selects that pull request, `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its details
 (conversation, review threads), `SUPERGIT_DEBUG_PR_FILES=1` opens its Files
@@ -437,6 +440,18 @@ never commit, push or create worktrees there without asking.
   (`open_project_attention`). The same data as the agent rail, which stays
   for now. The tree has one selection: the conversation picked last in the
   tree or the rail (`tree_agent`) while it is on screen, else the worktree.
+- **Tree menus** (`app/tree_menus.rs`, right click): repository = main
+  checkout (New Worktree…, new conversations, open/reveal/terminal, Copy
+  Path, Remove from Projects), worktree (new conversations, Rebase, open,
+  copy path/branch, Keep Active, Delete Worktree… → the cleanup preview),
+  conversation (Fork, Mark as Read, copy session id / resume command,
+  reveal transcript, Close). Rows of a project that is not open get only
+  what needs no open project. Close stops the agent and drops the row; the
+  transcript stays (Agents tab → Open). Fork: `ChatSession::fork_seed` →
+  `restore` with `fork_from` = the original's id; it shows that history and
+  starts as a copy (Claude `--resume <id> --fork-session`, plus
+  `--session-id <new>` in the TUI; Codex `thread/fork` / `codex fork <id>`)
+  until its agent names its own session.
 - **Panel lines**: a resizable split draws the line between its panels
   itself (gpui-component's resize handle, in the first pixel of the panel
   after it). A panel beside a handle draws no border on that side, or the
