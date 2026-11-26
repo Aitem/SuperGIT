@@ -1,4 +1,7 @@
+use std::collections::VecDeque;
+use std::io::Read;
 use std::path::Path;
+use std::process::Stdio;
 
 use anyhow::{Context as _, Result, ensure};
 use serde::Deserialize;
@@ -80,7 +83,7 @@ impl ActionsJob {
     pub fn failed_log(&self, path: &Path) -> Result<JobLog> {
         let run = self.run.to_string();
         let job = self.job.to_string();
-        let output = gh(
+        let mut child = crate::gh_command(
             path,
             [
                 "run",
@@ -92,8 +95,22 @@ impl ActionsJob {
                 &job,
                 "--log-failed",
             ],
-        )?;
-        Ok(JobLog::from_output(&output))
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+        let stdout = child.stdout.take().context("gh stdout is unavailable")?;
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(move || JobLog::read_tail(stdout));
+            let output = child.wait_with_output()?;
+            ensure!(
+                output.status.success(),
+                "gh run view: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            reader.join().expect("log reader panicked")
+        })
     }
 }
 
@@ -145,6 +162,25 @@ fn numeric_id(segment: &str) -> Option<u64> {
 }
 
 impl JobLog {
+    fn read_tail(mut reader: impl Read) -> Result<Self> {
+        // One preceding byte preserves the partial-line boundary on truncation.
+        let capacity = MAX_LOG_BYTES + 1;
+        let mut tail = VecDeque::with_capacity(capacity);
+        let mut buf = [0; 8192];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if n == 0 {
+                break;
+            }
+            tail.drain(..(tail.len() + n).saturating_sub(capacity));
+            tail.extend(&buf[..n]);
+        }
+        Ok(Self::from_output(tail.make_contiguous()))
+    }
+
     fn from_output(output: &[u8]) -> Self {
         let start = output.len().saturating_sub(MAX_LOG_BYTES);
         let mut tail = &output[start..];
@@ -202,7 +238,7 @@ mod tests {
     fn long_log_keeps_the_end_and_limits_lossy_utf8() {
         let mut output = vec![255; MAX_LOG_BYTES + 80];
         output.extend_from_slice("\nfailed: Русский UTF-8\n".as_bytes());
-        let tail = JobLog::from_output(&output);
+        let tail = JobLog::read_tail(output.as_slice()).unwrap();
         assert!(tail.truncated);
         assert_eq!(tail.text, "failed: Русский UTF-8\n");
         assert!(JobLog::from_output(&vec![255; MAX_LOG_BYTES]).text.len() <= MAX_LOG_BYTES);

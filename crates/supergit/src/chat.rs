@@ -171,6 +171,7 @@ pub struct ChatSession {
     question_forms: HashMap<String, Vec<questions::AnswerDraft>>,
     expanded: HashSet<usize>,
     /// Runs of tool calls the user unfolded, by their first item.
+    runs: timeline::Runs,
     open_runs: HashSet<usize>,
     /// The latest user message has scrolled out above the chat: it sticks
     /// to the top.
@@ -466,6 +467,7 @@ impl ChatSession {
             diffs: HashMap::new(),
             question_forms: HashMap::new(),
             expanded: HashSet::new(),
+            runs: Default::default(),
             open_runs: HashSet::new(),
             sticky_prompt: false,
             busy_since: None,
@@ -818,6 +820,7 @@ impl ChatSession {
                 {
                     *mode = saved;
                 }
+                self.runs.clear();
                 self.convo = loaded;
             }
             Err(e) => self.convo.push_notice(
@@ -1016,6 +1019,7 @@ impl ChatSession {
     }
 
     fn items_changed(&mut self, before: usize, cx: &mut Context<Self>) {
+        self.runs.clear();
         self.track_activity(cx);
         self.question_forms.retain(|id, _| {
             self.convo
@@ -1402,10 +1406,15 @@ impl ChatSession {
             return div().into_any_element();
         };
         let theme = cx.theme().clone();
-        let row = timeline::row(
+        let provider = self.provider();
+        let row = timeline::indexed_row(
             &self.convo.items,
             ix,
-            &|item| self.groupable(item),
+            &mut |i| {
+                self.runs.lookup(&self.convo.items, i, &|item| {
+                    Self::groupable(provider, item)
+                })
+            },
             &self.open_runs,
         );
         let (shape, first, last) = match row {
@@ -1595,11 +1604,11 @@ impl ChatSession {
 
     /// Tool calls that may fold into a run: not edits, which show a diff,
     /// nor the calls that are a step of their own (a subagent, a plan).
-    fn groupable(&self, item: &Item) -> bool {
+    fn groupable(provider: Provider, item: &Item) -> bool {
         let Item::Tool(tool) = item else {
             return false;
         };
-        match self.provider() {
+        match provider {
             Provider::Claude => {
                 !sg_claude::tools::is_edit(&tool.name)
                     && !sg_claude::tools::stands_alone(&tool.name)

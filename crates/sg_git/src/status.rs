@@ -329,12 +329,12 @@ pub(crate) fn append_new_file_patch(patch: &mut String, worktree: &Path, rel: &s
         return;
     }
     let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let lines = text.split_inclusive('\n');
     patch.push_str(&format!(
         "--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{} @@\n",
-        lines.len()
+        lines.clone().count()
     ));
-    for line in &lines {
+    for line in lines {
         patch.push('+');
         patch.push_str(line);
     }
