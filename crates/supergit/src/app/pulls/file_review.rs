@@ -118,7 +118,7 @@ impl SuperGitApp {
     fn visible_review(&self) -> Option<&LoadedReview> {
         let loaded = self.pulls.file_review.loaded.as_ref()?;
         let target = &loaded.target;
-        if self.tab != MainTab::PullRequests
+        if self.tab != ReviewTab::PullRequests
             || self.pulls.tab != DetailsTab::Files
             || self.pulls.shown != Some(target.number)
         {

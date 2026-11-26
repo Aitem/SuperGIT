@@ -253,7 +253,7 @@ impl SuperGitApp {
             .enumerate()
             .map(|(ix, root)| self.render_project_node(ix, root, &theme, cx))
             .collect();
-        // Its buttons are squares as in the agent rail, a line between them.
+        // Its buttons are squares as in the right rail, a line between them.
         let square = |id, icon| {
             square_button(id, icon)
                 .border_l_1()
@@ -279,7 +279,7 @@ impl SuperGitApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("SuperGIT"),
             );
-        // As tall as the rails are wide, like the agent panel's header: their
+        // As tall as the rails are wide, like the worktree's header: their
         // lines meet. On macOS the sidebar reaches the window's top edge: the
         // window buttons sit at the row's left, and the row moves the window
         // as a title bar does. Not gpui-component's `TitleBar`, which is
@@ -788,7 +788,7 @@ impl SuperGitApp {
             .pr(px(ROW_END))
             .py_1()
             .cursor_pointer()
-            // The selection is a background, as in the agent rail.
+            // The selection is a background, as in the right rail.
             .when(selected, |el| el.bg(theme.sidebar_accent))
             .hover(|el| {
                 el.bg(if selected {
@@ -829,14 +829,11 @@ impl SuperGitApp {
         self.worktree_menu(row, target, cx)
     }
 
-    /// The worktree's conversations, as the agent rail shows them (the
-    /// ready-to-type draft stays out): live ones while the worktree has
-    /// been open, else the saved ones.
-    /// The conversation picked last in the tree or the rail, if it is the
-    /// one on screen and belongs to `path`.
+    /// The conversation picked last in the tree, if it is the one on screen
+    /// and belongs to `path`.
     fn tree_agent_in(&self, path: &Path, cx: &App) -> Option<&str> {
         let picked = self.tree_agent.as_deref()?;
-        if !self.chat_open || self.selected.as_deref() != Some(path) {
+        if !self.chat_shown() || self.selected.as_deref() != Some(path) {
             return None;
         }
         let ix = self.active_chat.get(path).copied().unwrap_or(0);
@@ -844,6 +841,8 @@ impl SuperGitApp {
         (chat.read(cx).local_id() == picked).then_some(picked)
     }
 
+    /// The worktree's conversations (the ready-to-type draft stays out):
+    /// live ones while the worktree has been open, else the saved ones.
     fn agents_in(&self, scope: Scope<'_>, info: &WorktreeInfo, cx: &App) -> Vec<AgentEntry> {
         let path = info.path();
         let picked = scope.active.then(|| self.tree_agent_in(path, cx)).flatten();
@@ -857,7 +856,7 @@ impl SuperGitApp {
         };
         if let Some(chats) = self.chats.get(path) {
             let on_screen =
-                (scope.active && self.chat_open && self.selected.as_deref() == Some(path))
+                (scope.active && self.chat_shown() && self.selected.as_deref() == Some(path))
                     .then(|| self.active_chat.get(path).copied().unwrap_or(0));
             return chats
                 .iter()
@@ -919,7 +918,7 @@ impl SuperGitApp {
 
     /// One row per conversation under its worktree: the agent's mark (in its
     /// colors while it works), the title, and the state's icon when it wants
-    /// the user. A click opens the conversation in the agent panel.
+    /// the user. A click opens the conversation under the worktree's header.
     /// `indent`: where the parent's name starts, so the marks line up under
     /// it.
     fn render_agent_rows(
@@ -1149,7 +1148,7 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// The collapsed sidebar, a rail like the agent panel's: squares with a
+    /// The collapsed sidebar, a rail like the right one: squares with a
     /// line under each, the selection a background, names beside them at
     /// once. Expand first, then each project's initials and, under the
     /// active one, its worktrees' (initials take the color of an agent
@@ -1465,10 +1464,9 @@ struct AgentEntry {
     unread: bool,
     /// Busy with a turn here, or in another process.
     working: bool,
-    /// The one the agent panel shows.
+    /// The one shown under the worktree's header.
     on_screen: bool,
-    /// On screen and picked last in the tree or the rail: the tree's
-    /// selection.
+    /// On screen and picked last in the tree: the tree's selection.
     selected: bool,
     session_id: Option<String>,
     cwd: PathBuf,

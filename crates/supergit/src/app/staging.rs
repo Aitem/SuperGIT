@@ -114,7 +114,7 @@ impl SuperGitApp {
             Staging::Stage => ChangeScope::Unstaged,
             Staging::Unstage => ChangeScope::Staged,
         };
-        if self.tab != MainTab::Changes
+        if self.tab != ReviewTab::Changes
             || self.change_scope() != expected_scope
             || self.details.scope != expected_scope
             || self.difftastic_active()

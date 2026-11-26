@@ -58,7 +58,7 @@ use crate::model::{self, Details, History, LoadState, SharedSessionIndex, Worktr
 use crate::notifications;
 use crate::settings::DiffLayout;
 use crate::switcher::{self, Destination, Entry};
-use crate::workspace::{self, RepositoryView, ReviewPosition, WindowRect};
+use crate::workspace::{self, RepositoryView, ReviewPosition, ReviewTab, WindowRect};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Network requests run independently so they cannot delay local refreshes.
@@ -98,19 +98,10 @@ type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 mod cherry_pick;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MainTab {
-    History,
-    Changes,
-    Sessions,
-    PullRequests,
-}
-
-impl MainTab {
+impl ReviewTab {
     fn from_name(name: &str) -> Self {
         match name {
             "changes" => Self::Changes,
-            "claude" | "sessions" => Self::Sessions,
             "prs" | "pr" => Self::PullRequests,
             _ => Self::History,
         }
@@ -119,7 +110,7 @@ impl MainTab {
 
 #[derive(Clone, Copy)]
 enum LayoutPanel {
-    /// The review's width beside the agent panel.
+    /// The review panel's width beside the conversation.
     Review,
     /// The terminal panel's height (under the review).
     Terminal,
@@ -223,8 +214,8 @@ pub struct SuperGitApp {
     window_buttons_at: Option<Point<Pixels>>,
     /// A press on the header that may become a window drag.
     window_drag: bool,
-    /// The conversation last picked in the tree or the agent rail: while it
-    /// is on screen, it — not its worktree — shows selected in the tree.
+    /// The conversation last picked in the tree: while it is on screen, it
+    /// — not its worktree — shows selected in the tree.
     tree_agent: Option<String>,
     /// A conversation being renamed in the tree (`tree_rename`).
     renaming: Option<tree_rename::Rename>,
@@ -256,13 +247,15 @@ pub struct SuperGitApp {
     pulls: pulls::Pulls,
 
     selected: Option<PathBuf>,
-    tab: MainTab,
+    /// What the review panel shows (or shows again when it opens); saved
+    /// per project as `RepositoryView::review_tab`.
+    tab: ReviewTab,
     details: Details,
     history: History,
     changes_diff: Entity<DiffState>,
     /// The sidebar's width (window-wide, not per project).
     sidebar_layout: Entity<ResizableState>,
-    /// The agent panel and the review beside it.
+    /// The conversation and the review panel right of it.
     review_layout: Entity<ResizableState>,
     changes_layout: Entity<ResizableState>,
     history_layout: Entity<ResizableState>,
@@ -305,8 +298,8 @@ pub struct SuperGitApp {
     /// Background reads of inactive projects that have no snapshot yet.
     project_loads: HashMap<PathBuf, projects::ProjectLoad>,
 
-    /// Native agent conversations (Claude, Codex) per worktree (tabs in the
-    /// right panel).
+    /// Native agent conversations (Claude, Codex) per worktree (rows in the
+    /// sidebar's tree, one on screen under the worktree's header).
     /// They keep running while other worktrees, or projects, are selected.
     chats: HashMap<PathBuf, Vec<Entity<ChatSession>>>,
     active_chat: HashMap<PathBuf, usize>,
@@ -416,6 +409,18 @@ impl SuperGitApp {
             .and_then(|repo| persisted.repositories.get(&repo.root))
             .map(|view| view.chat_open)
             .unwrap_or(true);
+        // `SUPERGIT_TAB` opens the review panel on that tab.
+        let tab = match &repo {
+            Some(repo) => {
+                let view = persisted.repositories.entry(repo.root.clone()).or_default();
+                if let Some(tab) = initial_tab() {
+                    view.review_tab = tab;
+                    view.review_open = true;
+                }
+                view.review_tab
+            }
+            None => initial_tab().unwrap_or_default(),
+        };
         let quit_subscription = cx.on_app_quit(|this, cx| {
             this.persist_workspace(cx);
             async {}
@@ -496,7 +501,7 @@ impl SuperGitApp {
             prs_loaded: false,
             pulls,
             selected: None,
-            tab: initial_tab(),
+            tab,
             details: Details::default(),
             history: History::default(),
             changes_diff,
@@ -579,11 +584,11 @@ impl SuperGitApp {
         this
     }
 
-    /// The review's widest size beside the agent panel, and its width now:
-    /// what it keeps beside the panel, or all the room between the sidebar
-    /// and the agent rail while the panel is closed.
+    /// The review panel's widest size beside the conversation, and its
+    /// width now: what it keeps beside the conversation, or all the room
+    /// between the sidebar and the rail while the conversation is hidden.
     fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32) {
-        // A worktree's agent rail stays at the right edge, panel open or not.
+        // A worktree's rail stays at the right edge, panel open or not.
         let rail = if self.selected.is_some() {
             RAIL_WIDTH
         } else {
@@ -605,9 +610,16 @@ impl SuperGitApp {
         (review_max, review)
     }
 
-    /// The agent panel is on screen, left of the review.
+    /// The review panel is on screen: right of the conversation, or in its
+    /// place while the conversation is hidden (`cmd-l`).
+    fn review_shown(&self) -> bool {
+        self.selected.is_some() && self.repository_view().review_open
+    }
+
+    /// The conversation is on screen under the worktree's header: always,
+    /// unless it gave its room to the review panel (`cmd-l`).
     fn chat_shown(&self) -> bool {
-        self.chat_open && self.selected.is_some()
+        self.selected.is_some() && (self.chat_open || !self.repository_view().review_open)
     }
 
     fn repository_view(&self) -> &RepositoryView {
@@ -615,6 +627,12 @@ impl SuperGitApp {
             Some(repo) => self.view_of(&repo.root),
             None => empty_view(),
         }
+    }
+
+    /// The active project's saved view, to change it.
+    fn repository_view_mut(&mut self) -> Option<&mut RepositoryView> {
+        let root = self.repo.as_ref()?.root.clone();
+        Some(self.persisted.repositories.entry(root).or_default())
     }
 
     /// A project's saved view (the defaults until it has one).
@@ -673,6 +691,7 @@ impl SuperGitApp {
             let view = self.persisted.repositories.entry(root.clone()).or_default();
             view.selected = self.selected.clone();
             view.chat_open = self.chat_open;
+            view.review_tab = self.tab;
         }
         // Conversations of every project, including those running in the
         // background while another project is shown.
@@ -750,9 +769,6 @@ impl SuperGitApp {
         let Some(path) = self.selected.clone() else {
             return;
         };
-        // Every worktree opens on History (or `SUPERGIT_TAB`); the other
-        // tabs are one click away and are not remembered per worktree.
-        self.tab = initial_tab();
         if let Some(cached) = self.review_views.remove(&path) {
             self.details = cached.details;
             self.history = cached.history;
@@ -963,8 +979,8 @@ impl SuperGitApp {
         state: &Entity<ResizableState>,
         cx: &mut Context<Self>,
     ) {
-        // The review (right of the agent panel) and the terminal come second
-        // in their groups.
+        // The review panel (right of the conversation) and the terminal come
+        // second in their groups.
         let ix = if matches!(panel, LayoutPanel::Review | LayoutPanel::Terminal) {
             1
         } else {
@@ -2056,7 +2072,7 @@ impl SuperGitApp {
     }
 
     fn load_history(&mut self, limit: usize, cx: &mut Context<Self>) {
-        let shown = self.tab == MainTab::History || self.repository_view().history_open;
+        let shown = self.tab == ReviewTab::History && self.review_shown();
         if !shown || self.history_task.is_some() {
             return;
         }
@@ -2104,7 +2120,7 @@ impl SuperGitApp {
             self.commit_difft.update(cx, |view, cx| view.clear(cx));
         }
         self.history.update(history);
-        if self.tab == MainTab::History
+        if self.tab == ReviewTab::History
             && self.commit_task.is_none()
             && self.commit_patch.is_loading()
             && let Some(sha) = self.selected_commit.clone().or_else(|| {
@@ -2307,6 +2323,7 @@ impl SuperGitApp {
             self.history_layout = cx.new(|_| ResizableState::default());
             self.commit_files_layout = cx.new(|_| ResizableState::default());
             self.chat_open = self.repository_view().chat_open;
+            self.tab = self.repository_view().review_tab;
             self.restore_project(cx);
         } else {
             self.selected = None; // re-pick the worktree containing `path`
@@ -2443,7 +2460,7 @@ impl SuperGitApp {
                 .as_ref()
                 .is_some_and(|repo| repo.root == repository)
                 && this.selected.as_ref() == Some(&path)
-                && this.chat_open
+                && this.chat_shown()
                 && !this.settings_open
                 && !this.cleanup_results_open
                 && this.switcher.is_none()
@@ -2738,32 +2755,24 @@ impl SuperGitApp {
         self.add_chat(path, chat, window, cx);
     }
 
-    fn close_chat(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
-            return;
-        };
-        if let Some(list) = self.chats.get_mut(&path)
-            && ix < list.len()
-        {
-            // Dropping the session kills its agent process.
-            list.remove(ix);
-            let active = self.active_chat.get(&path).copied().unwrap_or(0);
-            let next = if active > ix { active - 1 } else { active };
-            self.active_chat
-                .insert(path, next.min(list.len().saturating_sub(1)));
-        }
-        self.queue_persist(cx);
-        cx.notify();
-    }
-
+    /// `cmd-l`: hides the conversation, so the review panel takes its room
+    /// (opening on its tab if it was hidden), or shows it again.
     pub fn toggle_claude(&mut self, _: &ToggleClaude, window: &mut Window, cx: &mut Context<Self>) {
-        self.chat_open = !self.chat_open;
-        self.queue_persist(cx);
-        if self.chat_open
-            && let Some(chat) = self.active_chat_entity()
-        {
-            chat.update(cx, |chat, cx| chat.focus(window, cx));
+        if self.chat_shown() {
+            self.chat_open = false;
+            let tab = self.tab;
+            if let Some(view) = self.repository_view_mut() {
+                view.review_open = true;
+                view.review_tab = tab;
+            }
+            self.reload_history(cx);
+        } else {
+            self.chat_open = true;
+            if let Some(chat) = self.active_chat_entity() {
+                chat.update(cx, |chat, cx| chat.focus(window, cx));
+            }
         }
+        self.queue_persist(cx);
         cx.notify();
     }
 
@@ -3080,8 +3089,8 @@ impl SuperGitApp {
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         // macOS, the sidebar collapsed: the window buttons sit at the start
-        // of this column's first row, unless the agent panel comes first.
-        let window_buttons = self.window_buttons_beside_rail(window) && !self.chat_shown();
+        // of this column's first row.
+        let window_buttons = self.window_buttons_beside_rail(window);
         let Some(info) = self.selected_info().cloned() else {
             let body = if let Some(error) = &self.load_error {
                 self.render_data_notice("Worktrees unavailable", Some(error), false, cx)
@@ -3112,22 +3121,91 @@ impl SuperGitApp {
                 .into_any_element();
         };
 
-        let (_, main_width) = self.pane_widths(window, cx);
-        // The commit tree takes the left of the review when it is shown.
-        let history_open = self.repository_view().history_open;
-        let tree_width = self.history_tree_width(main_width, cx);
-        let pane_width = if history_open {
-            main_width - tree_width
-        } else {
-            main_width
-        };
-        let content = match self.tab {
-            MainTab::Changes => {
+        let header = self
+            .render_header(&info, window_buttons, &theme, cx)
+            .into_any_element();
+        let header = self.window_drag_area(header, cx);
+        let body = self.render_worktree_body(&info, window, cx);
+        let rail = self.render_review_rail(&info, cx);
+        // The header spans the window to its right edge; the rail sits under
+        // it, beside the conversation and the panel it opens. Elastic: wide
+        // content (a long commit message, a diff line) must not push the
+        // rail off-screen.
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(header)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(div().flex_1().min_w_0().h_full().child(body))
+                    .child(rail),
+            )
+            .into_any_element()
+    }
+
+    /// Under the worktree's header: its conversation and, right of it, the
+    /// review panel the rail opened (or the panel alone while the
+    /// conversation is hidden, `cmd-l`). The panel keeps its width when the
+    /// window resizes; the conversation takes the room left.
+    fn render_worktree_body(
+        &mut self,
+        info: &WorktreeInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (review_max, review_width) = self.pane_widths(window, cx);
+        match (self.chat_shown(), self.review_shown()) {
+            (true, true) => {
+                let chat = self.render_conversation(window, cx);
+                let review = self.render_review_panel(info, review_width, window, cx);
+                h_resizable("review-layout")
+                    .with_state(&self.review_layout)
+                    .on_resize(cx.listener(|this, state, _, cx| {
+                        this.remember_layout(LayoutPanel::Review, state, cx)
+                    }))
+                    .child(
+                        resizable_panel()
+                            .size_range(px(CHAT_MIN)..Pixels::MAX)
+                            .child(elastic(chat)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(self.repository_view().review_width.min(review_max)))
+                            .size_range(px(REVIEW_MIN)..px(review_max))
+                            .fixed()
+                            .child(elastic(review)),
+                    )
+                    .into_any_element()
+            }
+            (false, true) => {
+                elastic(self.render_review_panel(info, review_width, window, cx)).into_any_element()
+            }
+            _ => elastic(self.render_conversation(window, cx)).into_any_element(),
+        }
+    }
+
+    /// The review panel: what the rail's selected button shows. History is
+    /// the commit tree with the commit picked in it beside; Changes and Pull
+    /// requests fill the panel. `width` is the panel's.
+    fn render_review_panel(
+        &mut self,
+        info: &WorktreeInfo,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        match self.tab {
+            ReviewTab::Changes => {
                 #[cfg(feature = "screenshot")]
                 self.debug_staging_once(cx);
                 let switch = self.render_staging_switch(cx).into_any_element();
                 let body = if self.git_editor.staging {
-                    self.render_index_editor(&info, window, cx)
+                    self.render_index_editor(info, window, cx)
                 } else {
                     v_flex()
                         .size_full()
@@ -3136,7 +3214,7 @@ impl SuperGitApp {
                             div()
                                 .flex_1()
                                 .min_h_0()
-                                .child(self.render_changes(&info, pane_width, &theme, cx)),
+                                .child(self.render_changes(info, width, &theme, cx)),
                         )
                         .into_any_element()
                 };
@@ -3146,146 +3224,45 @@ impl SuperGitApp {
                     .child(div().flex_1().min_h_0().child(body))
                     .into_any_element()
             }
-            MainTab::History => self.render_commit_view(pane_width, cx),
-            MainTab::Sessions => self.render_sessions(&info, &theme, cx).into_any_element(),
-            MainTab::PullRequests => {
-                self.ensure_pulls(cx);
-                self.render_pulls(&info, pane_width, cx)
+            ReviewTab::History => {
+                let tree_width = self.history_tree_width(width, cx);
+                let max = history_tree_max(width);
+                let commit = self.render_commit_view(width - tree_width, cx);
+                h_resizable("history-layout")
+                    .with_state(&self.history_layout)
+                    .on_resize(cx.listener(|this, state, _, cx| {
+                        this.remember_layout(LayoutPanel::History, state, cx)
+                    }))
+                    .child(
+                        resizable_panel()
+                            .size(px(self.repository_view().history_width.min(max)))
+                            .size_range(px(160.)..px(max))
+                            .fixed()
+                            .child(self.render_history_tree(tree_width, &theme, cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(px(180.)..Pixels::MAX)
+                            .child(elastic(commit)),
+                    )
+                    .into_any_element()
             }
-        };
-        let header = self
-            .render_header(&info, window_buttons, &theme, cx)
-            .into_any_element();
-        let header = self.window_drag_area(header, cx);
-        let pane = v_flex()
-            .size_full()
-            .min_w_0()
-            .child(div().flex_1().min_h_0().child(content));
-        let body = if history_open {
-            let max = history_tree_max(main_width);
-            h_resizable("history-layout")
-                .with_state(&self.history_layout)
-                .on_resize(cx.listener(|this, state, _, cx| {
-                    this.remember_layout(LayoutPanel::History, state, cx)
-                }))
-                .child(
-                    resizable_panel()
-                        .size(px(self.repository_view().history_width.min(max)))
-                        .size_range(px(160.)..px(max))
-                        .fixed()
-                        .child(self.render_history_tree(tree_width, &theme, cx)),
-                )
-                .child(
-                    resizable_panel()
-                        .size_range(px(180.)..Pixels::MAX)
-                        .child(elastic(pane)),
-                )
-                .into_any_element()
-        } else {
-            pane.into_any_element()
-        };
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .child(header)
-            // Across the review: its buttons stay put when the tree shows.
-            .child(self.render_review_tabs(&info, &theme, cx))
-            .child(div().flex_1().min_h_0().child(body))
-            .into_any_element()
+            ReviewTab::PullRequests => {
+                self.ensure_pulls(cx);
+                self.render_pulls(info, width, cx)
+            }
+        }
     }
 
-    /// Under the header, across the review: History shows or hides the
-    /// commit tree; Changes, Agents and Pull requests pick what the pane
-    /// beside it shows (a commit picked in the tree shows there too).
-    fn render_review_tabs(
-        &self,
-        info: &WorktreeInfo,
-        theme: &gpui_kit::component::Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let changes = if self.comparison_base().is_some() {
-            self.details
-                .files
-                .value()
-                .map(|files| files.len().to_string())
-                .unwrap_or_else(|| "—".into())
-        } else {
-            info.status
-                .as_ref()
-                .map(|status| status.files.len().to_string())
-                .unwrap_or_else(|_| "—".into())
+    /// Shows the review panel on `tab`, opening it if it is hidden.
+    fn set_tab(&mut self, tab: ReviewTab, cx: &mut Context<Self>) {
+        let Some(view) = self.repository_view_mut() else {
+            return;
         };
-        let open_prs = self
-            .prs
-            .iter()
-            .filter(|p| matches!(p.state, PrState::Open | PrState::Draft))
-            .count();
-        // Commits since the branch forked from main; none on main itself.
-        let history = match &self.history.fork {
-            Some(fork) => format!("History · {}", fork.commits),
-            None => "History".to_string(),
-        };
-        let tabs = [
-            (
-                MainTab::Changes,
-                "review-changes",
-                format!("Changes · {changes}"),
-                "Uncommitted changes in this worktree",
-            ),
-            (
-                MainTab::Sessions,
-                "review-agents",
-                format!("Agents · {}", info.sessions.len()),
-                "Agent sessions that ran in this worktree",
-            ),
-            (
-                MainTab::PullRequests,
-                "review-pulls",
-                format!("Pull requests · {open_prs}"),
-                "The repository's pull requests",
-            ),
-        ]
-        .map(|(tab, id, label, tooltip)| {
-            // Room for a count of three digits: a count that grows doesn't
-            // push the tabs after it.
-            let width = match tab {
-                MainTab::Changes => 7.5,
-                MainTab::Sessions => 6.5,
-                _ => 9.,
-            };
-            div().flex_none().min_w(rems(width)).child(
-                Button::new(id)
-                    .label(label)
-                    .small()
-                    .ghost()
-                    .selected(self.tab == tab)
-                    .tooltip(tooltip)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx))),
-            )
-        });
-        toolbar(theme)
-            .gap_1()
-            .child(
-                div().flex_none().min_w(rems(8.)).child(
-                    Button::new("toggle-history")
-                        .icon(IconName::PanelLeft)
-                        .label(history)
-                        .small()
-                        .ghost()
-                        .selected(self.repository_view().history_open)
-                        .tooltip(format!("Show or hide the commit tree ({MOD}-shift-h)"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_history(&ToggleHistory, window, cx)
-                        })),
-                ),
-            )
-            .child(div().flex_none().w_px().h(px(16.)).mx_1().bg(theme.border))
-            .children(tabs)
-    }
-
-    fn set_tab(&mut self, tab: MainTab, cx: &mut Context<Self>) {
-        if self.tab != tab {
+        let shown = view.review_open && view.review_tab == tab;
+        view.review_open = true;
+        view.review_tab = tab;
+        if !shown || self.tab != tab {
             self.tab = tab;
             self.reload_history(cx);
             self.queue_persist(cx);
@@ -3293,18 +3270,31 @@ impl SuperGitApp {
         }
     }
 
-    /// Shows or hides the commit tree beside the review (`cmd-shift-h`).
-    fn toggle_history(&mut self, _: &ToggleHistory, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(repo) = &self.repo else { return };
-        let view = self
-            .persisted
-            .repositories
-            .entry(repo.root.clone())
-            .or_default();
-        view.history_open = !view.history_open;
+    /// A rail button: shows the review panel on `tab`, or hides it when it
+    /// already shows `tab` (the conversation then takes the room again).
+    fn toggle_review(&mut self, tab: ReviewTab, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.tab;
+        let Some(view) = self.repository_view_mut() else {
+            return;
+        };
+        let hide = view.review_open && current == tab;
+        view.review_open = !hide;
+        view.review_tab = tab;
+        self.tab = tab;
+        if hide && !self.chat_open {
+            self.chat_open = true;
+            if let Some(chat) = self.active_chat_entity() {
+                chat.update(cx, |chat, cx| chat.focus(window, cx));
+            }
+        }
         self.reload_history(cx);
         self.queue_persist(cx);
         cx.notify();
+    }
+
+    /// Shows or hides History in the review panel (`cmd-shift-h`).
+    fn toggle_history(&mut self, _: &ToggleHistory, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_review(ReviewTab::History, window, cx);
     }
 
     /// The worktree's header. `window_buttons`: they sit at its start
@@ -3485,8 +3475,12 @@ impl SuperGitApp {
             .selected
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Select a worktree first"))?;
+        // A hidden panel's diff is not what the user is looking at.
+        if !self.review_shown() {
+            anyhow::bail!("Open Changes, History or a pull request's files first");
+        }
         let (state, patch, comparison, anchor) = match self.tab {
-            MainTab::Changes => (
+            ReviewTab::Changes => (
                 &self.changes_diff,
                 &self.details.patch,
                 self.details
@@ -3508,7 +3502,7 @@ impl SuperGitApp {
                     .get(&path)
                     .and_then(|view| view.changes_position.as_ref()),
             ),
-            MainTab::History => (
+            ReviewTab::History => (
                 &self.commit_diff,
                 &self.commit_patch,
                 format!(
@@ -3520,12 +3514,9 @@ impl SuperGitApp {
                     .get(&path)
                     .and_then(|view| view.commit_position.as_ref()),
             ),
-            MainTab::PullRequests => {
+            ReviewTab::PullRequests => {
                 let (state, patch, comparison) = self.pr_diff_context()?;
                 (state, patch, comparison, None)
-            }
-            MainTab::Sessions => {
-                anyhow::bail!("Open Changes, History or a pull request's files first")
             }
         };
         let patch_text = patch.value().ok_or_else(|| {
@@ -3602,7 +3593,7 @@ impl SuperGitApp {
             comparison: format!(
                 "{comparison}{}",
                 if patch.error().is_some()
-                    || (self.tab == MainTab::Changes
+                    || (self.tab == ReviewTab::Changes
                         && (self.load_error.is_some() || self.details.status.error().is_some()))
                 {
                     " · stale, last successful snapshot"
@@ -4631,7 +4622,7 @@ impl SuperGitApp {
             .min(history_tree_max(width))
     }
 
-    /// The commit tree beside the review (`cmd-h`): the search and scope
+    /// The commit tree in the History panel (`cmd-shift-h`): the search and scope
     /// bar, then the graph. `width` is the column's.
     fn render_history_tree(
         &self,
@@ -4759,7 +4750,7 @@ impl SuperGitApp {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 // A commit picked in the tree shows beside it.
-                this.set_tab(MainTab::History, cx);
+                this.set_tab(ReviewTab::History, cx);
                 this.select_commit(sha.clone(), cx)
             }))
         });
@@ -5072,87 +5063,6 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    fn render_sessions(
-        &self,
-        info: &WorktreeInfo,
-        theme: &gpui_kit::component::Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        if info.sessions.is_empty() {
-            // Padded, and the buttons wrap: a narrow pane keeps them whole.
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .p_4()
-                .text_center()
-                .text_color(theme.muted_foreground)
-                .child("No agent sessions in this worktree yet")
-                .child(h_flex().flex_wrap().justify_center().gap_2().children(
-                    Provider::ALL.into_iter().map(|provider| {
-                        Button::new(("agent-new-empty", provider as usize))
-                            .icon(crate::icons::agent_icon(provider))
-                            .label(format!("Start {} here", provider.label()))
-                            .when(provider == default_provider(), |b| b.primary())
-                            .tooltip(format!(
-                                "Open a new conversation in the {} panel",
-                                provider.label()
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.new_chat_with(provider, window, cx)
-                            }))
-                    }),
-                ))
-                .into_any_element();
-        }
-        // Open follows the panel's Chat | Terminal switch; with Chat, Terminal
-        // opens the agent's own TUI instead.
-        let chat_view = self.agent_view == crate::settings::AgentView::Chat;
-        let rows = info.sessions.iter().enumerate().map(|(ix, s)| {
-            let provider = s.provider;
-            let command = launch::resume_command(provider, &s.id);
-            let session = s.clone();
-            let in_terminal = s.clone();
-            session_row(ix, s, theme)
-                .child(
-                    Button::new(("open-session", ix))
-                        .label("Open")
-                        .small()
-                        .tooltip(format!("Continue in the {} panel", provider.label()))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_session_chat(session.clone(), window, cx)
-                        })),
-                )
-                .when(chat_view, |row| {
-                    row.child(
-                        Button::new(("resume-terminal", ix))
-                            .label("Terminal")
-                            .small()
-                            .ghost()
-                            .tooltip(format!(
-                                "Continue in the agent panel as {}'s own terminal UI ({command})",
-                                provider.label()
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_session(
-                                    in_terminal.clone(),
-                                    crate::settings::AgentView::Terminal,
-                                    window,
-                                    cx,
-                                )
-                            })),
-                    )
-                })
-        });
-        v_flex()
-            .id("sessions")
-            .size_full()
-            .overflow_y_scroll()
-            .children(rows)
-            .into_any_element()
-    }
-
     fn ensure_chats(&mut self, path: &PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // Every worktree gets a ready-to-type conversation; the agent process
         // only starts with the first message.
@@ -5197,168 +5107,103 @@ impl SuperGitApp {
         }
     }
 
-    /// Open the agent panel on the selected worktree's conversation `ix`.
-    fn open_chat_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
-            return;
-        };
-        self.tree_agent = self
-            .chats
-            .get(&path)
-            .and_then(|chats| chats.get(ix))
-            .map(|chat| chat.read(cx).local_id().to_string());
-        self.active_chat.insert(path, ix);
-        self.chat_open = true;
-        if let Some(chat) = self.active_chat_entity() {
-            chat.update(cx, |chat, cx| chat.focus(window, cx));
-        }
-        self.queue_persist(cx);
-        cx.notify();
-    }
-
-    /// The agent rail at the window's right edge, beside the review: the
-    /// button that collapses or expands the panel, one
-    /// mark per conversation of the selected worktree (the agent's mark, in
-    /// its own colors while the agent works, gray otherwise; the selected
-    /// one on a background), then New under them. Hovered, an item shows its label at
-    /// once to its left. Clicking a mark opens its conversation; its context
-    /// menu closes it. Every item is a square as wide as the rail, easy to
-    /// hit, with a line under it.
-    fn render_chat_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The rail at the right edge, under the worktree's header: one square
+    /// per review panel (History, Changes, Pull requests). A click shows
+    /// that panel right of the conversation, or hides it when it is the one
+    /// shown. The shown one sits on a background; hovered, a square shows
+    /// its name at once to its left. Every square is as wide as the rail,
+    /// easy to hit. No lines under them: they would sit just below the bars
+    /// beside (shorter than a square) and not meet their lines.
+    fn render_review_rail(&self, info: &WorktreeInfo, cx: &mut Context<Self>) -> AnyElement {
         use gpui_kit::component::Size;
-        let path = self.selected.clone().unwrap_or_default();
-        self.ensure_chats(&path, window, cx);
         let theme = cx.theme().clone();
-        let open = self.chat_open;
-        let chats = self.chats.get(&path).cloned().unwrap_or_default();
-        let active = self.active_chat.get(&path).copied().unwrap_or(0);
-        let closable = chats.len() > 1;
-        let owner = cx.entity().downgrade();
-        // The first square is as tall as the headers beside it: their lines
-        // meet.
-        let item = |id: ElementId| rail_square(id, theme.border);
-        // Busy in any process, this window's or another (Claude Code's
-        // registry, read with the sessions).
-        let busy: Vec<(Provider, String)> = self
-            .worktrees
+        let open = self.review_shown();
+        let changes = if self.comparison_base().is_some() {
+            self.details.files.value().map(Vec::len)
+        } else {
+            info.status.as_ref().ok().map(|status| status.files.len())
+        };
+        let open_prs = self
+            .prs
             .iter()
-            .filter(|info| info.path() == path)
-            .flat_map(|info| &info.sessions)
-            .filter(|session| session.busy)
-            .map(|session| (session.provider, session.id.clone()))
-            .collect();
-        let cells = chats.iter().enumerate().map(|(ix, chat)| {
-            let c = chat.read(cx);
-            let owner = owner.clone();
-            // The agent's mark: in its own colors while the agent works,
-            // gray otherwise.
-            let working = c.is_working()
-                || c.session_id().is_some_and(|id| {
-                    busy.iter()
-                        .any(|(provider, busy)| *provider == c.provider() && busy == id)
-                });
-            let mark = if working {
-                crate::icons::agent_icon(c.provider())
-            } else {
-                crate::icons::agent_mark(c.provider()).text_color(theme.muted_foreground)
-            };
-            let square = item(("rail-chat", ix).into())
-                // The selected conversation (on screen, or the one the panel
-                // reopens on).
-                .when(ix == active, |el| el.bg(theme.sidebar_accent))
+            .filter(|p| matches!(p.state, PrState::Open | PrState::Draft))
+            .count();
+        // Commits since the branch forked from main; none on main itself.
+        let history = match &self.history.fork {
+            Some(fork) => format!("History · {} since the fork", fork.commits),
+            None => "History".to_string(),
+        };
+        let items = [
+            (
+                ReviewTab::History,
+                "rail-history",
+                IconName::GitGraph,
+                format!("{history} ({MOD}-shift-h)"),
+            ),
+            (
+                ReviewTab::Changes,
+                "rail-changes",
+                IconName::Diff,
+                match changes {
+                    Some(count) => format!("Changes · {count}"),
+                    None => "Changes".to_string(),
+                },
+            ),
+            (
+                ReviewTab::PullRequests,
+                "rail-pulls",
+                IconName::GitPullRequest,
+                format!("Pull requests · {open_prs} open"),
+            ),
+        ];
+        let squares = items.map(|(tab, id, icon, label)| {
+            let shown = open && self.tab == tab;
+            let square = rail_square(id, theme.border)
+                .border_b_0()
+                .when(shown, |el| el.bg(theme.sidebar_accent))
                 .hover(|el| {
-                    el.bg(if ix == active {
+                    el.bg(if shown {
                         theme.sidebar_accent
                     } else {
                         theme.list_hover
                     })
                 })
-                .on_click(cx.listener(move |this, _, window, cx| this.open_chat_at(ix, window, cx)))
-                .child(mark.with_size(Size::Medium))
-                .context_menu(move |menu, _, _| {
-                    let owner = owner.clone();
-                    // Closing stops the conversation's agent; the last one
-                    // stays, so the worktree keeps a conversation to type in.
-                    menu.item(
-                        PopupMenuItem::new("Close Conversation")
-                            .disabled(!closable)
-                            .on_click(move |_, _, cx| {
-                                let _ = owner.update(cx, |this, cx| this.close_chat(ix, cx));
-                            }),
-                    )
-                });
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.toggle_review(tab, window, cx)),
+                )
+                .child(
+                    Icon::new(icon)
+                        .with_size(Size::Medium)
+                        .text_color(if shown {
+                            theme.foreground
+                        } else {
+                            theme.muted_foreground
+                        }),
+                );
             rail_label(
-                ("rail-chat-label", ix),
-                c.title().into(),
+                SharedString::from(format!("{id}-label")),
+                label.into(),
                 square,
                 LabelSide::Left,
                 &theme,
             )
         });
-        let toggle = item("toggle-chat".into())
-            .hover(|el| el.bg(theme.list_hover))
-            .on_click(
-                cx.listener(|this, _, window, cx| this.toggle_claude(&ToggleClaude, window, cx)),
-            )
-            .child(
-                Icon::new(if open {
-                    IconName::PanelRightClose
-                } else {
-                    IconName::PanelRightOpen
-                })
-                .with_size(Size::Medium),
-            );
-        let toggle_label = if open {
-            format!("Collapse the agent panel ({MOD}-l)")
-        } else {
-            format!("Expand the agent panel ({MOD}-l)")
-        };
-        let new = item("rail-chat-new".into())
-            .hover(|el| el.bg(theme.list_hover))
-            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
-            .child(Icon::new(IconName::Plus).with_size(Size::Medium));
         v_flex()
+            .id("review-rail")
             .w(px(RAIL_WIDTH))
             .flex_none()
             .h_full()
             .border_l_1()
             .border_color(theme.border)
-            .child(rail_label(
-                "rail-toggle-label",
-                toggle_label.into(),
-                toggle,
-                LabelSide::Left,
-                &theme,
-            ))
-            .child(
-                v_flex()
-                    .id("chat-rail")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(cells)
-                    // New ends the list, under the conversations.
-                    .child(rail_label(
-                        "rail-new-label",
-                        format!("New conversation ({MOD}-n)").into(),
-                        new,
-                        LabelSide::Left,
-                        &theme,
-                    )),
-            )
+            .children(squares)
             .into_any_element()
     }
 
-    /// The agent panel: the conversation on screen under a header with its
-    /// agent and title. Switching, New and collapsing live in the rail.
-    /// `window_buttons`: they sit at the header's start (macOS, the sidebar
-    /// collapsed), so it begins past them.
-    fn render_claude_panel(
-        &mut self,
-        window_buttons: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// The conversation on screen under the worktree's header (the one
+    /// picked in the sidebar's tree, else the worktree's last): a bar with
+    /// its agent, title and New, then the conversation. The tree's context
+    /// menu renames and closes it.
+    fn render_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
         let theme = cx.theme().clone();
@@ -5384,19 +5229,14 @@ impl SuperGitApp {
             let chat = chat.read(cx);
             (chat.provider(), chat.title())
         });
-
-        // As tall as the review's header beside it: their lines meet.
-        let header = h_flex()
-            .h(px(RAIL_WIDTH))
-            .flex_none()
+        // As tall as the review panel's bars beside it: their lines meet.
+        let bar = toolbar(&theme)
             .px_3()
-            .when(window_buttons, |row| row.pl(px(WINDOW_BUTTONS_INSET)))
             .gap_2()
-            .border_b_1()
-            .border_color(theme.border)
+            .when(current.is_none(), |el| el.child(div().flex_1()))
             .when_some(current, |el, (provider, title)| {
                 el.child(
-                    crate::icons::agent_icon(provider).with_size(gpui_kit::component::Size::Medium),
+                    crate::icons::agent_icon(provider).with_size(gpui_kit::component::Size::Small),
                 )
                 .child(
                     div()
@@ -5407,12 +5247,19 @@ impl SuperGitApp {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title),
                 )
-            });
+            })
+            .child(
+                Button::new("conversation-new")
+                    .icon(IconName::Plus)
+                    .small()
+                    .ghost()
+                    .tooltip(format!("New conversation in this worktree ({MOD}-n)"))
+                    .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
+            );
         v_flex()
             .size_full()
             .min_w_0()
-            // The resize handle at its right draws the line there.
-            .child(self.window_drag_area(header, cx))
+            .child(bar)
             .child(
                 div()
                     .flex_1()
@@ -5445,16 +5292,16 @@ impl SuperGitApp {
                 )
                 .into_any_element();
         }
-        // What the active project needs at its narrowest (a worktree's agent
-        // rail included).
+        // What the active project needs at its narrowest (a worktree's rail
+        // included).
         let rest = if self.repo.is_none() {
             480.
         } else if self.selected.is_none() {
             REVIEW_MIN
-        } else if self.chat_open {
-            CHAT_MIN + REVIEW_MIN + RAIL_WIDTH
         } else {
-            REVIEW_MIN + RAIL_WIDTH
+            let chat = if self.chat_shown() { CHAT_MIN } else { 0. };
+            let review = if self.review_shown() { REVIEW_MIN } else { 0. };
+            chat + review + RAIL_WIDTH
         };
         let max = (window.viewport_size().width.as_f32() - rest).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         div()
@@ -5482,11 +5329,11 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// The active project's agent panel, the review right of it and the
-    /// agent rail at the edge, or the welcome screen.
+    /// The active project's worktree (its header, conversation, review panel
+    /// and rail, the terminal panel, the status bar), or the welcome screen.
     fn render_project(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        // The status bar stays under the review, so the agent panel and the
-        // splitters reach the window's bottom edge.
+        // The status bar spans the worktree's column; the sidebar and its
+        // splitter reach the window's bottom edge.
         if self.repo.is_none() {
             let row = self
                 .window_buttons_beside_rail(window)
@@ -5500,56 +5347,14 @@ impl SuperGitApp {
                 .into_any_element();
         }
         let main = self.render_main(window, cx);
-        // The terminal panel opens under the review, above the status bar.
+        // The terminal panel opens under the worktree, above the status bar.
         let main = self.with_terminal(main, window, cx);
-        let main = v_flex()
+        v_flex()
             .size_full()
             .min_w_0()
             .min_h_0()
             .child(div().flex_1().min_h_0().w_full().child(elastic(main)))
             .child(self.render_status_bar(cx))
-            .into_any_element();
-        if self.selected.is_none() {
-            return main;
-        }
-        // The agent panel takes the room the review leaves; the review keeps
-        // its width when the window resizes.
-        let content = if self.chat_open {
-            let (review_max, _) = self.pane_widths(window, cx);
-            // macOS, the sidebar collapsed: the window buttons sit in the
-            // panel's header, the first one past the sidebar's rail.
-            let window_buttons = self.window_buttons_beside_rail(window);
-            let chat = self.render_claude_panel(window_buttons, window, cx);
-            h_resizable("review-layout")
-                .with_state(&self.review_layout)
-                .on_resize(cx.listener(|this, state, _, cx| {
-                    this.remember_layout(LayoutPanel::Review, state, cx)
-                }))
-                .child(
-                    resizable_panel()
-                        .size_range(px(CHAT_MIN)..Pixels::MAX)
-                        .child(elastic(chat)),
-                )
-                .child(
-                    resizable_panel()
-                        .size(px(self.repository_view().review_width.min(review_max)))
-                        .size_range(px(REVIEW_MIN)..px(review_max))
-                        .fixed()
-                        .child(elastic(main)),
-                )
-                .into_any_element()
-        } else {
-            elastic(main).into_any_element()
-        };
-        let rail = self.render_chat_rail(window, cx);
-        // Elastic like the panels above: wide content (a long commit
-        // message, a diff line) must not push the rail off-screen.
-        h_flex()
-            .flex_1()
-            .min_h_0()
-            .size_full()
-            .child(div().flex_1().min_w_0().h_full().child(content))
-            .child(rail)
             .into_any_element()
     }
 
@@ -5807,21 +5612,16 @@ fn elastic(content: impl IntoElement) -> Div {
         .child(content)
 }
 
-/// `SUPERGIT_TAB=history|changes|claude|prs` picks the tab shown at startup.
-fn initial_tab() -> MainTab {
-    MainTab::from_name(&std::env::var("SUPERGIT_TAB").unwrap_or_default())
+/// `SUPERGIT_TAB=history|changes|prs` opens the review panel on that tab at
+/// startup.
+fn initial_tab() -> Option<ReviewTab> {
+    std::env::var("SUPERGIT_TAB")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .map(|name| ReviewTab::from_name(&name))
 }
 
 // ---- row builders (pure presentation) -------------------------------------
-
-fn agent_color(state: AgentState, theme: &gpui_kit::component::Theme) -> Hsla {
-    match state {
-        AgentState::Working => theme.blue,
-        AgentState::NeedsAttention => theme.warning,
-        AgentState::Finished => theme.success,
-        AgentState::Idle => theme.muted_foreground,
-    }
-}
 
 fn attention_color(kind: Kind, theme: &gpui_kit::component::Theme) -> Hsla {
     match kind {
@@ -5844,13 +5644,13 @@ pub(crate) fn default_provider() -> Provider {
     Provider::parse(&crate::settings::load().agent).unwrap_or_default()
 }
 
-/// Width of a collapsed side panel (sidebar, agent panel).
+/// Width of a collapsed side panel (the sidebar) and of the right rail.
 const RAIL_WIDTH: f32 = 48.;
 
-/// The agent panel's narrowest, beside the review.
+/// The conversation's narrowest, beside the review panel.
 const CHAT_MIN: f32 = 320.;
 
-/// The review's narrowest: beside the agent panel, or alone.
+/// The review panel's narrowest: beside the conversation, or alone.
 const REVIEW_MIN: f32 = 360.;
 
 /// Height of the bars above the review's columns (commit search, file
@@ -5872,8 +5672,6 @@ fn toolbar(theme: &gpui_kit::component::Theme) -> Div {
         .border_b_1()
         .border_color(theme.border)
 }
-/// An agent-rail item with its label: shown at once on hover, to the item's
-/// left and centered on it (a tooltip waits and sits at the mouse).
 /// A rail's square: as tall as the rail is wide, a line under it, the
 /// whole square hovering (the caller picks the colors).
 fn rail_square(id: impl Into<ElementId>, border: Hsla) -> Stateful<Div> {
@@ -5909,7 +5707,7 @@ pub(crate) fn window_buttons_home() -> Point<Pixels> {
 /// Where a rail's labels open: away from the window's edge it hugs.
 #[derive(Clone, Copy)]
 enum LabelSide {
-    /// The agent rail, at the right edge.
+    /// The right rail, at the window's right edge.
     Left,
     /// The collapsed sidebar, at the left edge.
     Right,
@@ -5918,6 +5716,9 @@ enum LabelSide {
     RightPastWindowButtons,
 }
 
+/// A rail's item with its label: shown at once on hover, beside the item
+/// (away from the window's edge) and centered on it — a tooltip waits and
+/// sits at the mouse.
 fn rail_label(
     id: impl Into<ElementId>,
     text: SharedString,
@@ -6600,62 +6401,6 @@ fn commit_row(
         .when(selected, |el| el.bg(theme.list_active))
         .hover(|el| el.bg(theme.list_hover))
         .child(content)
-}
-
-fn session_row(ix: usize, s: &Session, theme: &gpui_kit::component::Theme) -> Stateful<Div> {
-    h_flex()
-        .id(("session", ix))
-        .px_4()
-        .py_2()
-        .gap_3()
-        .border_b_1()
-        .border_color(theme.border)
-        .child(
-            div()
-                .w(px(88.))
-                .flex_none()
-                .text_xs()
-                .text_color(agent_color(s.state, theme))
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(crate::icons::agent_icon(s.provider).xsmall())
-                        .child(s.state.label()),
-                ),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_0p5()
-                .child(div().truncate().child(s.title.clone()))
-                .when_some(s.last_prompt.clone().filter(|p| *p != s.title), |el, p| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(format!("› {p}")),
-                    )
-                }),
-        )
-        .when_some(s.git_branch.clone(), |el, b| {
-            el.child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(b),
-            )
-        })
-        .child(
-            div()
-                .flex_none()
-                .w(px(32.))
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(time_ago(s.modified)),
-        )
 }
 
 #[cfg(test)]

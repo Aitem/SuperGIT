@@ -195,11 +195,10 @@ impl SuperGitApp {
                         .small()
                         .ghost()
                         .disabled(busy)
-                        .tooltip("Close this dialog and open the Changes tab")
+                        .tooltip("Close this dialog and show Changes")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.close_cherry_pick(window, cx);
-                            this.tab = MainTab::Changes;
-                            cx.notify();
+                            this.set_tab(ReviewTab::Changes, cx);
                         })),
                 )
                 .child(

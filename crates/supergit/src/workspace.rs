@@ -107,8 +107,8 @@ pub struct RepositoryView {
     pub worktrees: BTreeMap<PathBuf, WorktreeView>,
     pub conversations: BTreeMap<PathBuf, Vec<SavedConversation>>,
     pub active_conversations: BTreeMap<PathBuf, usize>,
-    /// The review's width beside the agent panel (it fills the room while
-    /// the panel is closed).
+    /// The review panel's width beside the conversation (it fills the room
+    /// while the conversation is hidden).
     pub review_width: f32,
     pub changes_width: f32,
     pub history_width: f32,
@@ -124,8 +124,33 @@ pub struct RepositoryView {
     pub changes_tree: bool,
     /// What the History tab lists: every branch, or this one.
     pub history_scope: crate::model::history::HistoryScope,
-    /// The commit tree shows beside the review (`cmd-h`).
-    pub history_open: bool,
+    /// The review panel shows right of the conversation (the right rail's
+    /// buttons, `cmd-shift-h` for History).
+    pub review_open: bool,
+    /// What the review panel shows, or shows again when it opens.
+    #[serde(deserialize_with = "review_tab_or_history")]
+    pub review_tab: ReviewTab,
+}
+
+/// A panel this version does not know (an older or newer one's) reads as
+/// History: one unknown value must not cost the whole saved workspace.
+fn review_tab_or_history<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ReviewTab, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(ReviewTab::deserialize(value).unwrap_or_default())
+}
+
+/// What the review panel shows: one per button of the right rail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTab {
+    /// The commit tree, and the commit picked in it.
+    #[default]
+    History,
+    /// The worktree's uncommitted changes (or the branch's, against a base).
+    Changes,
+    PullRequests,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,7 +181,8 @@ impl Default for RepositoryView {
             terminal_height: 280.,
             changes_tree: false,
             history_scope: Default::default(),
-            history_open: true,
+            review_open: false,
+            review_tab: ReviewTab::History,
         }
     }
 }
@@ -305,6 +331,11 @@ mod tests {
             serde_json::from_str(r#"{"review_width":9999,"future":true}"#).unwrap();
         state.sanitize();
         assert_eq!(state.review_width, 1600.);
+        assert!(!state.review_open);
+        assert_eq!(state.review_tab, ReviewTab::History);
+        let state: RepositoryView =
+            serde_json::from_str(r#"{"review_open":true,"review_tab":"gone"}"#).unwrap();
+        assert_eq!(state.review_tab, ReviewTab::History);
         assert!(state.chat_open);
         assert!(!state.auto_cleanup);
         assert_eq!(state.protected_branches, ["main", "master"]);
