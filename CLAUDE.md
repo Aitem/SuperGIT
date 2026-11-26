@@ -437,8 +437,12 @@ never commit, push or create worktrees there without asking.
   is on screen.
 - **Sidebar tree**: a repository's row (Git's logo, `icons::git_mark`)
   is also its main checkout's: a click selects it, its counts and agents
-  show there, and no separate main row is drawn. Linked worktrees follow,
-  each with its branch's icon (a house for `main`/`master`).
+  show there, and no separate main row is drawn. Its chevron (fold) sits
+  at the right edge after "+"; the tree under it starts where its name
+  does (`NAME_START`): the main checkout's conversation marks and the
+  linked worktrees' status dots under its first letter, then each
+  worktree's type icon (a branch, a house for `main`/`master`) with its
+  conversations' marks under it.
 - **Agents in the sidebar**: under each worktree, a row per conversation
   that has started (`sidebar.rs` `agents_in`: the live chats once the
   worktree was open, else the saved ones): the agent's mark (in its colors
