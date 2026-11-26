@@ -596,13 +596,7 @@ impl SuperGitApp {
     /// width now: what it keeps beside the conversation, or all the room
     /// between the sidebar and the rail while the conversation is hidden.
     fn pane_widths(&self, window: &Window, cx: &App) -> (f32, f32) {
-        // A worktree's rail stays at the right edge, panel open or not.
-        let rail = if self.selected.is_some() {
-            RAIL_WIDTH
-        } else {
-            0.
-        };
-        let total = window.viewport_size().width.as_f32() - self.sidebar_width(cx) - rail;
+        let total = self.body_width(window, cx);
         let review_max = (total - CHAT_MIN).max(REVIEW_MIN);
         let review = if self.chat_shown() {
             self.review_layout
@@ -616,6 +610,18 @@ impl SuperGitApp {
             total.max(REVIEW_MIN)
         };
         (review_max, review)
+    }
+
+    /// The room under the worktree's header left of its rail: the
+    /// conversation and the review panel share it.
+    fn body_width(&self, window: &Window, cx: &App) -> f32 {
+        // A worktree's rail stays at the right edge, panel open or not.
+        let rail = if self.selected.is_some() {
+            RAIL_WIDTH
+        } else {
+            0.
+        };
+        window.viewport_size().width.as_f32() - self.sidebar_width(cx) - rail
     }
 
     /// The review panel is on screen: right of the conversation, or in its
@@ -2864,6 +2870,33 @@ impl SuperGitApp {
         list.get(ix).or(list.last()).cloned()
     }
 
+    /// The conversation the header names in the worktree at `path`: its
+    /// active one, live, else as saved (a hidden conversation is set up only
+    /// once it shows).
+    fn header_conversation(&self, path: &Path, cx: &App) -> Option<(Provider, SharedString)> {
+        if let Some(chats) = self.chats.get(path) {
+            let ix = self.active_chat.get(path).copied().unwrap_or(0);
+            let chat = chats.get(ix).or(chats.last())?.read(cx);
+            return Some((chat.provider(), chat.title().into()));
+        }
+        // As `ensure_chats` restores them.
+        let view = self.repository_view();
+        let saved: Vec<_> = view
+            .conversations
+            .get(path)?
+            .iter()
+            .filter(|c| native_provider(&c.provider))
+            .collect();
+        let last = saved.len().checked_sub(1)?;
+        let ix = view.active_conversations.get(path).copied().unwrap_or(0);
+        let saved = saved.get(ix.min(last))?;
+        let title = match saved.display_title() {
+            "" => "New conversation",
+            title => title,
+        };
+        Some((Provider::parse(&saved.provider)?, title.to_string().into()))
+    }
+
     /// State of the native conversations in a worktree, if any is active.
     fn live_agent_state(&self, path: &Path, cx: &App) -> Option<AgentState> {
         self.chats
@@ -3202,11 +3235,13 @@ impl SuperGitApp {
                 .into_any_element();
         };
 
+        // The body first: it sets up the worktree's conversations, whose
+        // title the header shows live.
+        let body = self.render_worktree_body(&info, window, cx);
         let header = self
             .render_header(&info, window_buttons, &theme, cx)
             .into_any_element();
         let header = self.window_drag_area(header, cx);
-        let body = self.render_worktree_body(&info, window, cx);
         let rail = self.render_review_rail(&info, cx);
         // The header spans the window to its right edge; the rail sits under
         // it, beside the conversation and the panel it opens. Elastic: wide
@@ -3228,10 +3263,11 @@ impl SuperGitApp {
             .into_any_element()
     }
 
-    /// Under the worktree's header: its conversation and, right of it, the
-    /// review panel the rail opened (or the panel alone while the
-    /// conversation is hidden, `cmd-l`). The panel keeps its width when the
-    /// window resizes; the conversation takes the room left.
+    /// Under the worktree's header: its conversation under the Git bar and,
+    /// right of it, the review panel the rail opened. While the conversation
+    /// is hidden (`cmd-l`) the panel fills the room and the Git bar spans
+    /// it, so the branch's actions stay at hand. The panel keeps its width
+    /// when the window resizes; the conversation takes the room left.
     fn render_worktree_body(
         &mut self,
         info: &WorktreeInfo,
@@ -3239,9 +3275,11 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (review_max, review_width) = self.pane_widths(window, cx);
+        let total = self.body_width(window, cx);
         match (self.chat_shown(), self.review_shown()) {
             (true, true) => {
-                let chat = self.render_conversation(window, cx);
+                let git_bar = self.render_git_bar(info, total - review_width, cx);
+                let chat = self.render_conversation(git_bar, window, cx);
                 let review = self.render_review_panel(info, review_width, window, cx);
                 h_resizable("review-layout")
                     .with_state(&self.review_layout)
@@ -3263,9 +3301,19 @@ impl SuperGitApp {
                     .into_any_element()
             }
             (false, true) => {
-                elastic(self.render_review_panel(info, review_width, window, cx)).into_any_element()
+                let git_bar = self.render_git_bar(info, total, cx);
+                let review = self.render_review_panel(info, review_width, window, cx);
+                v_flex()
+                    .size_full()
+                    .min_w_0()
+                    .child(git_bar)
+                    .child(div().flex_1().min_h_0().child(elastic(review)))
+                    .into_any_element()
             }
-            _ => elastic(self.render_conversation(window, cx)).into_any_element(),
+            _ => {
+                let git_bar = self.render_git_bar(info, total, cx);
+                elastic(self.render_conversation(git_bar, window, cx)).into_any_element()
+            }
         }
     }
 
@@ -3388,8 +3436,10 @@ impl SuperGitApp {
         self.toggle_review(ReviewTab::History, window, cx);
     }
 
-    /// The worktree's header. `window_buttons`: they sit at its start
-    /// (macOS, the sidebar collapsed), so it begins past them.
+    /// The worktree's header: what is on screen, `repo / worktree /` and the
+    /// conversation (its agent's mark and title). The branch's state and
+    /// actions sit in the Git bar under it. `window_buttons`: they sit at
+    /// its start (macOS, the sidebar collapsed), so it begins past them.
     fn render_header(
         &self,
         info: &WorktreeInfo,
@@ -3398,25 +3448,7 @@ impl SuperGitApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let path = info.wt.path.clone();
-        let status_line = match &info.status {
-            Ok(st) => {
-                let mut parts = Vec::new();
-                if let Some(up) = &st.upstream {
-                    parts.push(format!("→ {up}"));
-                    parts.push(format!("↑{} ↓{}", st.ahead, st.behind));
-                } else if st.branch.is_some() {
-                    parts.push("no upstream".into());
-                }
-                if st.staged_count() > 0 {
-                    parts.push(format!("{} staged", st.staged_count()));
-                }
-                if st.conflicted_count() > 0 {
-                    parts.push(format!("{} conflicts", st.conflicted_count()));
-                }
-                parts.join("  ·  ")
-            }
-            Err(e) => e.clone(),
-        };
+        let conversation = self.header_conversation(&path, cx);
         // The title may be clipped: its tooltip has the whole name and the path.
         let shown_path =
             SharedString::from(format!("{}\n{}", info.wt.display_name(), path.display()));
@@ -3455,11 +3487,11 @@ impl SuperGitApp {
             .px_4()
             .when(window_buttons, |row| row.pl(px(WINDOW_BUTTONS_INSET)))
             .gap_4()
-            .justify_between()
             .border_b_1()
             .border_color(theme.border)
             .child(
                 h_flex()
+                    .flex_1()
                     .min_w_0()
                     .child(
                         // Selectable like any text (drag, double click,
@@ -3486,22 +3518,39 @@ impl SuperGitApp {
                                 highlights,
                             )),
                     )
-                    .when(!status_line.is_empty(), |row| {
+                    .when_some(conversation, |row, (provider, title)| {
                         row.child(
                             div()
-                                .min_w_0()
-                                // Gives way, down to nothing, before the
-                                // names do.
-                                .flex_shrink(1000.)
-                                .ml_2()
-                                .text_xs()
+                                .flex_none()
+                                .px_1p5()
+                                .text_base()
                                 .text_color(theme.muted_foreground)
+                                .child("/"),
+                        )
+                        .child(
+                            crate::icons::agent_icon(provider)
+                                .with_size(gpui_kit::component::Size::Small)
+                                .flex_none()
+                                .mr_1p5(),
+                        )
+                        .child(
+                            // Gives way, down to its ellipsis, before the
+                            // names do; the tooltip has it whole.
+                            div()
+                                .id("header-conversation")
+                                .min_w_0()
+                                .flex_shrink(1000.)
                                 .truncate()
-                                .child(status_line),
+                                .text_base()
+                                .tooltip({
+                                    let title = title.clone();
+                                    move |window, cx| Tooltip::new(title.clone()).build(window, cx)
+                                })
+                                .tooltip_show_delay(crate::TOOLTIP_DELAY)
+                                .child(title),
                         )
                     }),
             )
-            .child(self.render_branch_actions(info, cx))
     }
 
     /// Inline feedback keeps errors actionable without a modal or a focus change.
@@ -5253,13 +5302,17 @@ impl SuperGitApp {
     }
 
     /// The conversation on screen under the worktree's header (the one
-    /// picked in the sidebar's tree, else the worktree's last): a bar with
-    /// its agent, title and New, then the conversation. The tree's context
-    /// menu renames and closes it.
-    fn render_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// picked in the sidebar's tree, else the worktree's last), with
+    /// `git_bar` over it; the header names it. The tree's context menu
+    /// renames and closes it.
+    fn render_conversation(
+        &mut self,
+        git_bar: AnyElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let path = self.selected.clone().unwrap_or_default();
         self.ensure_chats(&path, window, cx);
-        let theme = cx.theme().clone();
         let chats = self.chats.get(&path).cloned().unwrap_or_default();
         let active = self
             .active_chat
@@ -5278,41 +5331,10 @@ impl SuperGitApp {
         {
             chat.update(cx, |chat, cx| chat.mark_seen(cx));
         }
-        let current = chats.get(active).map(|chat| {
-            let chat = chat.read(cx);
-            (chat.provider(), chat.title())
-        });
-        // As tall as the review panel's bars beside it: their lines meet.
-        let bar = toolbar(&theme)
-            .px_3()
-            .gap_2()
-            .when(current.is_none(), |el| el.child(div().flex_1()))
-            .when_some(current, |el, (provider, title)| {
-                el.child(
-                    crate::icons::agent_icon(provider).with_size(gpui_kit::component::Size::Small),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-            })
-            .child(
-                Button::new("conversation-new")
-                    .icon(IconName::Plus)
-                    .small()
-                    .ghost()
-                    .tooltip(format!("New conversation in this worktree ({MOD}-n)"))
-                    .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
-            );
         v_flex()
             .size_full()
             .min_w_0()
-            .child(bar)
+            .child(git_bar)
             .child(
                 div()
                     .flex_1()

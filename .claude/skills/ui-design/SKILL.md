@@ -44,13 +44,13 @@ Controls stay where the hand left them.
 ## 3. Hierarchy: top-down, general to specific
 
 The window reads top to bottom, each level narrower than the one above:
-worktree header (what and where: `repo / worktree`, branch actions) →
+worktree header (what and where: `repo / worktree /` the conversation) →
 the conversation and the review panel the right rail opens (History,
-Changes, Pull requests) → each column's bar (search, filters, view
-options) → content.
+Changes, Pull requests) → each column's bar (the conversation's Git bar:
+branch state and actions; search, filters, view options) → content.
 
-- A control lives at the level it acts on. Branch actions go in the header,
-  not in a commit's card. A diff's layout goes above that diff.
+- A control lives at the level it acts on. Branch actions go in the Git
+  bar, not in a commit's card. A diff's layout goes above that diff.
 - One primary (filled) button per area at most. Everything else is ghost.
 - Group related controls; separate groups with space or a 1px divider
   rather than boxes.

@@ -428,10 +428,14 @@ never commit, push or create worktrees there without asking.
   `icons::ExtraIcons` (and in the `icons_used_by_the_app_are_embedded`
   test).
 - **Window columns**: sidebar | worktree column. The worktree column: its
-  header (`repo / worktree`, branch actions) across it to the window's
-  right edge; under it the conversation (a bar with its agent, title and
-  New), right of it the review panel, and the right rail
-  at the edge; then the terminal panel and the status bar, full width.
+  header (`repo / worktree /` the conversation's agent mark and title)
+  across it to the window's right edge; under it the conversation with the
+  Git bar over it (`render_git_bar`: Fetch, Pull, Push, Rebase, Delete at
+  its left edge — icons only when narrow — then upstream, ahead/behind,
+  staged), right of it
+  the review panel, and the right rail at the edge; then the terminal
+  panel and the status bar, full width. While the conversation is hidden
+  (`cmd-l`) the Git bar spans the review panel.
 - **Review panel and right rail**: the rail (`render_review_rail`) holds
   History, Changes and Pull requests squares (`ReviewTab`); a click shows
   that panel right of the conversation, a click on the shown one hides

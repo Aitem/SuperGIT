@@ -78,7 +78,7 @@ gpui_kit::assets::icon_assets!(
         ChevronsUpDown,
         FolderGit2,
         Circle,
-        // The header's branch actions.
+        // The Git bar's branch actions.
         ArrowDownToLine,
         ArrowUpFromLine,
         GitBranch,
@@ -159,7 +159,7 @@ mod tests {
             IconName::TriangleAlert,
             IconName::Map,
             IconName::Copy,
-            // The header's branch actions.
+            // The Git bar's branch actions.
             IconName::RefreshCw,
             IconName::ArrowDownToLine,
             IconName::ArrowUpFromLine,

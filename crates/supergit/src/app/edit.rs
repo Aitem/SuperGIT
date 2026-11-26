@@ -27,12 +27,65 @@ struct SquashOffer {
     published: bool,
 }
 
+/// The Git bar's narrowest with labels on its actions (they take about
+/// 380px): below it they show only their icons (and tooltips), so all five
+/// fit beside a narrow conversation and the branch's state stays readable.
+const GIT_BAR_LABELS: f32 = 560.;
+
 impl SuperGitApp {
-    /// The header's actions on the worktree's branch: fetch, pull, push,
-    /// rebase, and for a linked worktree, delete.
-    pub(super) fn render_branch_actions(
+    /// The bar over the conversation: the branch's actions at its left
+    /// edge, then its state (upstream, ahead and behind, staged,
+    /// conflicts). As tall as the review panel's bars beside it: their
+    /// lines meet. `width`: the bar's.
+    pub(super) fn render_git_bar(
         &self,
         info: &WorktreeInfo,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let state = match &info.status {
+            Ok(st) => {
+                let mut parts = Vec::new();
+                if let Some(up) = &st.upstream {
+                    parts.push(format!("→ {up}"));
+                    parts.push(format!("↑{} ↓{}", st.ahead, st.behind));
+                } else if st.branch.is_some() {
+                    parts.push("no upstream".into());
+                }
+                if st.staged_count() > 0 {
+                    parts.push(format!("{} staged", st.staged_count()));
+                }
+                if st.conflicted_count() > 0 {
+                    parts.push(format!("{} conflicts", st.conflicted_count()));
+                }
+                parts.join("  ·  ")
+            }
+            Err(e) => e.clone(),
+        };
+        toolbar(&theme)
+            .gap_3()
+            .child(self.render_branch_actions(info, width >= GIT_BAR_LABELS, cx))
+            .child(
+                // Gives way, down to nothing, before the actions do.
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .truncate()
+                    .child(state),
+            )
+            .into_any_element()
+    }
+
+    /// The Git bar's actions on the worktree's branch: fetch, pull, push,
+    /// rebase, and for a linked worktree, delete. `labels`: each shows its
+    /// name beside its icon.
+    fn render_branch_actions(
+        &self,
+        info: &WorktreeInfo,
+        labels: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let path = info.wt.path.clone();
@@ -43,7 +96,11 @@ impl SuperGitApp {
             || self.base_update_paths.contains(&path)
             || self.cleanup_paths.contains(&path);
         let action = |id: &'static str, icon: IconName, label: &'static str| {
-            Button::new(id).icon(icon).label(label).small().ghost()
+            Button::new(id)
+                .icon(icon)
+                .when(labels, |button| button.label(label))
+                .small()
+                .ghost()
         };
         let fetch_path = path.clone();
         let pull_path = path.clone();
@@ -217,13 +274,11 @@ impl SuperGitApp {
         }
     }
 
+    /// As tall as the Git bar beside it: their lines meet.
     pub(super) fn render_staging_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        toolbar(cx.theme())
             .px_3()
-            .py_1()
             .gap_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
             .child(
                 Button::new("show-working-tree")
                     .label("Review changes")
