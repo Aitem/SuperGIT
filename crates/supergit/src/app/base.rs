@@ -95,6 +95,10 @@ impl SuperGitApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.folder.is_some() {
+            self.flash("A folder without Git has no worktree base", true, cx);
+            return;
+        }
         if self.action_task.is_some() || self.cleanup_task.is_some() {
             self.flash("Another Git operation is in progress", true, cx);
             return;

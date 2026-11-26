@@ -70,8 +70,9 @@ const USAGE: &str = "\
 SuperGIT — Git GUI for agent-driven development
 
 USAGE:
-    supergit [PATH]          open the repository containing PATH (default: cwd,
-                             else the last opened repository)
+    supergit [PATH]          open the repository containing PATH, else PATH as
+                             a folder project without Git (default: the
+                             repository at cwd, else the last opened project)
     supergit --dump [PATH]   print worktrees, agent sessions and PRs as text
 
 ENV:
@@ -132,23 +133,26 @@ fn main() -> Result<()> {
     // macOS may pass `-psn_…` to bundled apps; only plain arguments are paths.
     let explicit = args.iter().find(|a| !a.starts_with('-'));
 
-    let (repo, launch_dir) = match explicit {
+    let (project, launch_dir) = match explicit {
+        // A repository, or any folder as a folder project.
         Some(p) => {
             let dir = std::fs::canonicalize(p).with_context(|| format!("no such path: {p}"))?;
-            (Some(sg_git::Repo::discover(&dir)?), dir)
+            (Some(model::Project::open(&dir)?), dir)
         }
         None => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            // Only a repository: the folder a terminal happens to be in (or
+            // the Dock's `/`) is no project anyone asked for.
             match sg_git::Repo::discover(&cwd) {
-                Ok(repo) => (Some(repo), cwd),
-                // Started from the Dock (cwd is `/`): reopen the last repository.
+                Ok(repo) => (Some(model::Project::Repo(repo)), cwd),
+                // Started from the Dock (cwd is `/`): reopen the last project.
                 Err(_) => match recent::load()
                     .into_iter()
-                    .find_map(|p| sg_git::Repo::discover(&p).ok())
+                    .find_map(|p| model::Project::open(&p).ok())
                 {
-                    Some(repo) => {
-                        let dir = repo.root.clone();
-                        (Some(repo), dir)
+                    Some(project) => {
+                        let dir = project.root().to_path_buf();
+                        (Some(project), dir)
                     }
                     None => (None, cwd),
                 },
@@ -157,8 +161,13 @@ fn main() -> Result<()> {
     };
 
     if dump {
-        let repo = repo.context("not inside a git repository")?;
-        return dump::run(&repo);
+        return match project {
+            Some(model::Project::Repo(repo)) => dump::run(&repo),
+            Some(model::Project::Folder(root)) => {
+                anyhow::bail!("{} is not a Git repository", root.display())
+            }
+            None => anyhow::bail!("not inside a git repository"),
+        };
     }
     // Screenshot runs are throwaway windows: never hand off to, or act as,
     // the user's instance.
@@ -167,13 +176,13 @@ fn main() -> Result<()> {
         None
     } else {
         // A launcher click (no repository here) only raises the window.
-        match single_instance::claim(repo.is_some().then_some(launch_dir.as_path())) {
+        match single_instance::claim(project.is_some().then_some(launch_dir.as_path())) {
             single_instance::Role::Forwarded => return Ok(()),
             single_instance::Role::Primary(listener) => listener,
         }
     };
-    if let Some(repo) = &repo {
-        recent::remember(&repo.root);
+    if let Some(project) = &project {
+        recent::remember(project.root());
     }
 
     let app = gpui_kit::application().with_assets(icons::AppAssets);
@@ -288,7 +297,7 @@ fn main() -> Result<()> {
         };
         let (_handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
             window.set_window_title("SuperGIT");
-            cx.new(|cx| app::SuperGitApp::new(repo, launch_dir, window, cx))
+            cx.new(|cx| app::SuperGitApp::new(project, launch_dir, window, cx))
         })
         .expect("failed to open the main window");
         #[cfg(feature = "screenshot")]
@@ -368,8 +377,8 @@ pub(crate) fn set_app_menus(cx: &mut App) {
                 .collect::<Vec<_>>(),
             ),
             Menu::new("File").items([
-                MenuItem::action("Open Repository as Project…", app::OpenRepository),
-                MenuItem::action("Recent Repositories", app::CloseRepository),
+                MenuItem::action("Open Folder as Project…", app::OpenRepository),
+                MenuItem::action("Recent Projects", app::CloseRepository),
                 MenuItem::separator(),
                 MenuItem::action("Refresh", app::Refresh),
             ]),

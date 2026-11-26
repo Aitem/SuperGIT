@@ -75,7 +75,7 @@ impl SuperGitApp {
 
     /// Show the selected worktree's shell (starting it) and focus it.
     pub(super) fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.repo.is_none() {
+        if !self.project_open() {
             return;
         }
         let Some(path) = self.selected.clone() else {
@@ -120,9 +120,8 @@ impl SuperGitApp {
         let view = cx.new(|cx| TerminalView::new(spawn, window, cx));
         let subscription = cx.subscribe_in(&view, window, Self::on_shell_event);
         let root = self
-            .repo
-            .as_ref()
-            .map(|repo| repo.root.clone())
+            .active_root()
+            .map(Path::to_path_buf)
             .unwrap_or_default();
         self.terminal_panel.shells.insert(
             path.to_path_buf(),

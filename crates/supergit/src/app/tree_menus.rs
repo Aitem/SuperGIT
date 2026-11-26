@@ -133,13 +133,15 @@ fn new_conversation_items(
 }
 
 impl SuperGitApp {
-    /// A repository's row, which stands for its main checkout too.
+    /// A repository's row, which stands for its main checkout too; a
+    /// folder project's (`folder`), which has no worktrees to add.
     pub(super) fn repository_menu(
         &self,
         row: Stateful<Div>,
         root: &Path,
         main: Option<&Path>,
         active: bool,
+        folder: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let owner = cx.entity().downgrade();
@@ -149,9 +151,13 @@ impl SuperGitApp {
             let checkout = main.clone().unwrap_or_else(|| root.clone());
             let new_root = root.clone();
             let remove_root = root.clone();
-            let menu = menu.item(item(&owner, "New Worktree…", move |this, window, cx| {
-                this.open_new_worktree(new_root.clone(), window, cx)
-            }));
+            let menu = if folder {
+                menu
+            } else {
+                menu.item(item(&owner, "New Worktree…", move |this, window, cx| {
+                    this.open_new_worktree(new_root.clone(), window, cx)
+                }))
+            };
             let menu = match &main {
                 Some(main) if active => new_conversation_items(menu, &owner, main),
                 _ => menu,

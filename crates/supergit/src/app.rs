@@ -233,8 +233,12 @@ pub struct SuperGitApp {
     base_inputs: HashMap<PathBuf, Entity<InputState>>,
     switcher_input: Entity<InputState>,
     switcher: Option<Switcher>,
-    /// `None` shows the welcome screen (e.g. first launch from the Dock).
+    /// The active project's Git repository. Neither this nor `folder`
+    /// shows the welcome screen (e.g. first launch from the Dock).
     repo: Option<Repo>,
+    /// The active project when it is a plain folder: agents and the
+    /// terminal work in it; everything Git (`repo`) stays off.
+    folder: Option<PathBuf>,
     recent: Vec<PathBuf>,
     clone_repository: Option<clone_repository::CloneForm>,
     clone_focus: FocusHandle,
@@ -345,7 +349,7 @@ pub struct SuperGitApp {
 
 impl SuperGitApp {
     pub fn new(
-        repo: Option<Repo>,
+        project: Option<model::Project>,
         launch_dir: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -408,14 +412,22 @@ impl SuperGitApp {
         let pulls = pulls::Pulls::new(window, diff_layout, cx);
 
         let mut persisted = workspace::load();
-        if let Some(repo) = &repo {
-            persisted.projects.add(&repo.root);
+        if let Some(project) = &project {
+            persisted.projects.add(project.root());
+            persisted
+                .projects
+                .set_folder(project.root(), matches!(project, model::Project::Folder(_)));
         }
-        let chat_open = repo
+        let chat_open = project
             .as_ref()
-            .and_then(|repo| persisted.repositories.get(&repo.root))
+            .and_then(|project| persisted.repositories.get(project.root()))
             .map(|view| view.chat_open)
             .unwrap_or(true);
+        let (repo, folder) = match project {
+            Some(model::Project::Repo(repo)) => (Some(repo), None),
+            Some(model::Project::Folder(root)) => (None, Some(root)),
+            None => (None, None),
+        };
         // `SUPERGIT_TAB` opens the review panel on that tab.
         let tab = match &repo {
             Some(repo) => {
@@ -496,6 +508,7 @@ impl SuperGitApp {
             switcher_input,
             switcher: None,
             repo,
+            folder,
             recent: crate::recent::load(),
             clone_repository: None,
             clone_focus: cx.focus_handle(),
@@ -616,8 +629,9 @@ impl SuperGitApp {
     /// The room under the worktree's header left of its rail: the
     /// conversation and the review panel share it.
     fn body_width(&self, window: &Window, cx: &App) -> f32 {
-        // A worktree's rail stays at the right edge, panel open or not.
-        let rail = if self.selected.is_some() {
+        // A worktree's rail stays at the right edge, panel open or not (a
+        // folder project has none).
+        let rail = if self.selected.is_some() && self.repo.is_some() {
             RAIL_WIDTH
         } else {
             0.
@@ -628,25 +642,31 @@ impl SuperGitApp {
     /// The review panel is on screen: right of the conversation, or in its
     /// place while the conversation is hidden (`cmd-l`).
     fn review_shown(&self) -> bool {
-        self.selected.is_some() && self.repository_view().review_open
+        self.selected.is_some() && self.review_open()
+    }
+
+    /// The review panel is open: only a repository has one (a folder
+    /// project has nothing to review).
+    fn review_open(&self) -> bool {
+        self.repo.is_some() && self.repository_view().review_open
     }
 
     /// The conversation is on screen under the worktree's header: always,
     /// unless it gave its room to the review panel (`cmd-l`).
     fn chat_shown(&self) -> bool {
-        self.selected.is_some() && (self.chat_open || !self.repository_view().review_open)
+        self.selected.is_some() && (self.chat_open || !self.review_open())
     }
 
     fn repository_view(&self) -> &RepositoryView {
-        match &self.repo {
-            Some(repo) => self.view_of(&repo.root),
+        match self.active_root() {
+            Some(root) => self.view_of(root),
             None => empty_view(),
         }
     }
 
     /// The active project's saved view, to change it.
     fn repository_view_mut(&mut self) -> Option<&mut RepositoryView> {
-        let root = self.repo.as_ref()?.root.clone();
+        let root = self.active_root()?.to_path_buf();
         Some(self.persisted.repositories.entry(root).or_default())
     }
 
@@ -699,7 +719,7 @@ impl SuperGitApp {
 
     fn persist_workspace(&mut self, cx: &App) {
         self.capture_saved_review(cx);
-        let current = self.repo.as_ref().map(|repo| repo.root.clone());
+        let current = self.active_root().map(Path::to_path_buf);
         if let Some(root) = &current
             && !self.worktrees.is_empty()
         {
@@ -1004,12 +1024,9 @@ impl SuperGitApp {
         let Some(width) = state.read(cx).sizes().get(ix).map(|width| width.as_f32()) else {
             return;
         };
-        let Some(repo) = &self.repo else { return };
-        let view = self
-            .persisted
-            .repositories
-            .entry(repo.root.clone())
-            .or_default();
+        let Some(view) = self.repository_view_mut() else {
+            return;
+        };
         match panel {
             LayoutPanel::Review => view.review_width = width,
             LayoutPanel::Terminal => view.terminal_height = width,
@@ -1030,18 +1047,25 @@ impl SuperGitApp {
             .filter(|info| info.status.is_ok() && !info.wt.is_bare && info.wt.prunable.is_none())
         {
             let path = info.wt.path.clone();
-            let branch = info.wt.branch.as_deref().unwrap_or("Detached HEAD");
+            // A folder project's place is named after the folder.
+            let name = info.name();
+            let branch = match &info.wt.branch {
+                _ if info.folder => name.as_str(),
+                Some(branch) => branch.as_str(),
+                None => "Detached HEAD",
+            };
             let pr = self
                 .pr_for_branch(info.wt.branch.as_deref())
                 .map(|pr| format!(" #{} {}", pr.number, pr.title))
                 .unwrap_or_default();
             let detail = path.display().to_string();
             let search = format!("{branch}{pr} {detail}");
+            let kind = if info.folder { "Folder" } else { "Worktree" };
             entries.push(Entry {
                 key: format!("worktree:{}", path.display()),
                 path: path.clone(),
                 title: format!("{branch}{pr}"),
-                detail: format!("Worktree · {detail}"),
+                detail: format!("{kind} · {detail}"),
                 search: search.clone(),
                 destination: Destination::Worktree,
             });
@@ -1120,13 +1144,8 @@ impl SuperGitApp {
     }
 
     fn remember_target(&mut self, key: String, cx: &mut Context<Self>) {
-        if let Some(repo) = &self.repo {
-            let recent = &mut self
-                .persisted
-                .repositories
-                .entry(repo.root.clone())
-                .or_default()
-                .recent_targets;
+        if let Some(view) = self.repository_view_mut() {
+            let recent = &mut view.recent_targets;
             recent.retain(|previous| previous != &key);
             recent.insert(0, key);
             recent.truncate(50);
@@ -1416,12 +1435,15 @@ impl SuperGitApp {
     }
 
     /// Where an agent in `info`'s worktree works, for its initial prompt.
-    fn place(repo: &Repo, info: &WorktreeInfo) -> crate::initial_prompt::Place {
+    /// `root`: the project's (the main checkout, or a folder project's
+    /// folder).
+    fn place(root: &Path, info: &WorktreeInfo) -> crate::initial_prompt::Place {
         crate::initial_prompt::Place {
             worktree: info.wt.path.clone(),
             branch: info.wt.branch.clone(),
-            repo: repo.root.clone(),
+            repo: root.to_path_buf(),
             linked: !info.wt.is_main,
+            folder: info.folder,
         }
     }
 
@@ -1453,12 +1475,11 @@ impl SuperGitApp {
         let text = self.initial_prompt_input.read(cx).value();
         // What the selected worktree's agents would get.
         let preview = self
-            .repo
-            .as_ref()
+            .active_root()
             .zip(self.selected_info())
-            .map(|(repo, info)| {
-                let prompt = crate::initial_prompt::render(&text, &Self::place(repo, info));
-                (info.wt.display_name(), prompt)
+            .map(|(root, info)| {
+                let prompt = crate::initial_prompt::render(&text, &Self::place(root, info));
+                (info.name(), prompt)
             });
         v_flex()
             .gap_2()
@@ -1514,7 +1535,8 @@ impl SuperGitApp {
                     .child(
                         "Placeholders: {worktree}, {branch}, {repo}, {repo_name}. \
                          {#linked}…{/linked} shows only in a linked worktree, \
-                         {#main}…{/main} only in the main checkout.",
+                         {#main}…{/main} only in the main checkout, \
+                         {#folder}…{/folder} only in a folder without Git.",
                     ),
             )
             .child(Textarea::new(&self.initial_prompt_input))
@@ -1574,22 +1596,21 @@ impl SuperGitApp {
     /// (Re)start the refresh loop. Restarting refreshes immediately, PRs included.
     fn start_polling(&mut self, cx: &mut Context<Self>) {
         self.start_base_polling(cx);
-        if self.repo.is_none() {
+        if !self.project_open() {
             self.poll_task = None;
             self.prs_task = None;
             return;
         }
-        self.load_avatars(cx);
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                let Ok(Some((repo, index))) = this.read_with(cx, |this, _| {
-                    this.repo.clone().map(|r| (r, this.index.clone()))
+                let Ok(Some((project, index))) = this.read_with(cx, |this, _| {
+                    this.active_project().map(|p| (p, this.index.clone()))
                 }) else {
                     return;
                 };
                 let result = cx
                     .background_executor()
-                    .spawn(async move { model::load_worktrees(&repo, &index) })
+                    .spawn(async move { project.load(&index) })
                     .await;
                 if this
                     .update(cx, |this, cx| this.apply_worktrees(result, cx))
@@ -1600,7 +1621,13 @@ impl SuperGitApp {
                 cx.background_executor().timer(POLL_INTERVAL).await;
             }
         }));
-        self.start_pr_polling(cx);
+        // Avatars and pull requests are GitHub's: a folder has neither.
+        if self.repo.is_some() {
+            self.load_avatars(cx);
+            self.start_pr_polling(cx);
+        } else {
+            self.prs_task = None;
+        }
     }
 
     /// (Re)start the pull request refresh loop; it fetches right away.
@@ -1639,9 +1666,9 @@ impl SuperGitApp {
             Ok(list) => {
                 self.load_error = None;
                 self.worktrees = list;
-                if let Some(repo) = &self.repo {
-                    let places = self.worktrees.iter().map(|info| Self::place(repo, info));
-                    crate::initial_prompt::Places::set_repo(&repo.root, places, cx);
+                if let Some(root) = self.active_root().map(Path::to_path_buf) {
+                    let places = self.worktrees.iter().map(|info| Self::place(&root, info));
+                    crate::initial_prompt::Places::set_repo(&root, places, cx);
                 }
             }
             Err(e) => {
@@ -1663,12 +1690,12 @@ impl SuperGitApp {
             .is_some_and(|p| self.worktrees.iter().any(|w| &w.wt.path == p));
         if !valid {
             self.cache_review(cx);
-            let preferred = self.repo.as_ref().and_then(|repo| {
-                (self.launch_dir == repo.root)
+            let preferred = self.active_root().and_then(|root| {
+                (self.launch_dir == root)
                     .then(|| {
                         self.persisted
                             .repositories
-                            .get(&repo.root)
+                            .get(root)
                             .and_then(|view| view.selected.clone())
                     })
                     .flatten()
@@ -2059,8 +2086,9 @@ impl SuperGitApp {
     }
 
     fn reload_details(&mut self, cx: &mut Context<Self>) {
-        // Let a slow read finish instead of canceling it on every poll.
-        if self.details_task.is_some() {
+        // Let a slow read finish instead of canceling it on every poll. A
+        // folder project has no Git to read.
+        if self.details_task.is_some() || self.repo.is_none() {
             return;
         }
         let Some(info) = self.selected_info() else {
@@ -2350,19 +2378,25 @@ impl SuperGitApp {
         }
     }
 
-    /// Open the repository containing `path` (from the dialog, a recent entry,
-    /// the sidebar, a folder dropped on the Dock icon or `open -a
-    /// SuperGIT <dir>`) and add it to the sidebar's projects. The previous
-    /// project keeps its conversations running. Returns whether it opened.
+    /// Open the repository containing `path`, else `path` as a folder
+    /// project (from the dialog, a recent entry, the sidebar, a folder
+    /// dropped on the Dock icon or `open -a SuperGIT <dir>`) and add it to
+    /// the sidebar's projects. The previous project keeps its conversations
+    /// running. Returns whether it opened.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
-        let repo = match Repo::discover(&path) {
-            Ok(repo) => repo,
+        // Git's quick `rev-parse`, or a stat or two for a folder.
+        let project = match model::Project::open(&path) {
+            Ok(project) => project,
             Err(e) => {
                 self.flash(format!("{e:#}"), true, cx);
                 return false;
             }
         };
-        let same = self.repo.as_ref().is_some_and(|r| r.root == repo.root);
+        let root = project.root().to_path_buf();
+        let same_root = self.active_root() == Some(root.as_path());
+        // A folder turned repository (`git init`), or the other way round,
+        // opens afresh.
+        let same = same_root && self.repo.is_some() == matches!(project, model::Project::Repo(_));
         if !same && self.git_operation_running() {
             self.flash(
                 "Wait for the running Git operation before switching projects",
@@ -2373,13 +2407,23 @@ impl SuperGitApp {
         }
         self.persist_workspace(cx);
         self.cache_review(cx);
-        crate::recent::remember(&repo.root);
+        crate::recent::remember(&root);
         self.recent = crate::recent::load();
-        self.persisted.projects.add(&repo.root);
+        self.persisted.projects.add(&root);
+        self.persisted
+            .projects
+            .set_folder(&root, matches!(project, model::Project::Folder(_)));
         self.launch_dir = path;
         if !same {
+            if same_root {
+                // Its places were the other kind's: nothing to keep.
+                self.worktrees.clear();
+            }
             self.stash_project();
-            self.repo = Some(repo);
+            (self.repo, self.folder) = match project {
+                model::Project::Repo(repo) => (Some(repo), None),
+                model::Project::Folder(root) => (None, Some(root)),
+            };
             self.reset_view(cx);
             self.review_layout = cx.new(|_| ResizableState::default());
             self.terminal_panel.reset_layout(cx);
@@ -2460,7 +2504,7 @@ impl SuperGitApp {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open Repository".into()),
+            prompt: Some("Open".into()),
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = paths.await
@@ -2491,6 +2535,7 @@ impl SuperGitApp {
         self.cache_review(cx);
         self.stash_project();
         self.repo = None;
+        self.folder = None;
         self.poll_task = None;
         self.prs_task = None;
         self.reset_view(cx);
@@ -2501,7 +2546,7 @@ impl SuperGitApp {
     // ---- agent panel -------------------------------------------------------
 
     fn watch_chat(&mut self, path: PathBuf, chat: &Entity<ChatSession>, cx: &mut Context<Self>) {
-        let Some(repository) = self.repo.as_ref().map(|repo| repo.root.clone()) else {
+        let Some(repository) = self.active_root().map(Path::to_path_buf) else {
             return;
         };
         self.chat_projects.insert(path.clone(), repository.clone());
@@ -2519,10 +2564,7 @@ impl SuperGitApp {
             let provider = chat.read(cx).provider();
             let revision_changed =
                 this.notified.insert(key.clone(), state.revision) != Some(state.revision);
-            let focused = this
-                .repo
-                .as_ref()
-                .is_some_and(|repo| repo.root == repository)
+            let focused = this.active_root() == Some(repository.as_path())
                 && this.selected.as_ref() == Some(&path)
                 && this.chat_shown()
                 && !this.settings_open
@@ -2660,11 +2702,7 @@ impl SuperGitApp {
             );
             return;
         }
-        if self
-            .repo
-            .as_ref()
-            .is_none_or(|repo| repo.root != target.repository)
-        {
+        if self.active_root() != Some(target.repository.as_path()) {
             // A cached project restores its worktrees at once and takes the
             // pending destination right away; otherwise the first poll does.
             let repository = target.repository.clone();
@@ -2828,6 +2866,11 @@ impl SuperGitApp {
     /// `cmd-l`: hides the conversation, so the review panel takes its room
     /// (opening on its tab if it was hidden), or shows it again.
     pub fn toggle_claude(&mut self, _: &ToggleClaude, window: &mut Window, cx: &mut Context<Self>) {
+        // A folder project has no review panel to give the room to.
+        if self.folder.is_some() {
+            self.flash("A folder without Git has nothing to review", false, cx);
+            return;
+        }
         if self.chat_shown() {
             self.chat_open = false;
             let tab = self.tab;
@@ -3195,8 +3238,14 @@ impl SuperGitApp {
         // of this column's first row.
         let window_buttons = self.window_buttons_beside_rail(window);
         let Some(info) = self.selected_info().cloned() else {
+            let folder = self.folder.is_some();
             let body = if let Some(error) = &self.load_error {
-                self.render_data_notice("Worktrees unavailable", Some(error), false, cx)
+                let title = if folder {
+                    "Folder unavailable"
+                } else {
+                    "Worktrees unavailable"
+                };
+                self.render_data_notice(title, Some(error), false, cx)
             } else {
                 div()
                     .flex_1()
@@ -3204,10 +3253,10 @@ impl SuperGitApp {
                     .items_center()
                     .justify_center()
                     .text_color(theme.muted_foreground)
-                    .child(if self.worktrees.is_empty() {
-                        "Loading worktrees…"
-                    } else {
-                        "Select a worktree"
+                    .child(match (self.worktrees.is_empty(), folder) {
+                        (true, true) => "Loading…",
+                        (true, false) => "Loading worktrees…",
+                        (false, _) => "Select a worktree",
                     })
                     .into_any_element()
             };
@@ -3231,7 +3280,11 @@ impl SuperGitApp {
             .render_header(&info, window_buttons, &theme, cx)
             .into_any_element();
         let header = self.window_drag_area(header, cx);
-        let rail = self.render_review_rail(&info, cx);
+        // A folder project has nothing to review: no rail.
+        let rail = self
+            .repo
+            .is_some()
+            .then(|| self.render_review_rail(&info, cx));
         // The header spans the window to its right edge; the rail sits under
         // it, beside the conversation and the panel it opens. Elastic: wide
         // content (a long commit message, a diff line) must not push the
@@ -3247,7 +3300,7 @@ impl SuperGitApp {
                     .min_h_0()
                     .w_full()
                     .child(div().flex_1().min_w_0().h_full().child(body))
-                    .child(rail),
+                    .children(rail),
             )
             .into_any_element()
     }
@@ -3268,7 +3321,7 @@ impl SuperGitApp {
         match (self.chat_shown(), self.review_shown()) {
             (true, true) => {
                 let git_bar = self.render_git_bar(info, total - review_width, cx);
-                let chat = self.render_conversation(git_bar, window, cx);
+                let chat = self.render_conversation(Some(git_bar), window, cx);
                 let review = self.render_review_panel(info, review_width, window, cx);
                 h_resizable("review-layout")
                     .with_state(&self.review_layout)
@@ -3299,9 +3352,13 @@ impl SuperGitApp {
                     .child(div().flex_1().min_h_0().child(elastic(review)))
                     .into_any_element()
             }
+            // A folder project: no Git, so no bar.
+            _ if self.repo.is_none() => {
+                elastic(self.render_conversation(None, window, cx)).into_any_element()
+            }
             _ => {
                 let git_bar = self.render_git_bar(info, total, cx);
-                elastic(self.render_conversation(git_bar, window, cx)).into_any_element()
+                elastic(self.render_conversation(Some(git_bar), window, cx)).into_any_element()
             }
         }
     }
@@ -3380,6 +3437,9 @@ impl SuperGitApp {
 
     /// Shows the review panel on `tab`, opening it if it is hidden.
     fn set_tab(&mut self, tab: ReviewTab, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            return;
+        }
         let Some(view) = self.repository_view_mut() else {
             return;
         };
@@ -3397,6 +3457,10 @@ impl SuperGitApp {
     /// A rail button: shows the review panel on `tab`, or hides it when it
     /// already shows `tab` (the conversation then takes the room again).
     fn toggle_review(&mut self, tab: ReviewTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.folder.is_some() {
+            self.flash("A folder without Git has nothing to review", false, cx);
+            return;
+        }
         let current = self.tab;
         let Some(view) = self.repository_view_mut() else {
             return;
@@ -3439,10 +3503,9 @@ impl SuperGitApp {
         let path = info.wt.path.clone();
         let conversation = self.header_conversation(&path, cx);
         // The title may be clipped: its tooltip has the whole name and the path.
-        let shown_path =
-            SharedString::from(format!("{}\n{}", info.wt.display_name(), path.display()));
-        // "repo / worktree", the repository's part muted.
-        let worktree = info.wt.display_name();
+        let shown_path = SharedString::from(format!("{}\n{}", info.name(), path.display()));
+        // "repo / worktree", the repository's part muted; a folder's name.
+        let worktree = info.name();
         let (title, highlights) = match &self.repo {
             Some(repo) => {
                 let prefix = format!("{} / ", projects::project_name(&repo.root));
@@ -5292,11 +5355,11 @@ impl SuperGitApp {
 
     /// The conversation on screen under the worktree's header (the one
     /// picked in the sidebar's tree, else the worktree's last), with
-    /// `git_bar` over it; the header names it. The tree's context menu
+    /// `git_bar` over it (none in a folder project); the header names it. The tree's context menu
     /// renames and closes it.
     fn render_conversation(
         &mut self,
-        git_bar: AnyElement,
+        git_bar: Option<AnyElement>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -5323,7 +5386,7 @@ impl SuperGitApp {
         v_flex()
             .size_full()
             .min_w_0()
-            .child(git_bar)
+            .children(git_bar)
             .child(
                 div()
                     .flex_1()
@@ -5358,14 +5421,15 @@ impl SuperGitApp {
         }
         // What the active project needs at its narrowest (a worktree's rail
         // included).
-        let rest = if self.repo.is_none() {
+        let rest = if !self.project_open() {
             480.
         } else if self.selected.is_none() {
             REVIEW_MIN
         } else {
             let chat = if self.chat_shown() { CHAT_MIN } else { 0. };
             let review = if self.review_shown() { REVIEW_MIN } else { 0. };
-            chat + review + RAIL_WIDTH
+            let rail = if self.repo.is_some() { RAIL_WIDTH } else { 0. };
+            chat + review + rail
         };
         let max = (window.viewport_size().width.as_f32() - rest).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         div()
@@ -5398,7 +5462,7 @@ impl SuperGitApp {
     fn render_project(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // The status bar spans the worktree's column; the sidebar and its
         // splitter reach the window's bottom edge.
-        if self.repo.is_none() {
+        if !self.project_open() {
             let row = self
                 .window_buttons_beside_rail(window)
                 .then(|| self.render_window_buttons_row(cx));
@@ -5469,9 +5533,11 @@ impl SuperGitApp {
                         .gap_2()
                         .child(
                             Button::new("welcome-open")
-                                .label("Open Repository")
+                                .label("Open Folder")
                                 .primary()
-                                .tooltip(format!("Choose a folder with a Git repository ({MOD}-o)"))
+                                .tooltip(format!(
+                                    "Choose a Git repository, or any folder to work in with agents ({MOD}-o)"
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_repository(&OpenRepository, window, cx)
                                 })),
@@ -5501,7 +5567,7 @@ impl SuperGitApp {
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let update = self.update_button(cx);
-        let terminal = self.repo.is_some().then(|| self.terminal_button(cx));
+        let terminal = self.project_open().then(|| self.terminal_button(cx));
         let theme = cx.theme();
         h_flex()
             .h(px(26.))

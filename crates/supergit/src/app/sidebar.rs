@@ -363,6 +363,8 @@ impl SuperGitApp {
                 && self.tree_agent_in(main.path(), cx).is_none()
         });
         let main_path = main.map(|main| main.wt.path.clone());
+        // A plain folder: its row is the folder, with no worktrees to add.
+        let folder = self.is_folder_project(root);
         let target = root.to_path_buf();
         let fold_target = root.to_path_buf();
         let add_target = root.to_path_buf();
@@ -399,10 +401,20 @@ impl SuperGitApp {
                 div()
                     .id("project-mark")
                     .flex_none()
-                    .child(crate::icons::git_mark().small())
-                    .tooltip(|window, cx| {
-                        Tooltip::new("Git repository: its row is the main checkout")
-                            .build(window, cx)
+                    .child(if folder {
+                        Icon::new(IconName::Folder)
+                            .small()
+                            .text_color(theme.muted_foreground)
+                    } else {
+                        crate::icons::git_mark().small()
+                    })
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(if folder {
+                            "Folder without Git: agents and the terminal work in it"
+                        } else {
+                            "Git repository: its row is the main checkout"
+                        })
+                        .build(window, cx)
                     })
                     .tooltip_show_delay(crate::TOOLTIP_DELAY),
             )
@@ -419,30 +431,32 @@ impl SuperGitApp {
             .when(signal.is_some(), |row| {
                 row.child(self.render_signal("project-signal", signal, root, theme, cx))
             })
-            .child(
-                div()
-                    .id("project-new-worktree")
-                    .flex_none()
-                    .size(px(FOLD_BUTTON))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .hover(|el| el.bg(theme.sidebar_accent))
-                    .tooltip(|window, cx| {
-                        Tooltip::new("New worktree in this project").build(window, cx)
-                    })
-                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.open_new_worktree(add_target.clone(), window, cx);
-                    }))
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .with_size(gpui_kit::component::Size::Medium)
-                            .text_color(theme.muted_foreground),
-                    ),
-            )
+            .when(!folder, |row| {
+                row.child(
+                    div()
+                        .id("project-new-worktree")
+                        .flex_none()
+                        .size(px(FOLD_BUTTON))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .hover(|el| el.bg(theme.sidebar_accent))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("New worktree in this project").build(window, cx)
+                        })
+                        .tooltip_show_delay(crate::TOOLTIP_DELAY)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_new_worktree(add_target.clone(), window, cx);
+                        }))
+                        .child(
+                            Icon::new(IconName::Plus)
+                                .with_size(gpui_kit::component::Size::Medium)
+                                .text_color(theme.muted_foreground),
+                        ),
+                )
+            })
             // Last, at the right edge: the name and the tree start at the
             // left one.
             .child(
@@ -456,10 +470,11 @@ impl SuperGitApp {
                     .rounded_sm()
                     .hover(|el| el.bg(theme.sidebar_accent))
                     .tooltip(move |window, cx| {
-                        Tooltip::new(if folded {
-                            "Show this project's worktrees"
-                        } else {
-                            "Hide this project's worktrees"
+                        Tooltip::new(match (folded, folder) {
+                            (true, false) => "Show this project's worktrees",
+                            (false, false) => "Hide this project's worktrees",
+                            (true, true) => "Show this folder's conversations",
+                            (false, true) => "Hide this folder's conversations",
                         })
                         .build(window, cx)
                     })
@@ -478,7 +493,7 @@ impl SuperGitApp {
                         .text_color(theme.muted_foreground),
                     ),
             );
-        let row = self.repository_menu(row, root, main.map(WorktreeInfo::path), active, cx);
+        let row = self.repository_menu(row, root, main.map(WorktreeInfo::path), active, folder, cx);
 
         // The main checkout's conversations, under its row.
         let main_agents = match (folded, scope, main) {
@@ -1282,7 +1297,7 @@ impl SuperGitApp {
             .map(|kind| (kind, self.attention_count(kind, cx)))
             .filter(|(_, count)| *count > 0)
             .collect();
-        let has_repo = self.repo.is_some();
+        let has_repo = self.project_open();
         button.dropdown_menu(move |mut menu, window, cx| {
             // Each opens the exact conversation; repeat to cycle.
             for &(kind, count) in &attention {
@@ -1307,7 +1322,7 @@ impl SuperGitApp {
             ));
             menu = menu.separator().item(app_item(
                 &owner,
-                "Open Repository…",
+                "Open Folder…",
                 Box::new(OpenRepository),
                 |this, window, cx| this.open_repository(&OpenRepository, window, cx),
             ));
@@ -1322,7 +1337,7 @@ impl SuperGitApp {
                     )
                     .item(app_item(
                         &owner,
-                        "Recent Repositories",
+                        "Recent Projects",
                         Box::new(CloseRepository),
                         |this, window, cx| this.close_repository(&CloseRepository, window, cx),
                     ));
@@ -1378,7 +1393,7 @@ impl SuperGitApp {
             .map(|(ix, info)| {
                 let selected = self.selected.as_deref() == Some(info.path());
                 let path = info.wt.path.clone();
-                let name = info.wt.display_name();
+                let name = info.name();
                 let color = self
                     .worktree_signal(scope, info, cx)
                     .map_or(theme.muted_foreground, |signal| {

@@ -471,6 +471,20 @@ never commit, push or create worktrees there without asking.
   linked worktrees' status dots under its first letter, then each
   worktree's type icon (a branch, a house for `main`/`master`) with its
   conversations' marks under it.
+- **Folder projects**: a folder in no repository (`sg_git::Repo::find`
+  → `None`: no `.git` in or above it, decided from files, not Git's
+  translated messages) opens as `model::Project::Folder`: `self.folder`
+  instead of `self.repo` (`active_root()` / `project_open()` mean either),
+  one place to work (`model::load_folder`: the folder as a main checkout,
+  `WorktreeInfo::folder`, status clean) with conversations and the
+  terminal. Everything Git stays off: no review panel or rail, no Git
+  bar, no "+" worktree, no `gh` calls; the header is `folder /
+  conversation`, the tree draws a folder icon (`Projects::folders`,
+  saved, so folded projects draw right before they load). A folder owns
+  only the sessions started in it, not those of repositories inside it.
+  The initial prompt's `{#folder}…{/folder}` section is theirs. The cwd
+  at launch opens only a repository; an explicit path or a recent entry
+  may be a folder.
 - **Agents in the sidebar**: under each worktree, a row per conversation
   that has started (`sidebar.rs` `agents_in`: the live chats once the
   worktree was open, else the saved ones): the agent's mark (in its colors
