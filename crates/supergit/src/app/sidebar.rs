@@ -8,10 +8,16 @@ use super::tree_menus::{ConversationTarget, WorktreeTarget};
 use super::*;
 use gpui_kit::component::menu::DropdownMenu as _;
 
-/// How far worktree rows sit under their project: past its chevron, so
-/// their status dots start level with its name.
-const WORKTREE_INDENT: f32 = 32.;
-/// The square a project's chevron is pressed in.
+/// A project's row: its padding, Git's mark (`small`) and the gap, then its
+/// name. The tree under it starts where the name does.
+const ROW_START: f32 = 8.;
+const GIT_MARK: f32 = 14.;
+const NAME_START: f32 = ROW_START + GIT_MARK + 4.;
+/// How far worktree rows sit under their project: their status dots
+/// centered under its name's first letter, where the main checkout's
+/// conversations have their marks, so they read a level deeper than it.
+const WORKTREE_INDENT: f32 = NAME_START - (SIGNAL_CELL - AGENT_MARK) / 2.;
+/// The squares a project's "+" and chevron are pressed in.
 const FOLD_BUTTON: f32 = 24.;
 /// The place of a row's mark, before its name: a dot, or an agent's signal.
 const SIGNAL_CELL: f32 = 16.;
@@ -21,21 +27,23 @@ const PROJECT_ROW: f32 = 40.;
 const WORKTREE_ROW: f32 = 32.;
 /// A conversation's row under its worktree: lower than the worktree's.
 const AGENT_ROW: f32 = 24.;
-/// A worktree's type icon (branch, house) before its name.
+/// A worktree's type icon (branch, house) before its name, and an agent's
+/// mark before a conversation's title (both `xsmall`).
 const TYPE_ICON: f32 = 12.;
-/// Where the project row's name starts (padding, chevron, Git's mark and
-/// the gaps): the main checkout's conversations line up under it.
-const MAIN_AGENT_INDENT: f32 = 8. + FOLD_BUTTON + 4. + 14. + 4.;
+const AGENT_MARK: f32 = 12.;
+/// Where the main checkout's conversations start: their marks under the
+/// project's name, as linked worktrees' type icons are.
+const MAIN_AGENT_INDENT: f32 = NAME_START;
 
-/// Where a worktree's name starts (its indent, signal cell, type icon and
-/// the gaps): its conversations line up under it.
+/// Where a worktree's conversations start: their marks under its type
+/// icon (past its indent, the signal cell and the gap).
 fn worktree_agent_indent(completed: bool) -> f32 {
     let row = if completed {
         WORKTREE_INDENT + SIGNAL_CELL
     } else {
         WORKTREE_INDENT
     };
-    row + SIGNAL_CELL + 4. + TYPE_ICON + 4.
+    row + SIGNAL_CELL + 4. + (TYPE_ICON - AGENT_MARK) / 2.
 }
 
 /// The main checkout's changed files and commits ahead and behind, on its
@@ -362,8 +370,9 @@ impl SuperGitApp {
             .id("project")
             .h(px(PROJECT_ROW))
             .flex_none()
-            .pl_2()
-            // The "+" square is wider than its 16px icon, which ends at ROW_END.
+            .pl(px(ROW_START))
+            // The chevron's square is wider than its 16px icon, which ends
+            // at ROW_END.
             .pr(px(ROW_END - (FOLD_BUTTON - 16.) / 2.))
             .gap_1()
             .cursor_pointer()
@@ -375,7 +384,7 @@ impl SuperGitApp {
                     theme.list_hover
                 })
             })
-            // Selects the main checkout; the chevron folds.
+            // Selects the main checkout; the chevron (at the right) folds.
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tree_agent = None;
                 match main_path.clone() {
@@ -386,30 +395,6 @@ impl SuperGitApp {
                     None => this.click_project(target.clone(), cx),
                 }
             }))
-            .child(
-                div()
-                    .id("project-fold")
-                    .flex_none()
-                    .size(px(FOLD_BUTTON))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .hover(|el| el.bg(theme.sidebar_accent))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_fold(fold_target.clone(), cx);
-                    }))
-                    .child(
-                        Icon::new(if folded {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .with_size(gpui_kit::component::Size::Medium)
-                        .text_color(theme.muted_foreground),
-                    ),
-            )
             .child(
                 div()
                     .id("project-mark")
@@ -456,6 +441,41 @@ impl SuperGitApp {
                         Icon::new(IconName::Plus)
                             .with_size(gpui_kit::component::Size::Medium)
                             .text_color(theme.muted_foreground),
+                    ),
+            )
+            // Last, at the right edge: the name and the tree start at the
+            // left one.
+            .child(
+                div()
+                    .id("project-fold")
+                    .flex_none()
+                    .size(px(FOLD_BUTTON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .hover(|el| el.bg(theme.sidebar_accent))
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(if folded {
+                            "Show this project's worktrees"
+                        } else {
+                            "Hide this project's worktrees"
+                        })
+                        .build(window, cx)
+                    })
+                    .tooltip_show_delay(crate::TOOLTIP_DELAY)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_fold(fold_target.clone(), cx);
+                    }))
+                    .child(
+                        Icon::new(if folded {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .with_size(gpui_kit::component::Size::Medium)
+                        .text_color(theme.muted_foreground),
                     ),
             );
         let row = self.repository_menu(row, root, main.map(WorktreeInfo::path), active, cx);
@@ -1402,7 +1422,7 @@ fn window_buttons_shown(window: &Window) -> bool {
 /// A one-line note under a project (loading, an error).
 fn note(text: String, color: Hsla) -> AnyElement {
     div()
-        .pl(px(WORKTREE_INDENT))
+        .pl(px(NAME_START))
         .pr_3()
         .py_2()
         .text_xs()
