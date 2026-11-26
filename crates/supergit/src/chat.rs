@@ -1384,7 +1384,7 @@ impl ChatSession {
                 .top_0()
                 .left_0()
                 .right_0()
-                .child(look::column(
+                .child(
                     // Level with the message cards.
                     div().px_3().pt_2().child(
                         h_flex()
@@ -1417,7 +1417,7 @@ impl ChatSession {
                             )
                             .child(div().min_w_0().truncate().child(line)),
                     ),
-                ))
+                )
                 .into_any_element(),
         )
     }
@@ -2161,7 +2161,7 @@ impl ChatSession {
                     .child(self.render_model_options(cx))
                     .child(send),
             );
-        // The edge spans the panel; the composer keeps to the column.
+        // The edge spans the panel, over the composer's top padding.
         div()
             .flex_none()
             .relative()
@@ -2169,7 +2169,7 @@ impl ChatSession {
             .on_drag_move(
                 cx.listener(|this, event, window, cx| this.drag_composer_edge(event, window, cx)),
             )
-            .child(look::column(content))
+            .child(content)
             // Last, so it lies over the padding it shares the top edge with.
             .child(self.render_composer_edge(cx))
     }
@@ -2225,14 +2225,9 @@ impl Render for ChatSession {
                         )
                         // Its 32px between rows made runs of tool calls sparse;
                         // `render_item` spaces rows by kind instead. Its own
-                        // 12px at the sides line the rows up with the
-                        // composer; a wide panel centers them in its column.
-                        .with_row_style(
-                            StyleRefinement::default()
-                                .pb(px(0.))
-                                .max_w(look::COLUMN_MAX)
-                                .mx_auto(),
-                        )
+                        // 12px at the sides line the rows up with the panel's
+                        // header and the composer, across the panel's width.
+                        .with_row_style(StyleRefinement::default().pb(px(0.)))
                         .with_list_style(StyleRefinement::default().pt_3().pb_3())
                         // Scrolled up, the conversation fades out at the
                         // bottom instead of ending mid-line.
@@ -2241,7 +2236,7 @@ impl Render for ChatSession {
                     .children(self.render_sticky_prompt(cx))
                     .into_any_element()
             })
-            .children(self.render_activity(cx).map(look::column))
+            .children(self.render_activity(cx))
             .when(!choosing, |el| el.child(self.render_composer(cx)))
             .into_any_element()
     }
