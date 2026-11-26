@@ -89,9 +89,11 @@ gpui_kit::assets::icon_assets!(
         Diff,
         Clock,
         House,
-        // The History tab's scope.
+        // The History tab's scope (and the rail's History).
         GitGraph,
-        GitCommitVertical
+        GitCommitVertical,
+        // The right rail's Pull requests.
+        GitPullRequest
     ]
 );
 
@@ -172,6 +174,8 @@ mod tests {
             // The History tab's scope.
             IconName::GitGraph,
             IconName::GitCommitVertical,
+            // The right rail.
+            IconName::GitPullRequest,
         ] {
             let path = icon.path();
             assert!(

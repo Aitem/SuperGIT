@@ -37,7 +37,7 @@ impl SuperGitApp {
         if self.selected.as_ref() != Some(&path) {
             self.select_worktree(path.clone(), cx);
             if self.selected.as_ref() == Some(&path) {
-                self.tab = MainTab::PullRequests;
+                self.set_tab(ReviewTab::PullRequests, cx);
                 self.select_pr(path.clone(), pr.number, cx);
             }
         }

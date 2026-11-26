@@ -630,7 +630,7 @@ impl SuperGitApp {
     /// own PRs, GitHub search results, the selected PR's details. Cheap
     /// when nothing is due; called on every render of the tab.
     pub(super) fn ensure_pulls(&mut self, cx: &mut Context<Self>) {
-        if self.tab != MainTab::PullRequests {
+        if self.tab != ReviewTab::PullRequests {
             return;
         }
         let Some(root) = self.active_root().map(Path::to_path_buf) else {

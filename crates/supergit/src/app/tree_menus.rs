@@ -322,8 +322,8 @@ impl SuperGitApp {
             if !t.active {
                 return menu;
             }
-            // Closing stops its agent; the history stays in the Agents tab,
-            // where Open continues it.
+            // Closing stops its agent; its transcript stays where the agent
+            // keeps it.
             let close = t.clone();
             menu.separator().item(item(
                 &owner,
@@ -419,9 +419,8 @@ impl SuperGitApp {
         }
     }
 
-    /// Stop a conversation's agent and take it off the tree and the agent
-    /// panel. Its transcript stays: the Agents tab lists it, Open continues
-    /// it.
+    /// Stop a conversation's agent and take it off the tree and the
+    /// worktree's column. Its transcript stays where the agent keeps it.
     fn close_conversation(
         &mut self,
         root: &Path,

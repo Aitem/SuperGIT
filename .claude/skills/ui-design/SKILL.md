@@ -7,8 +7,9 @@ description: SuperGIT's UI rules and review checklist — layout stability, top-
 
 A native Git GUI on macOS and Linux (GPUI). These rules distill the
 platform guidelines (sources at the end) into what keeps biting in this app.
-CLAUDE.md's **Buttons**, **Icons**, **Review layout** and **Panel lines**
-notes are part of this; read them too.
+CLAUDE.md's **Buttons**, **Icons**, **Window columns**, **Review panel
+and right rail** and **Panel lines** notes are part of this; read them
+too.
 
 ## 1. Find the existing pattern first
 
@@ -30,8 +31,9 @@ Controls stay where the hand left them.
 
 - Showing/hiding a panel, loading, selecting, a counter changing, a hover —
   none of these may move other controls. A bar that holds toggles spans the
-  area it controls and stays put whether its panel shows or not (the review
-  bar sits above the commit tree, not beside it).
+  area it controls and stays put whether its panel shows or not (the
+  worktree's header spans the whole column; the right rail sits under it,
+  its squares fixed at the edge).
 - Reserve space for things that come and go: a fixed slot for a count or a
   spinner, the count inside the search field (not a second line under it).
 - Loading keeps the layout: same rows and bars, placeholder content, the
@@ -43,8 +45,9 @@ Controls stay where the hand left them.
 
 The window reads top to bottom, each level narrower than the one above:
 worktree header (what and where: `repo / worktree`, branch actions) →
-review bar (History toggle, Changes / Agents / Pull requests) → each
-column's bar (search, filters, view options) → content.
+the conversation and the review panel the right rail opens (History,
+Changes, Pull requests) → each column's bar (search, filters, view
+options) → content.
 
 - A control lives at the level it acts on. Branch actions go in the header,
   not in a commit's card. A diff's layout goes above that diff.
@@ -77,7 +80,7 @@ column's bar (search, filters, view options) → content.
   The app menu keeps Hide / Hide Others / Show All and a Window ▸ Minimize.
   GNOME: Ctrl+Q, Ctrl+W, Ctrl+, and Ctrl+N; Super is the system's.
   Toggles of the app's own panels take ⌘ plus a letter nobody else claims
-  (⌘B sidebar, ⌘L agent panel, ⌘J terminal), or ⌘⇧ (⌘⇧H History).
+  (⌘B sidebar, ⌘L conversation, ⌘J terminal), or ⌘⇧ (⌘⇧H History).
 - Esc closes dialogs and popovers; Return runs a dialog's default action.
 - Linux: every app `ctrl-` shortcut must also be released to programs in
   the embedded terminal (`bind_terminal_keys` in main.rs).

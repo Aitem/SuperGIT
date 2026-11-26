@@ -56,7 +56,7 @@ fn github_line(hunk: &str, side: DiffSide, number: usize) -> Option<(ReviewSide,
 
 impl SuperGitApp {
     fn pr_comment_patch(&self) -> Option<(&PrDetails, &Patch)> {
-        if self.tab != MainTab::PullRequests
+        if self.tab != ReviewTab::PullRequests
             || self.pulls.tab != DetailsTab::Files
             || self.difftastic_active() && !self.pr_difft_unavailable()
         {

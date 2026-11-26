@@ -15,9 +15,8 @@ Platform differences stay behind small seams; keep both working:
   gpui-component's `AppMenuBar`, drawn in the title bar (`menu_bar`).
 - Window chrome: on macOS the side panels reach the window's top edge
   (`FULL_HEIGHT_PANELS`) and the window buttons sit in the first row: the
-  sidebar's header, or beside its rail when it is collapsed: the agent
-  panel's header, the review's while the panel is closed
-  (`sync_window_buttons`). A row they sit in starts `WINDOW_BUTTONS_INSET`
+  sidebar's header, or beside its rail when it is collapsed: the
+  worktree's header (`sync_window_buttons`). A row they sit in starts `WINDOW_BUTTONS_INSET`
   further right and moves the window through `window_drag_area`. Elsewhere,
   and on macOS without a sidebar, a `TitleBar` row spans the window. Keep
   gpui-component's `TitleBar` out of columns: it is never narrower than its
@@ -349,13 +348,13 @@ the app renders its own window through Metal to a PNG, then quits:
 
 ```sh
 cargo build --features screenshot
-SUPERGIT_TAB=claude SUPERGIT_SCREENSHOT=/tmp/ui.png SUPERGIT_SCREENSHOT_DELAY=6 \
+SUPERGIT_TAB=changes SUPERGIT_SCREENSHOT=/tmp/ui.png SUPERGIT_SCREENSHOT_DELAY=6 \
   ./target/debug/supergit $SUPERGIT_TEST_REPO
 ```
 
 Then read the PNG. Use this to verify every UI change. Screenshot runs open a
 real (unfocused) window — keep them few, the user may be working.
-`SUPERGIT_TAB=history|changes|claude|prs` picks the tab;
+`SUPERGIT_TAB=history|changes|prs` opens the review panel on that tab;
 `SUPERGIT_CHANGES_TREE=1` (screenshot builds) shows the Changes list as a tree;
 `SUPERGIT_DEBUG_REBASE=<branch>` (screenshot builds) opens the Rebase dialog;
 `SUPERGIT_DEBUG_COMMIT=<sha prefix>` (screenshot builds) selects that History
@@ -424,19 +423,21 @@ never commit, push or create worktrees there without asking.
   `IconName` (lucide) draws nothing until it is listed in
   `icons::ExtraIcons` (and in the `icons_used_by_the_app_are_embedded`
   test).
-- **Window columns**: sidebar | agent panel (the chat, takes the room
-  left) | review (the worktree's header, review bar, commit tree, terminal
-  panel, status bar; a saved width, `RepositoryView::review_width`, kept
-  when the window resizes) | agent rail. With the panel closed (`cmd-l`)
-  the review fills the room up to the rail.
-- **Review layout**: under the worktree's header, a bar across the review
-  holds History — a toggle for the commit tree (`cmd-shift-h`,
-  `RepositoryView::history_open`) — and the Changes / Agents / Pull
-  requests tabs; it stays put whether the tree shows or not. Below it the
-  commit tree (search, scope, graph) sits left of the review pane when
-  shown; a commit picked in the tree shows in the pane
-  (`MainTab::History`), and history loads whenever the tree or a commit
-  is on screen.
+- **Window columns**: sidebar | worktree column. The worktree column: its
+  header (`repo / worktree`, branch actions) across it to the window's
+  right edge; under it the conversation (a bar with its agent, title and
+  New), right of it the review panel, and the right rail
+  at the edge; then the terminal panel and the status bar, full width.
+- **Review panel and right rail**: the rail (`render_review_rail`) holds
+  History, Changes and Pull requests squares (`ReviewTab`); a click shows
+  that panel right of the conversation, a click on the shown one hides
+  it. `RepositoryView::review_open` / `review_tab` / `review_width`
+  (the panel keeps its width when the window resizes; the conversation
+  takes the rest). `cmd-shift-h` toggles History; `cmd-l` hides the
+  conversation so the panel fills the room (opening it if hidden), and
+  back. History is the commit tree (search, scope, graph) with the commit
+  picked in it beside; history loads only while it is on screen.
+  `set_tab` shows a panel from code (cherry-pick, PR review context).
 - **Sidebar tree**: a repository's row (Git's logo, `icons::git_mark`)
   is also its main checkout's: a click selects it, its counts and agents
   show there, and no separate main row is drawn. Its chevron (fold) sits
@@ -449,9 +450,9 @@ never commit, push or create worktrees there without asking.
   that has started (`sidebar.rs` `agents_in`: the live chats once the
   worktree was open, else the saved ones): the agent's mark (in its colors
   while it works), the title, the state's icon; a click opens it
-  (`open_project_attention`). The same data as the agent rail, which stays
-  for now. The tree has one selection: the conversation picked last in the
-  tree or the rail (`tree_agent`) while it is on screen, else the worktree.
+  (`open_project_attention`) under the worktree's header. The tree has one
+  selection: the conversation picked last in the tree (`tree_agent`) while
+  it is on screen, else the worktree.
 - **Tree menus** (`app/tree_menus.rs`, right click): repository = main
   checkout (New Worktree…, new conversations, open/reveal/terminal, Copy
   Path, Remove from Projects), worktree (new conversations, Rebase, open,
@@ -459,7 +460,7 @@ never commit, push or create worktrees there without asking.
   conversation (Rename…, Fork, Mark as Read, copy session id / resume
   command, reveal transcript, Close). Rows of a project that is not open get only
   what needs no open project. Close stops the agent and drops the row; the
-  transcript stays (Agents tab → Open). Fork: `ChatSession::fork_seed` →
+  transcript stays where the agent keeps it. Fork: `ChatSession::fork_seed` →
   `restore` with `fork_from` = the original's id; it shows that history and
   starts as a copy (Claude `--resume <id> --fork-session`, plus
   `--session-id <new>` in the TUI; Codex `thread/fork` / `codex fork <id>`)
