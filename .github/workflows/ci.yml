@@ -7,9 +7,10 @@ on:
   workflow_dispatch:
 
 # A new push to a branch/PR cancels its previous run; every commit on main
-# keeps its own result.
+# keeps its own result, so main's runs get a group per commit: in a shared
+# group a run waits for the one in progress, and the next merge cancels it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -53,9 +54,7 @@ jobs:
         run: rustup toolchain install && rustc --version
       # libghostty-vt (crates/sg_terminal) builds with Zig; the release it
       # builds from is a Zig package (crates/sg_terminal/ghostty/build.zig.zon).
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.1
+      - uses: ./.github/actions/setup-zig
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -72,9 +71,7 @@ jobs:
         run: rustup toolchain install && rustc --version
       # libghostty-vt (crates/sg_terminal) builds with Zig; the release it
       # builds from is a Zig package (crates/sg_terminal/ghostty/build.zig.zon).
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.1
+      - uses: ./.github/actions/setup-zig
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -94,9 +91,7 @@ jobs:
         run: rustup toolchain install && rustc --version
       # libghostty-vt (crates/sg_terminal) builds with Zig; the release it
       # builds from is a Zig package (crates/sg_terminal/ghostty/build.zig.zon).
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.1
+      - uses: ./.github/actions/setup-zig
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
