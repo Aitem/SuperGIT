@@ -81,6 +81,17 @@ pub struct SavedConversation {
     /// until the fork's agent names a session of its own).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_from: Option<String>,
+    /// The name the user gave it (Rename), shown instead of `title`, which
+    /// follows the agent's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl SavedConversation {
+    /// What it is called: the user's name for it, else the agent's title.
+    pub fn display_title(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.title)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

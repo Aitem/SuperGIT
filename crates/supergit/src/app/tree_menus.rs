@@ -32,6 +32,8 @@ pub(super) struct ConversationTarget {
     pub cwd: PathBuf,
     pub transcript: Option<PathBuf>,
     pub can_fork: bool,
+    /// What it is called now: Rename starts from it.
+    pub title: String,
     pub unread: bool,
     pub working: bool,
     /// Its project is the open one: everything applies.
@@ -253,7 +255,19 @@ impl SuperGitApp {
         let target = Rc::new(target);
         row.context_menu(move |menu, _, _| {
             let t = target.clone();
-            let mut menu = menu;
+            let rename = t.clone();
+            // At once: the menu gives the focus back on closing only when
+            // its item left it where it was, and the field takes it.
+            let mut menu = menu.item(item(&owner, "Rename…", move |this, window, cx| {
+                this.start_rename(
+                    rename.root.clone(),
+                    rename.worktree.clone(),
+                    rename.local_id.clone(),
+                    rename.title.clone(),
+                    window,
+                    cx,
+                )
+            }));
             if t.active {
                 let fork = t.clone();
                 menu = menu.item(
@@ -275,7 +289,7 @@ impl SuperGitApp {
                 .map(|id| launch::resume_command_in(t.provider, id, &t.cwd));
             let transcript = t.transcript.clone();
             let menu = menu
-                .when(t.active || t.unread, PopupMenu::separator)
+                .separator()
                 .item(copy_item(
                     &owner,
                     "Copy Session ID",
@@ -475,50 +489,65 @@ impl SuperGitApp {
 
     /// Screenshot builds only: `SUPERGIT_DEBUG_RIGHT_CLICK=x,y` right-clicks
     /// that window point (= PNG pixel) five seconds after startup, for
-    /// checking context menus.
+    /// checking context menus, and `…=x,y,mx,my` then clicks the menu item
+    /// at `mx,my`; `SUPERGIT_DEBUG_DOUBLE_CLICK=x,y` double-clicks the point
+    /// (renaming a conversation).
     #[cfg(feature = "screenshot")]
     pub(super) fn debug_right_click_once(&mut self, cx: &mut Context<Self>) {
-        let Ok(spec) = std::env::var("SUPERGIT_DEBUG_RIGHT_CLICK") else {
-            return;
-        };
-        if std::env::var_os("SUPERGIT_DEBUG_RIGHT_CLICK_DONE").is_some() {
+        if std::env::var_os("SUPERGIT_DEBUG_CLICK_DONE").is_some() {
             return;
         }
+        let (spec, button, clicks) = match (
+            std::env::var("SUPERGIT_DEBUG_RIGHT_CLICK"),
+            std::env::var("SUPERGIT_DEBUG_DOUBLE_CLICK"),
+        ) {
+            (Ok(spec), _) => (spec, MouseButton::Right, 1),
+            (_, Ok(spec)) => (spec, MouseButton::Left, 2),
+            _ => return,
+        };
         let coords: Vec<f32> = spec
             .split(',')
             .filter_map(|value| value.trim().parse().ok())
             .collect();
-        let [x, y] = coords[..] else {
-            return;
+        let (at, item) = match coords[..] {
+            [x, y] => (point(px(x), px(y)), None),
+            [x, y, mx, my] => (point(px(x), px(y)), Some(point(px(mx), px(my)))),
+            _ => return,
         };
         // SAFETY: isolated screenshot builds only, on the main thread.
-        unsafe { std::env::set_var("SUPERGIT_DEBUG_RIGHT_CLICK_DONE", "1") };
+        unsafe { std::env::set_var("SUPERGIT_DEBUG_CLICK_DONE", "1") };
         let Some(window) = cx.windows().first().copied() else {
             return;
         };
         cx.spawn(async move |_, cx| {
             cx.background_executor().timer(Duration::from_secs(5)).await;
-            let at = point(px(x), px(y));
-            let steps = [
-                PlatformInput::MouseMove(MouseMoveEvent {
+            let press = |steps: &mut Vec<PlatformInput>, at, button, clicks| {
+                steps.push(PlatformInput::MouseMove(MouseMoveEvent {
                     position: at,
                     pressed_button: None,
                     modifiers: Modifiers::default(),
-                }),
-                PlatformInput::MouseDown(MouseDownEvent {
-                    button: MouseButton::Right,
-                    position: at,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }),
-                PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Right,
-                    position: at,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                }),
-            ];
+                }));
+                for click_count in 1..=clicks {
+                    steps.push(PlatformInput::MouseDown(MouseDownEvent {
+                        button,
+                        position: at,
+                        modifiers: Modifiers::default(),
+                        click_count,
+                        first_mouse: false,
+                    }));
+                    steps.push(PlatformInput::MouseUp(MouseUpEvent {
+                        button,
+                        position: at,
+                        modifiers: Modifiers::default(),
+                        click_count,
+                    }));
+                }
+            };
+            let mut steps = Vec::new();
+            press(&mut steps, at, button, clicks);
+            if let Some(item) = item {
+                press(&mut steps, item, MouseButton::Left, 1);
+            }
             for step in steps {
                 // An unfocused window draws no frames of its own.
                 let _ = window.update(cx, |_, window, cx| {
@@ -526,7 +555,14 @@ impl SuperGitApp {
                     window.dispatch_event(step, cx);
                 });
                 cx.background_executor()
-                    .timer(Duration::from_millis(120))
+                    .timer(Duration::from_millis(60))
+                    .await;
+            }
+            // A few more frames, so what the last click did (focus) settles.
+            for _ in 0..3 {
+                let _ = window.update(cx, |_, window, cx| window.draw(cx).clear(cx));
+                cx.background_executor()
+                    .timer(Duration::from_millis(60))
                     .await;
             }
         })
