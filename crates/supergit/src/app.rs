@@ -5437,6 +5437,7 @@ impl SuperGitApp {
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let update = self.update_button(cx);
+        let terminal = self.repo.is_some().then(|| self.terminal_button(cx));
         let theme = cx.theme();
         h_flex()
             .h(px(26.))
@@ -5447,6 +5448,9 @@ impl SuperGitApp {
             .border_color(theme.border)
             .bg(theme.status_bar)
             .text_color(theme.muted_foreground)
+            // The terminal at the left edge, under the panel it opens; the
+            // right side is for messages.
+            .children(terminal)
             .child(div().flex_1())
             .when(!self.cleanup_results.is_empty(), |bar| {
                 bar.child(
@@ -5475,9 +5479,6 @@ impl SuperGitApp {
                 )
             })
             .children(update)
-            .when(self.repo.is_some(), |bar| {
-                bar.child(self.terminal_button(cx))
-            })
     }
 }
 
