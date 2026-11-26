@@ -7,6 +7,7 @@ mod base;
 mod commit_pane;
 mod edit;
 mod issue_worktree;
+mod notification_settings;
 mod projects;
 mod pulls;
 mod sidebar;
@@ -1535,7 +1536,6 @@ impl SuperGitApp {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let settings = crate::settings::load();
         let theme = cx.theme().clone();
         div().absolute().inset_0().flex().justify_center().items_start().pt(px(80.))
             .bg(gpui_kit::black().opacity(0.35))
@@ -1550,24 +1550,7 @@ impl SuperGitApp {
                     .child(Button::new("close-settings").label("Done").small().ghost()
                         .tooltip("Close settings (Esc)")
                         .on_click(cx.listener(|this,_,window,cx| this.close_settings(window,cx)))))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Background notifications"))
-                .children([(true,"Approvals and questions",settings.notify_approvals),(false,"Completion and failures",settings.notify_completions)]
-                    .into_iter().map(|(approval,label,enabled)| h_flex().justify_between().child(label)
-                        .child(Button::new(if approval {"notify-approval"} else {"notify-completion"})
-                            .label(if enabled {"On"} else {"Off"}).small().ghost()
-                            .tooltip(match (approval, enabled) {
-                                (true, true) => "Stop notifying when an agent needs approval or an answer",
-                                (true, false) => "Notify when an agent needs approval or an answer",
-                                (false, true) => "Stop notifying when an agent finishes or fails",
-                                (false, false) => "Notify when an agent finishes or fails",
-                            })
-                            .on_click(cx.listener(move |this,_,_,cx| this.toggle_notification(approval,cx))))))
-                .child(div().text_sm().text_color(theme.muted_foreground).child(
-                    if cfg!(target_os = "macos") {
-                        "Only exact events from native conversations are notified. The visible conversation stays quiet. If macOS blocks alerts, enable SuperGIT in System Settings → Notifications."
-                    } else {
-                        "Only exact events from native conversations are notified. The visible conversation stays quiet. Alerts go to your desktop's notification server; Do Not Disturb hides them."
-                    }))
+                .child(self.render_notification_settings(cx))
                 .child(v_flex().gap_2()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("Agents"))
                     .child(h_flex().justify_between().child("Open conversations as")
@@ -2554,6 +2537,12 @@ impl SuperGitApp {
             }
             if revision_changed {
                 let settings = crate::settings::load();
+                let needs_you = matches!(state.kind, Kind::Approval | Kind::Question);
+                if state.should_notify(focused, true, true)
+                    && let Some(sound) = settings.sound(needs_you)
+                {
+                    crate::sound::play(sound);
+                }
                 if state.should_notify(
                     focused,
                     settings.notify_approvals,

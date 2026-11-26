@@ -8,6 +8,13 @@ Platform differences stay behind small seams; keep both working:
 - `notifications.rs` → `notifications/macos.rs` (UserNotifications, objc2;
   a macOS-only dependency) or `notifications/freedesktop.rs` (notify-rust
   over D-Bus, click = default action).
+- `sound.rs` (Settings ▸ Notifications: a sound per event, beside the
+  banner) → `sound/macos.rs` (`NSSound`, the system alert sounds) or
+  `sound/freedesktop.rs` (sound theme ids: `canberra-gtk-play`, else
+  `pw-play`/`paplay` on the theme's file). Same events and quiet rule as
+  banners (`watch_chat`); at most one sound a second; screenshot runs are
+  silent. `settings.json` `sound_approvals`/`sound_completions`: absent =
+  the default, `""` = none.
 - Shortcuts: `shortcut!("…")` in main.rs (cmd/ctrl) for bindings, `MOD` in
   tooltips — never a literal `cmd-`. gpui's `secondary-` does not parse in
   `KeyBinding::new` (panics at startup).

@@ -23,6 +23,7 @@ mod selectable;
 mod settings;
 mod shell_env;
 mod single_instance;
+mod sound;
 mod submodules;
 mod switcher;
 mod syntax;

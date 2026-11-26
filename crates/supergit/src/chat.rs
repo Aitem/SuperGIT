@@ -9,6 +9,7 @@ mod composer_height;
 mod options;
 
 pub use composer_height::init;
+pub(crate) use options::setting_trigger;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
