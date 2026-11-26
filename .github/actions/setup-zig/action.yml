@@ -1,0 +1,23 @@
+name: Set up Zig
+description: >-
+  Puts the pinned Zig release (zig.sh) on PATH: downloaded from Zig's
+  community mirrors, checked against its SHA-256 and cached once per
+  platform and version. Stands in for mlugg/setup-zig, whose action still
+  targets Node 20 (https://codeberg.org/mlugg/setup-zig/pulls/55) and saves
+  a new copy of Zig's cache from every job.
+
+runs:
+  using: composite
+  steps:
+    - name: Pick the Zig package
+      id: zig
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/zig.sh" pick
+    - name: Restore Zig from the cache
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.zig.outputs.dir }}
+        key: ${{ steps.zig.outputs.name }}
+    - name: Install Zig
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/zig.sh" install

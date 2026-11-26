@@ -60,8 +60,8 @@ crates/supergit/src/
 
   This replaced an earlier `scripts/fetch-ghostty.sh` that vendored a
   37 MB repo snapshot into each checkout. CI installs Zig with
-  `mlugg/setup-zig`. libghostty links statically, so nothing extra goes
-  into the `.app`.
+  `.github/actions/setup-zig` (pinned release, SHA-256, cached).
+  libghostty links statically, so nothing extra goes into the `.app`.
 - **Threading.** libghostty handles are `!Send`, so the terminal lives on
   the main thread and the PTY reader only moves bytes. Each batch of output
   gets one repaint. While a program holds a synchronized frame, the last
