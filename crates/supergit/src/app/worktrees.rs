@@ -140,7 +140,7 @@ impl SuperGitApp {
         self.begin_cleanup(plans, true, Some(proof), cx);
     }
 
-    fn toggle_cleanup_protection(&mut self, branch: &str, cx: &mut Context<Self>) {
+    pub(super) fn toggle_cleanup_protection(&mut self, branch: &str, cx: &mut Context<Self>) {
         let Some(repo) = &self.repo else {
             return;
         };
@@ -156,40 +156,6 @@ impl SuperGitApp {
         }
         self.queue_persist(cx);
         cx.notify();
-    }
-
-    pub(super) fn render_cleanup_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.repo.is_none() {
-            return div().into_any_element();
-        }
-        let view = self.repository_view();
-        let mut branches = view.protected_branches.clone();
-        branches.extend(
-            self.worktrees
-                .iter()
-                .filter_map(|info| info.wt.branch.clone()),
-        );
-        branches.sort();
-        branches.dedup();
-        let theme = cx.theme().clone();
-        v_flex().gap_2()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("Worktree cleanup · this repository"))
-            .child(h_flex().justify_between().child("After a PR merges")
-                .child(Button::new("auto-cleanup").small().ghost().label(if view.auto_cleanup {"On"} else {"Off"})
-                    .tooltip(if view.auto_cleanup {"Stop removing worktrees on their own after their PR merges"} else {"Remove a worktree and its local branch once its PR merges"})
-                    .on_click(cx.listener(|this,_,_,cx| this.toggle_auto_cleanup(cx)))))
-            .child(div().text_sm().text_color(theme.muted_foreground).child(
-                "Only PRs observed open in this app session qualify. Selected, dirty, busy, kept, protected or unread work stays. Squash and rebase merges need manual review."))
-            .child(div().text_sm().child("Protected local branches (the main worktree and default base are always protected)"))
-            .child(v_flex().id("cleanup-protected-branches").max_h(px(130.)).overflow_y_scroll().gap_1()
-                .children(branches.into_iter().enumerate().map(|(ix,branch)| {
-                    let protected = view.protected_branches.contains(&branch);
-                    h_flex().justify_between().gap_2().child(div().truncate().child(branch.clone()))
-                        .child(Button::new(("cleanup-protection",ix)).small().ghost().label(if protected {"Protected"} else {"Protect"})
-                            .tooltip(if protected {"Let cleanup delete this branch again"} else {"Keep cleanup from ever deleting this branch"})
-                            .on_click(cx.listener(move |this,_,_,cx| this.toggle_cleanup_protection(&branch,cx))))
-                })))
-            .child(self.render_pending_cleanup(cx)).into_any_element()
     }
 
     pub(super) fn cleanup_policy(&self, automatic: bool) -> sg_git::CleanupPolicy {
@@ -789,7 +755,6 @@ impl SuperGitApp {
             return;
         };
         self.cleanup_results_open = false;
-        self.settings_open = false;
         self.close_switcher(&CloseSwitcher, window, cx);
         let targets = paths
             .iter()

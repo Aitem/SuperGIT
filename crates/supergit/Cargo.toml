@@ -40,11 +40,64 @@ two-face = { version = "0.4.5", default-features = false, features = ["syntect-f
 # Only for the `screenshot` feature: turns on GPUI's `render_to_image`.
 gpui_platform_test_support = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"], optional = true }
 
-# macOS notifications (src/notifications/macos.rs) and sounds (src/sound/macos.rs).
+# macOS notifications (src/notifications/macos.rs), sounds (src/sound/macos.rs)
+# and the settings window (src/app/settings_window/native.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSSound"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSObject", "NSString", "NSError"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSSound",
+    "NSAccessibilityProtocols",
+    "NSActionCell",
+    "NSAppearance",
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSButton",
+    "NSButtonCell",
+    "NSCell",
+    "NSClipView",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSGraphics",
+    "NSGridView",
+    "NSImage",
+    "NSImageRep",
+    "NSLayoutAnchor",
+    "NSLayoutConstraint",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPopUpButton",
+    "NSResponder",
+    "NSScrollView",
+    "NSSegmentedControl",
+    "NSStackView",
+    "NSSwitch",
+    "NSTabView",
+    "NSTabViewController",
+    "NSTabViewItem",
+    "NSText",
+    "NSTextField",
+    "NSTextView",
+    "NSToolbar",
+    "NSUserInterfaceLayout",
+    "NSView",
+    "NSViewController",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSBundle",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSString",
+] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "UNUserNotificationCenter", "UNNotification", "UNNotificationRequest", "UNNotificationContent", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }
 block2 = "0.6"
 

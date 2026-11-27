@@ -260,7 +260,6 @@ impl SuperGitApp {
             self.close_cleanup_preview(window, cx);
         }
         self.cleanup_results_open = false;
-        self.settings_open = false;
         self.close_switcher(&CloseSwitcher, window, cx);
         self.rebase_dialog = Some(RebaseDialog {
             path,
