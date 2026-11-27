@@ -377,6 +377,12 @@ there `count` times by `dy` px (negative: down), several runs separated by
 five seconds after startup (context menus; take the shot a bit later), and
 `=x,y,mx,my` then clicks the menu item at `mx,my`;
 `SUPERGIT_DEBUG_DOUBLE_CLICK=x,y` double-clicks it (renaming a conversation);
+`SUPERGIT_DEBUG_SETTINGS=general|agents|notifications|diffs|repository`
+(screenshot builds) opens the settings window on that page and shoots it
+instead of the main window (on macOS AppKit draws it into the PNG:
+`cacheDisplayInRect`); `SUPERGIT_DEBUG_SETTINGS_CLICK=1` (macOS) then
+clicks the first banner and branch checkboxes after 2 s, to check the way
+back to the app;
 `SUPERGIT_DEBUG_PR=<number>` (screenshot builds, with `SUPERGIT_TAB=prs`)
 selects that pull request, `SUPERGIT_DEBUG_PR_SCROLL=<px>` scrolls its details
 (conversation, review threads), `SUPERGIT_DEBUG_PR_FILES=1` opens its Files
@@ -505,6 +511,21 @@ never commit, push or create worktrees there without asking.
   starts as a copy (Claude `--resume <id> --fork-session`, plus
   `--session-id <new>` in the TUI; Codex `thread/fork` / `codex fork <id>`)
   until its agent names its own session.
+- **Settings** (`app/settings_window.rs`): a window of its own, opened by
+  ⌘, / SuperGIT ▸ Settings… from any window (a global `OpenSettings`
+  handler; one window, ⌘, again brings it forward), closed by ⌘W or Esc.
+  Pages: General, Agents, Notifications, Diffs, Repository. On macOS it is
+  AppKit's (`settings_window/native/appkit.rs`, objc2): an
+  `NSTabViewController` in the toolbar style, each page an `NSGridView`
+  of labels and system controls; built once, closing hides it. Controls
+  report to `Target` (define_class!; also the text view's and window's
+  delegate) → an `Event` channel → a GPUI task applies it to the app
+  (`native.rs`), and while the window shows every app change sends it a
+  new `State`. The window handles ⌘W, Esc and the editing keys itself (the
+  app's menus have no Edit menu). Elsewhere GPUI draws the same pages
+  (`settings_window/gpui_window.rs`). Values are saved as they change, the
+  initial prompt on leaving its field and on close (shared helpers in
+  `settings_window.rs`).
 - **Renaming a conversation** (`app/tree_rename.rs`): Rename… or a double
   click turns its title in the tree into a field, as in VS Code (all
   selected; Return or a click elsewhere keeps it, Escape does not; empty
@@ -515,7 +536,7 @@ never commit, push or create worktrees there without asking.
   itself (gpui-component's resize handle, in the first pixel of the panel
   after it). A panel beside a handle draws no border on that side, or the
   line doubles; rails and fixed-width panels draw their own.
-- **Initial prompt** (`initial_prompt.rs`, Settings ▸ Initial prompt): a
+- **Initial prompt** (`initial_prompt.rs`, Settings ▸ Agents ▸ Initial prompt): a
   template added to every agent SuperGIT starts — Claude's
   `--append-system-prompt` (chat and TUI, on every start: a resumed session
   does not keep it), Codex's `developerInstructions` on `thread/start` / `-c

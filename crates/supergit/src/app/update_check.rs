@@ -99,6 +99,11 @@ impl SuperGitApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.check_updates_now(cx);
+    }
+
+    /// The same from a window that is not GPUI's (Settings on macOS).
+    pub(super) fn check_updates_now(&mut self, cx: &mut Context<Self>) {
         self.flash("Checking for updates…", false, cx);
         cx.spawn(async move |this, cx| {
             let result = cx

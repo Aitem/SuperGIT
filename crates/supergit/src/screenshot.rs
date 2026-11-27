@@ -46,3 +46,27 @@ pub fn schedule(handle: AnyWindowHandle, cx: &mut App) {
     })
     .detach();
 }
+
+/// `SUPERGIT_DEBUG_SETTINGS` on macOS: AppKit's settings window, drawn by
+/// AppKit to the PNG.
+#[cfg(target_os = "macos")]
+pub fn schedule_settings(cx: &mut App) {
+    let Ok(out) = std::env::var("SUPERGIT_SCREENSHOT") else {
+        return;
+    };
+    let delay = std::env::var("SUPERGIT_SCREENSHOT_DELAY")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(4.0);
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(Duration::from_secs_f64(delay))
+            .await;
+        match crate::app::settings_window::capture(&out) {
+            Ok(()) => eprintln!("screenshot saved: {out}"),
+            Err(e) => eprintln!("screenshot failed: {e:#}"),
+        }
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
+}

@@ -227,6 +227,16 @@ fn main() -> Result<()> {
             KeyBinding::new("up", app::SwitcherPrevious, Some("Switcher")),
             KeyBinding::new("down", app::SwitcherNext, Some("Switcher")),
             KeyBinding::new("escape", app::CloseSwitcher, Some("Switcher")),
+            KeyBinding::new(
+                shortcut!("w"),
+                app::settings_window::CloseSettings,
+                Some(app::settings_window::CONTEXT),
+            ),
+            KeyBinding::new(
+                "escape",
+                app::settings_window::CloseSettings,
+                Some(app::settings_window::CONTEXT),
+            ),
         ]);
         if cfg!(target_os = "macos") {
             cx.bind_keys([
@@ -300,8 +310,28 @@ fn main() -> Result<()> {
             cx.new(|cx| app::SuperGitApp::new(project, launch_dir, window, cx))
         })
         .expect("failed to open the main window");
+        // ⌘, and SuperGIT ▸ Settings… from any window: the settings have a
+        // window of their own.
+        let settings_app = view.downgrade();
+        cx.on_action(move |_: &app::OpenSettings, cx| {
+            app::settings_window::open(settings_app.clone(), None, true, cx);
+        });
+        // `SUPERGIT_DEBUG_SETTINGS=<page>` shoots the settings window instead.
         #[cfg(feature = "screenshot")]
-        screenshot::schedule(_handle, cx);
+        match std::env::var("SUPERGIT_DEBUG_SETTINGS") {
+            Ok(page) => {
+                let page = app::settings_window::Page::parse(&page);
+                match app::settings_window::open(view.downgrade(), Some(page), false, cx) {
+                    Some(window) => screenshot::schedule(window, cx),
+                    // AppKit's window is not GPUI's: it draws itself.
+                    #[cfg(target_os = "macos")]
+                    None => screenshot::schedule_settings(cx),
+                    #[cfg(not(target_os = "macos"))]
+                    None => screenshot::schedule(_handle, cx),
+                }
+            }
+            Err(_) => screenshot::schedule(_handle, cx),
+        }
 
         // Global navigation must also work when no child control owns focus.
         let switcher_view = view.downgrade();
